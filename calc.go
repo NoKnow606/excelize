@@ -692,6 +692,7 @@ type formulaFuncs struct {
 //	ODDFYIELD
 //	ODDLPRICE
 //	ODDLYIELD
+//	OFFSET
 //	OR
 //	PDURATION
 //	PEARSON
@@ -757,6 +758,7 @@ type formulaFuncs struct {
 //	SLN
 //	SLOPE
 //	SMALL
+//	SORT
 //	SQRT
 //	SQRTPI
 //	STANDARDIZE
@@ -16224,6 +16226,380 @@ func (fn *formulaFuncs) INDEX(argsList *list.List) formulaArg {
 		return newMatrixFormulaArg([][]formulaArg{cells.List})
 	}
 	return cells.List[colIdx]
+}
+
+// OFFSET function returns a reference to a range that is a specified number
+// of rows and columns from a cell or range of cells. The syntax of the
+// function is:
+//
+//	OFFSET(reference,rows,cols,[height],[width])
+func (fn *formulaFuncs) OFFSET(argsList *list.List) formulaArg {
+	if argsList.Len() < 3 || argsList.Len() > 5 {
+		return newErrorFormulaArg(formulaErrorVALUE, "OFFSET requires 3 to 5 arguments")
+	}
+
+	// Get reference argument
+	refArg := argsList.Front().Value.(formulaArg)
+	if refArg.Type == ArgError {
+		return refArg
+	}
+
+	// Parse the reference to get coordinates
+	var refStartRow, refStartCol, refEndRow, refEndCol int
+	var refSheet string
+
+	// Extract reference information from cellRefs or cellRanges
+	if refArg.cellRefs != nil && refArg.cellRefs.Len() > 0 {
+		// Single cell reference
+		cr := refArg.cellRefs.Front().Value.(cellRef)
+		refSheet = cr.Sheet
+		refStartCol, refStartRow = cr.Col, cr.Row
+		refEndCol, refEndRow = cr.Col, cr.Row
+	} else if refArg.cellRanges != nil && refArg.cellRanges.Len() > 0 {
+		// Range reference
+		cr := refArg.cellRanges.Front().Value.(cellRange)
+		refSheet = cr.From.Sheet
+		refStartCol, refStartRow = cr.From.Col, cr.From.Row
+		refEndCol, refEndRow = cr.To.Col, cr.To.Row
+	} else if refArg.Type == ArgString {
+		// Fallback: Parse cell reference like "A1" or "Sheet1!A1:B2"
+		ref := refArg.String
+		if strings.Contains(ref, "!") {
+			parts := strings.Split(ref, "!")
+			refSheet = parts[0]
+			ref = parts[1]
+		} else {
+			refSheet = fn.sheet
+		}
+
+		// Check if it's a range or single cell
+		if strings.Contains(ref, ":") {
+			coordinates, err := rangeRefToCoordinates(ref)
+			if err != nil {
+				return newErrorFormulaArg(formulaErrorREF, err.Error())
+			}
+			refStartCol, refStartRow, refEndCol, refEndRow = coordinates[0], coordinates[1], coordinates[2], coordinates[3]
+		} else {
+			col, row, err := CellNameToCoordinates(ref)
+			if err != nil {
+				return newErrorFormulaArg(formulaErrorREF, err.Error())
+			}
+			refStartCol, refStartRow = col, row
+			refEndCol, refEndRow = col, row
+		}
+	} else {
+		return newErrorFormulaArg(formulaErrorVALUE, "OFFSET reference must be a cell or range reference")
+	}
+
+	// Get rows offset
+	rowsArg := argsList.Front().Next().Value.(formulaArg).ToNumber()
+	if rowsArg.Type != ArgNumber {
+		return rowsArg
+	}
+	rowOffset := int(rowsArg.Number)
+
+	// Get cols offset
+	colsArg := argsList.Front().Next().Next().Value.(formulaArg).ToNumber()
+	if colsArg.Type != ArgNumber {
+		return colsArg
+	}
+	colOffset := int(colsArg.Number)
+
+	// Get optional height (defaults to original height)
+	height := refEndRow - refStartRow + 1
+	if argsList.Len() >= 4 {
+		heightArg := argsList.Front().Next().Next().Next().Value.(formulaArg).ToNumber()
+		if heightArg.Type != ArgNumber {
+			return heightArg
+		}
+		if heightArg.Number < 1 {
+			return newErrorFormulaArg(formulaErrorREF, "OFFSET height must be positive")
+		}
+		height = int(heightArg.Number)
+	}
+
+	// Get optional width (defaults to original width)
+	width := refEndCol - refStartCol + 1
+	if argsList.Len() == 5 {
+		widthArg := argsList.Back().Value.(formulaArg).ToNumber()
+		if widthArg.Type != ArgNumber {
+			return widthArg
+		}
+		if widthArg.Number < 1 {
+			return newErrorFormulaArg(formulaErrorREF, "OFFSET width must be positive")
+		}
+		width = int(widthArg.Number)
+	}
+
+	// Calculate new range coordinates
+	newStartRow := refStartRow + rowOffset
+	newStartCol := refStartCol + colOffset
+	newEndRow := newStartRow + height - 1
+	newEndCol := newStartCol + width - 1
+
+	// Validate bounds (Excel has max 1048576 rows and 16384 columns)
+	if newStartRow < 1 || newStartCol < 1 || newEndRow > 1048576 || newEndCol > 16384 {
+		return newErrorFormulaArg(formulaErrorREF, "OFFSET reference is out of bounds")
+	}
+
+	// Build the result range and return its values
+	var mtx [][]formulaArg
+	for row := newStartRow; row <= newEndRow; row++ {
+		var rowData []formulaArg
+		for col := newStartCol; col <= newEndCol; col++ {
+			cellName, err := CoordinatesToCellName(col, row)
+			if err != nil {
+				return newErrorFormulaArg(formulaErrorREF, err.Error())
+			}
+			result, err := fn.f.CalcCellValue(refSheet, cellName, Options{RawCellValue: true})
+			if err != nil {
+				rowData = append(rowData, newStringFormulaArg(""))
+			} else {
+				arg := newStringFormulaArg(result)
+				if num := arg.ToNumber(); num.Type == ArgNumber {
+					arg = num
+				}
+				rowData = append(rowData, arg)
+			}
+		}
+		mtx = append(mtx, rowData)
+	}
+
+	// Return single cell value or matrix
+	if len(mtx) == 1 && len(mtx[0]) == 1 {
+		return mtx[0][0]
+	}
+	return newMatrixFormulaArg(mtx)
+}
+
+// SORT function sorts the contents of a range or array. The syntax of the
+// function is:
+//
+//	SORT(array,[sort_index],[sort_order],[by_col])
+func (fn *formulaFuncs) SORT(argsList *list.List) formulaArg {
+	if argsList.Len() < 1 || argsList.Len() > 4 {
+		return newErrorFormulaArg(formulaErrorVALUE, "SORT requires 1 to 4 arguments")
+	}
+
+	// Get array argument
+	arrayArg := argsList.Front().Value.(formulaArg)
+	if arrayArg.Type == ArgError {
+		return arrayArg
+	}
+
+	// Convert to matrix
+	var mtx [][]formulaArg
+	switch arrayArg.Type {
+	case ArgMatrix:
+		mtx = arrayArg.Matrix
+	case ArgList:
+		// Convert list to single column matrix
+		for _, item := range arrayArg.List {
+			mtx = append(mtx, []formulaArg{item})
+		}
+	case ArgNumber, ArgString:
+		// Single value becomes 1x1 matrix
+		mtx = [][]formulaArg{{arrayArg}}
+	default:
+		return newErrorFormulaArg(formulaErrorVALUE, "SORT requires an array or range")
+	}
+
+	if len(mtx) == 0 {
+		return newErrorFormulaArg(formulaErrorVALUE, "SORT array cannot be empty")
+	}
+
+	// Get sort_index (default = 1, which is first row/column)
+	sortIndex := 1
+	if argsList.Len() >= 2 {
+		sortIndexArg := argsList.Front().Next().Value.(formulaArg).ToNumber()
+		if sortIndexArg.Type != ArgNumber {
+			return sortIndexArg
+		}
+		sortIndex = int(sortIndexArg.Number)
+		if sortIndex < 1 {
+			return newErrorFormulaArg(formulaErrorVALUE, "SORT sort_index must be >= 1")
+		}
+	}
+
+	// Get sort_order (default = 1 for ascending, -1 for descending)
+	sortOrder := 1
+	if argsList.Len() >= 3 {
+		sortOrderArg := argsList.Front().Next().Next().Value.(formulaArg).ToNumber()
+		if sortOrderArg.Type != ArgNumber {
+			return sortOrderArg
+		}
+		sortOrder = int(sortOrderArg.Number)
+		if sortOrder != 1 && sortOrder != -1 {
+			sortOrder = 1 // Default to ascending if invalid
+		}
+	}
+
+	// Get by_col (default = FALSE, sort by rows)
+	byCol := false
+	if argsList.Len() == 4 {
+		byColArg := argsList.Back().Value.(formulaArg).ToBool()
+		if byColArg.Type != ArgNumber {
+			return byColArg
+		}
+		byCol = byColArg.Number == 1
+	}
+
+	// Make a copy of the matrix to sort
+	sortedMtx := make([][]formulaArg, len(mtx))
+	for i := range mtx {
+		sortedMtx[i] = make([]formulaArg, len(mtx[i]))
+		copy(sortedMtx[i], mtx[i])
+	}
+
+	// Perform sorting
+	if byCol {
+		// Sort columns based on values in the sort_index row
+		if sortIndex > len(sortedMtx) {
+			return newErrorFormulaArg(formulaErrorVALUE, "SORT sort_index exceeds array dimensions")
+		}
+		sortRowIdx := sortIndex - 1
+
+		// Transpose to sort columns as rows
+		transposed := fn.transposeMatrix(sortedMtx)
+
+		// Sort the transposed matrix by the specified column (now row)
+		sort.SliceStable(transposed, func(i, j int) bool {
+			if sortRowIdx >= len(transposed[i]) || sortRowIdx >= len(transposed[j]) {
+				return false
+			}
+			cmp := fn.compareFormulaArgs(transposed[i][sortRowIdx], transposed[j][sortRowIdx])
+			if sortOrder == 1 {
+				return cmp < 0
+			}
+			return cmp > 0
+		})
+
+		// Transpose back
+		sortedMtx = fn.transposeMatrix(transposed)
+	} else {
+		// Sort rows based on values in the sort_index column
+		if len(sortedMtx) > 0 && sortIndex > len(sortedMtx[0]) {
+			return newErrorFormulaArg(formulaErrorVALUE, "SORT sort_index exceeds array dimensions")
+		}
+		sortColIdx := sortIndex - 1
+
+		sort.SliceStable(sortedMtx, func(i, j int) bool {
+			if sortColIdx >= len(sortedMtx[i]) || sortColIdx >= len(sortedMtx[j]) {
+				return false
+			}
+			cmp := fn.compareFormulaArgs(sortedMtx[i][sortColIdx], sortedMtx[j][sortColIdx])
+			if sortOrder == 1 {
+				return cmp < 0
+			}
+			return cmp > 0
+		})
+	}
+
+	return newMatrixFormulaArg(sortedMtx)
+}
+
+// transposeMatrix transposes a matrix (swap rows and columns)
+func (fn *formulaFuncs) transposeMatrix(mtx [][]formulaArg) [][]formulaArg {
+	if len(mtx) == 0 {
+		return mtx
+	}
+	rows := len(mtx)
+	cols := len(mtx[0])
+	transposed := make([][]formulaArg, cols)
+	for i := 0; i < cols; i++ {
+		transposed[i] = make([]formulaArg, rows)
+		for j := 0; j < rows; j++ {
+			if i < len(mtx[j]) {
+				transposed[i][j] = mtx[j][i]
+			} else {
+				transposed[i][j] = newStringFormulaArg("")
+			}
+		}
+	}
+	return transposed
+}
+
+// compareFormulaArgs compares two formulaArg values for sorting
+// Returns: -1 if a < b, 0 if a == b, 1 if a > b
+// Sort order: Numbers < Text < Logical < Errors, Empty cells go to end
+func (fn *formulaFuncs) compareFormulaArgs(a, b formulaArg) int {
+	// Handle empty/blank values - they go to the end
+	aEmpty := (a.Type == ArgString && a.String == "") || a.Type == ArgUnknown
+	bEmpty := (b.Type == ArgString && b.String == "") || b.Type == ArgUnknown
+
+	if aEmpty && bEmpty {
+		return 0
+	}
+	if aEmpty {
+		return 1
+	}
+	if bEmpty {
+		return -1
+	}
+
+	// Type priority: Number < String < Boolean < Error
+	typePriority := map[ArgType]int{
+		ArgNumber: 0,
+		ArgString: 1,
+		ArgError:  2,
+	}
+
+	// Handle boolean (stored as ArgNumber with Boolean flag)
+	aPriority := typePriority[a.Type]
+	bPriority := typePriority[b.Type]
+
+	if a.Type == ArgNumber && a.Boolean {
+		aPriority = 2 // Boolean priority between String and Error
+	}
+	if b.Type == ArgNumber && b.Boolean {
+		bPriority = 2
+	}
+
+	if aPriority != bPriority {
+		if aPriority < bPriority {
+			return -1
+		}
+		return 1
+	}
+
+	// Same type, compare values
+	switch a.Type {
+	case ArgNumber:
+		if a.Boolean && b.Boolean {
+			// Both are booleans
+			if a.Number < b.Number {
+				return -1
+			}
+			if a.Number > b.Number {
+				return 1
+			}
+			return 0
+		}
+		// Both are numbers
+		if a.Number < b.Number {
+			return -1
+		}
+		if a.Number > b.Number {
+			return 1
+		}
+		return 0
+	case ArgString:
+		// Case-insensitive string comparison
+		aLower := strings.ToLower(a.String)
+		bLower := strings.ToLower(b.String)
+		if aLower < bLower {
+			return -1
+		}
+		if aLower > bLower {
+			return 1
+		}
+		return 0
+	case ArgError:
+		// Errors are equal for sorting purposes
+		return 0
+	}
+
+	return 0
 }
 
 // INDIRECT function converts a text string into a cell reference. The syntax
