@@ -1711,11 +1711,15 @@ func (f *File) cellResolver(ctx *calcContext, sheet, cell string) (formulaArg, e
 				ctx.iterations[ref]++
 				ctx.mu.Unlock()
 				arg, _ = f.calcCellValue(ctx, sheet, cell)
+				// 修复: 写入 iterationsCache 需要加锁保护
+				ctx.mu.Lock()
 				ctx.iterationsCache[ref] = arg
+				ctx.mu.Unlock()
 				return arg, nil
 			}
+			cachedResult := ctx.iterationsCache[ref]
 			ctx.mu.Unlock()
-			return ctx.iterationsCache[ref], nil
+			return cachedResult, nil
 		}
 		ctx.mu.Unlock()
 	}
