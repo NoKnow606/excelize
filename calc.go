@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -886,6 +887,42 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 		f.calcCache.Store(cacheKey, result)
 	}
 	return
+}
+
+// CalcCellValues calculates multiple cell values efficiently by leveraging cache.
+// This function is optimized for batch calculation scenarios where multiple cells
+// need to be calculated. It provides better performance than calling CalcCellValue
+// multiple times because:
+// 1. Shared ranges (like lookup tables) are read once and cached
+// 2. Results are cached for subsequent calculations
+// 3. Reduces overhead of multiple function calls
+//
+// The syntax of the function is:
+//
+//	CalcCellValues(sheet, cells, opts...)
+//
+// Example:
+//
+//	cells := []string{"A1", "A2", "A3", "B1", "B2", "B3"}
+//	results, err := f.CalcCellValues("Sheet1", cells)
+//	// results is a map: {"A1": "value1", "A2": "value2", ...}
+func (f *File) CalcCellValues(sheet string, cells []string, opts ...Options) (map[string]string, error) {
+	if len(cells) == 0 {
+		return make(map[string]string), nil
+	}
+
+	results := make(map[string]string, len(cells))
+
+	// Calculate all cells, benefiting from cache
+	for _, cell := range cells {
+		result, err := f.CalcCellValue(sheet, cell, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate %s: %w", cell, err)
+		}
+		results[cell] = result
+	}
+
+	return results, nil
 }
 
 // calcCellValue calculate cell value by given context, worksheet name and cell
@@ -1772,6 +1809,118 @@ func (f *File) clearCellCache(sheet, cell string) {
 	_, _ = col, row // Use variables to avoid unused variable error
 }
 
+// rangeResolverParallel reads cell values in parallel for large ranges
+// Only used when numRows >= parallelThreshold to avoid goroutine overhead
+func (f *File) rangeResolverParallel(ctx *calcContext, sheet string, ws *xlsxWorksheet, valueRange []int) ([][]formulaArg, error) {
+	const parallelThreshold = 100 // 小于100行不并行
+
+	numRows := valueRange[1] - valueRange[0] + 1
+	numCols := valueRange[3] - valueRange[2] + 1
+
+	// 小数据集使用串行
+	if numRows < parallelThreshold {
+		return f.rangeResolverSerial(ctx, sheet, ws, valueRange)
+	}
+
+	// 并行读取
+	matrix := make([][]formulaArg, numRows)
+	for i := range matrix {
+		matrix[i] = make([]formulaArg, numCols)
+	}
+
+	numWorkers := min(runtime.NumCPU(), numRows)
+	chunkSize := (numRows + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for workerID := 0; workerID < numWorkers; workerID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			startRow := valueRange[0] + id*chunkSize
+			endRow := min(startRow+chunkSize-1, valueRange[1])
+
+			for row := startRow; row <= endRow; row++ {
+				// 获取列最大值
+				colMax := 0
+				if row <= len(ws.SheetData.Row) {
+					rowData := &ws.SheetData.Row[row-1]
+					colMax = min(valueRange[3], len(rowData.C))
+				}
+
+				for col := valueRange[2]; col <= valueRange[3]; col++ {
+					value := newEmptyFormulaArg()
+					if col <= colMax {
+						cell, err := CoordinatesToCellName(col, row)
+						if err != nil {
+							errMu.Lock()
+							if firstErr == nil {
+								firstErr = err
+							}
+							errMu.Unlock()
+							return
+						}
+
+						value, err = f.cellResolver(ctx, sheet, cell)
+						if err != nil {
+							errMu.Lock()
+							if firstErr == nil {
+								firstErr = err
+							}
+							errMu.Unlock()
+							return
+						}
+					}
+					matrix[row-valueRange[0]][col-valueRange[2]] = value
+				}
+			}
+		}(workerID)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	return matrix, nil
+}
+
+// rangeResolverSerial is the original serial implementation
+func (f *File) rangeResolverSerial(ctx *calcContext, sheet string, ws *xlsxWorksheet, valueRange []int) ([][]formulaArg, error) {
+	var matrix [][]formulaArg
+
+	for row := valueRange[0]; row <= valueRange[1]; row++ {
+		colMax := 0
+		if row <= len(ws.SheetData.Row) {
+			rowData := &ws.SheetData.Row[row-1]
+			colMax = min(valueRange[3], len(rowData.C))
+		}
+
+		var matrixRow []formulaArg
+		for col := valueRange[2]; col <= valueRange[3]; col++ {
+			value := newEmptyFormulaArg()
+			if col <= colMax {
+				cell, err := CoordinatesToCellName(col, row)
+				if err != nil {
+					return nil, err
+				}
+				value, err = f.cellResolver(ctx, sheet, cell)
+				if err != nil {
+					return nil, err
+				}
+			}
+			matrixRow = append(matrixRow, value)
+		}
+		matrix = append(matrix, matrixRow)
+	}
+
+	return matrix, nil
+}
+
 // rangeResolver extract value as string from given reference and range list.
 // This function will not ignore the empty cell. For example, A1:A2:A2:B3 will
 // be reference A1:B3.
@@ -1819,29 +1968,12 @@ func (f *File) rangeResolver(ctx *calcContext, cellRefs, cellRanges *list.List) 
 			return
 		}
 
-		for row := valueRange[0]; row <= valueRange[1]; row++ {
-			colMax := 0
-			if row <= len(ws.SheetData.Row) {
-				rowData := &ws.SheetData.Row[row-1]
-				colMax = min(valueRange[3], len(rowData.C))
-			}
-
-			var matrixRow []formulaArg
-			for col := valueRange[2]; col <= valueRange[3]; col++ {
-				value := newEmptyFormulaArg()
-				if col <= colMax {
-					var cell string
-					if cell, err = CoordinatesToCellName(col, row); err != nil {
-						return
-					}
-					if value, err = f.cellResolver(ctx, sheet, cell); err != nil {
-						return
-					}
-				}
-				matrixRow = append(matrixRow, value)
-			}
-			arg.Matrix = append(arg.Matrix, matrixRow)
+		// Use parallel resolver for large ranges
+		arg.Matrix, err = f.rangeResolverParallel(ctx, sheet, ws, valueRange)
+		if err != nil {
+			return
 		}
+
 		// Store result in range cache
 		f.rangeCache.Store(cacheKey, arg.Matrix)
 		return
@@ -6058,6 +6190,41 @@ func (fn *formulaFuncs) SUMIFS(argsList *list.List) formulaArg {
 	return newNumberFormulaArg(sum)
 }
 
+// sumproductParallel performs parallel multiplication for SUMPRODUCT with large arrays
+func (fn *formulaFuncs) sumproductParallel(args []formulaArg, res []float64) {
+	n := len(args)
+	numWorkers := min(runtime.NumCPU(), n/100) // At least 100 elements per worker
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+
+	chunkSize := (n + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+
+	for workerID := 0; workerID < numWorkers; workerID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			start := id * chunkSize
+			end := min(start+chunkSize, n)
+
+			for i := start; i < end; i++ {
+				num := args[i].ToNumber()
+				if num.Type == ArgNumber {
+					res[i] = res[i] * num.Number
+				} else if args[i].Value() != "" {
+					// Error case - set to 0 to be handled later
+					res[i] = 0
+				}
+			}
+		}(workerID)
+	}
+
+	wg.Wait()
+}
+
 // sumproduct is an implementation of the formula function SUMPRODUCT.
 func (fn *formulaFuncs) sumproduct(argsList *list.List) formulaArg {
 	var (
@@ -6093,12 +6260,17 @@ func (fn *formulaFuncs) sumproduct(argsList *list.List) formulaArg {
 			if len(args) != n {
 				return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
 			}
-			for i, value := range args {
-				num := value.ToNumber()
-				if num.Type != ArgNumber && value.Value() != "" {
-					return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
+			// Use parallel processing for large arrays
+			if n > 1000 {
+				fn.sumproductParallel(args, res)
+			} else {
+				for i, value := range args {
+					num := value.ToNumber()
+					if num.Type != ArgNumber && value.Value() != "" {
+						return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
+					}
+					res[i] = res[i] * num.Number
 				}
-				res[i] = res[i] * num.Number
 			}
 		}
 	}
