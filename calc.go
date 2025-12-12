@@ -1216,6 +1216,50 @@ func calcPow(rOpd, lOpd formulaArg, opdStack *Stack) error {
 
 // calcEq evaluate equal arithmetic operations.
 func calcEq(rOpd, lOpd formulaArg, opdStack *Stack) error {
+	// 支持数组公式：当一个操作数是数组，另一个是标量时，进行逐元素比较
+	if lOpd.Type == ArgMatrix && rOpd.Type != ArgMatrix {
+		// 左侧是数组，右侧是标量：逐元素比较
+		result := make([][]formulaArg, len(lOpd.Matrix))
+		for i, row := range lOpd.Matrix {
+			result[i] = make([]formulaArg, len(row))
+			for j, cell := range row {
+				result[i][j] = newBoolFormulaArg(cell.Value() == rOpd.Value())
+			}
+		}
+		opdStack.Push(newMatrixFormulaArg(result))
+		return nil
+	}
+	if rOpd.Type == ArgMatrix && lOpd.Type != ArgMatrix {
+		// 右侧是数组，左侧是标量：逐元素比较
+		result := make([][]formulaArg, len(rOpd.Matrix))
+		for i, row := range rOpd.Matrix {
+			result[i] = make([]formulaArg, len(row))
+			for j, cell := range row {
+				result[i][j] = newBoolFormulaArg(lOpd.Value() == cell.Value())
+			}
+		}
+		opdStack.Push(newMatrixFormulaArg(result))
+		return nil
+	}
+	if lOpd.Type == ArgMatrix && rOpd.Type == ArgMatrix {
+		// 两个都是数组：逐元素比较（数组大小必须匹配）
+		if len(lOpd.Matrix) != len(rOpd.Matrix) {
+			return errors.New(formulaErrorVALUE)
+		}
+		result := make([][]formulaArg, len(lOpd.Matrix))
+		for i := range lOpd.Matrix {
+			if len(lOpd.Matrix[i]) != len(rOpd.Matrix[i]) {
+				return errors.New(formulaErrorVALUE)
+			}
+			result[i] = make([]formulaArg, len(lOpd.Matrix[i]))
+			for j := range lOpd.Matrix[i] {
+				result[i][j] = newBoolFormulaArg(lOpd.Matrix[i][j].Value() == rOpd.Matrix[i][j].Value())
+			}
+		}
+		opdStack.Push(newMatrixFormulaArg(result))
+		return nil
+	}
+	// 标量比较（现有功能）
 	opdStack.Push(newBoolFormulaArg(rOpd.Value() == lOpd.Value()))
 	return nil
 }
@@ -1336,6 +1380,74 @@ func calcSubtract(rOpd, lOpd formulaArg, opdStack *Stack) error {
 
 // calcMultiply evaluate multiplication arithmetic operations.
 func calcMultiply(rOpd, lOpd formulaArg, opdStack *Stack) error {
+	// 支持数组公式：逐元素乘法
+	if lOpd.Type == ArgMatrix && rOpd.Type != ArgMatrix {
+		// 左侧是数组，右侧是标量：逐元素乘以标量
+		rOpdVal := rOpd.ToNumber()
+		if rOpdVal.Type != ArgNumber {
+			return errors.New(rOpdVal.Value())
+		}
+		result := make([][]formulaArg, len(lOpd.Matrix))
+		for i, row := range lOpd.Matrix {
+			result[i] = make([]formulaArg, len(row))
+			for j, cell := range row {
+				cellVal := cell.ToNumber()
+				if cellVal.Type != ArgNumber {
+					return errors.New(cellVal.Value())
+				}
+				result[i][j] = newNumberFormulaArg(cellVal.Number * rOpdVal.Number)
+			}
+		}
+		opdStack.Push(newMatrixFormulaArg(result))
+		return nil
+	}
+	if rOpd.Type == ArgMatrix && lOpd.Type != ArgMatrix {
+		// 右侧是数组，左侧是标量：逐元素乘以标量
+		lOpdVal := lOpd.ToNumber()
+		if lOpdVal.Type != ArgNumber {
+			return errors.New(lOpdVal.Value())
+		}
+		result := make([][]formulaArg, len(rOpd.Matrix))
+		for i, row := range rOpd.Matrix {
+			result[i] = make([]formulaArg, len(row))
+			for j, cell := range row {
+				cellVal := cell.ToNumber()
+				if cellVal.Type != ArgNumber {
+					return errors.New(cellVal.Value())
+				}
+				result[i][j] = newNumberFormulaArg(lOpdVal.Number * cellVal.Number)
+			}
+		}
+		opdStack.Push(newMatrixFormulaArg(result))
+		return nil
+	}
+	if lOpd.Type == ArgMatrix && rOpd.Type == ArgMatrix {
+		// 两个都是数组：逐元素乘法（数组大小必须匹配）
+		if len(lOpd.Matrix) != len(rOpd.Matrix) {
+			return errors.New(formulaErrorVALUE)
+		}
+		result := make([][]formulaArg, len(lOpd.Matrix))
+		for i := range lOpd.Matrix {
+			if len(lOpd.Matrix[i]) != len(rOpd.Matrix[i]) {
+				return errors.New(formulaErrorVALUE)
+			}
+			result[i] = make([]formulaArg, len(lOpd.Matrix[i]))
+			for j := range lOpd.Matrix[i] {
+				lCellVal := lOpd.Matrix[i][j].ToNumber()
+				if lCellVal.Type != ArgNumber {
+					return errors.New(lCellVal.Value())
+				}
+				rCellVal := rOpd.Matrix[i][j].ToNumber()
+				if rCellVal.Type != ArgNumber {
+					return errors.New(rCellVal.Value())
+				}
+				result[i][j] = newNumberFormulaArg(lCellVal.Number * rCellVal.Number)
+			}
+		}
+		opdStack.Push(newMatrixFormulaArg(result))
+		return nil
+	}
+	// 标量乘法（现有功能）
 	lOpdVal := lOpd.ToNumber()
 	if lOpdVal.Type != ArgNumber {
 		return errors.New(lOpdVal.Value())
@@ -15713,10 +15825,24 @@ func (fn *formulaFuncs) MATCH(argsList *list.List) formulaArg {
 	}
 	switch lookupArrayArg.Type {
 	case ArgMatrix:
-		if len(lookupArrayArg.Matrix) != 1 && len(lookupArrayArg.Matrix[0]) != 1 {
-			return newErrorFormulaArg(formulaErrorNA, lookupArrayErr)
+		numRows := len(lookupArrayArg.Matrix)
+		numCols := 0
+		if numRows > 0 {
+			numCols = len(lookupArrayArg.Matrix[0])
 		}
-		lookupArray = lookupArrayArg.ToList()
+
+		// 单行或单列（保持现有行为）
+		if numRows == 1 || numCols == 1 {
+			lookupArray = lookupArrayArg.ToList()
+		} else {
+			// 支持数组公式：将二维数组展平为一维数组（按行优先顺序）
+			// 这允许 MATCH 处理来自数组公式的结果，例如：
+			// MATCH(1, INDEX((A:A=x)*(B:B=y), 0), 0)
+			lookupArray = make([]formulaArg, 0, numRows*numCols)
+			for _, row := range lookupArrayArg.Matrix {
+				lookupArray = append(lookupArray, row...)
+			}
+		}
 	default:
 		return newErrorFormulaArg(formulaErrorNA, lookupArrayErr)
 	}
@@ -16198,12 +16324,65 @@ func (fn *formulaFuncs) INDEX(argsList *list.List) formulaArg {
 		}
 		colIdx = int(colArg.Number) - 1
 	}
+
+	// 处理 INDEX(array, 0, 0) 的情况
 	if rowIdx == -1 && colIdx == -1 {
-		if len(array.ToList()) != 1 {
+		if argsList.Len() == 3 {
+			// INDEX(array, 0, 0) with 3 arguments
+			if array.Type == ArgMatrix {
+				// 单个单元格（1x1矩阵）：返回该单元格的值
+				if len(array.Matrix) == 1 && len(array.Matrix[0]) == 1 {
+					return array.Matrix[0][0]
+				}
+				// 多行或多列：返回错误
+				return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
+			}
+			// 单个值（非矩阵）：返回该值
+			return array
+		}
+		// INDEX(array, 0) with 2 arguments - 返回完整数组（用于数组公式）
+		return array
+	}
+
+	// 支持返回整列：INDEX(array, 0, col_num)
+	if rowIdx == -1 && colIdx >= 0 {
+		if array.Type != ArgMatrix {
 			return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
 		}
-		return array.ToList()[0]
+		// 检查列索引是否超出范围
+		if len(array.Matrix) > 0 && colIdx >= len(array.Matrix[0]) {
+			return newErrorFormulaArg(formulaErrorREF, "INDEX col_num out of range")
+		}
+		column := make([]formulaArg, 0, len(array.Matrix))
+		for _, row := range array.Matrix {
+			if colIdx < len(row) {
+				column = append(column, row[colIdx])
+			} else {
+				// 列索引超出当前行的列数，返回空值
+				column = append(column, newEmptyFormulaArg())
+			}
+		}
+		// 返回列向量（单列的二维数组）
+		matrixColumn := make([][]formulaArg, len(column))
+		for i, val := range column {
+			matrixColumn[i] = []formulaArg{val}
+		}
+		return newMatrixFormulaArg(matrixColumn)
 	}
+
+	// 支持返回整行：INDEX(array, row_num, 0)
+	if colIdx == -1 && rowIdx >= 0 {
+		if array.Type != ArgMatrix {
+			return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
+		}
+		if rowIdx >= len(array.Matrix) {
+			return newErrorFormulaArg(formulaErrorREF, "INDEX row_num out of range")
+		}
+		// 返回行向量（单行的二维数组）
+		return newMatrixFormulaArg([][]formulaArg{array.Matrix[rowIdx]})
+	}
+
+	// 原有逻辑：返回单个单元格
 	cells := fn.index(array, rowIdx, colIdx)
 	if cells.Type != ArgList {
 		return cells

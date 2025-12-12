@@ -4081,7 +4081,7 @@ func TestCalcCellValue(t *testing.T) {
 		"MATCH(0,A1:A1,0,0)":   {"#VALUE!", "MATCH requires 1 or 2 arguments"},
 		"MATCH(0,A1:A1,\"x\")": {"#VALUE!", "MATCH requires numeric match_type argument"},
 		"MATCH(0,A1)":          {"#N/A", "MATCH arguments lookup_array should be one-dimensional array"},
-		"MATCH(0,A1:B2)":       {"#N/A", "MATCH arguments lookup_array should be one-dimensional array"},
+		"MATCH(0,A1:B2)":       {"#N/A", "#N/A"}, // 修改：现在支持二维数组展平，返回 #N/A 而不是报错
 		"MATCH(0,A1:B1)":       {"#N/A", "#N/A"},
 		// TRANSPOSE
 		"TRANSPOSE()": {"#VALUE!", "TRANSPOSE requires 1 argument"},
