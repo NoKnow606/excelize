@@ -15261,6 +15261,154 @@ func (fn *formulaFuncs) SUBSTITUTE(argsList *list.List) formulaArg {
 	return newStringFormulaArg(pre + targetText.Value() + post)
 }
 
+// TEXTSPLIT splits text by delimiter(s) and returns the result as a dynamic
+// array. The syntax of the function is:
+//
+//	TEXTSPLIT(text, col_delimiter, [row_delimiter], [ignore_empty], [match_mode], [pad_with])
+func (fn *formulaFuncs) TEXTSPLIT(argsList *list.List) formulaArg {
+	if argsList.Len() < 2 {
+		return newErrorFormulaArg(formulaErrorVALUE, "TEXTSPLIT requires at least 2 arguments")
+	}
+	if argsList.Len() > 6 {
+		return newErrorFormulaArg(formulaErrorVALUE, "TEXTSPLIT accepts at most 6 arguments")
+	}
+
+	// 获取文本参数
+	textArg := argsList.Front().Value.(formulaArg)
+	if textArg.Type == ArgError {
+		return textArg
+	}
+	text := textArg.Value()
+
+	// 获取列分隔符
+	colDelimArg := argsList.Front().Next().Value.(formulaArg)
+	if colDelimArg.Type == ArgError {
+		return colDelimArg
+	}
+	colDelim := colDelimArg.Value()
+
+	if colDelim == "" {
+		return newErrorFormulaArg(formulaErrorVALUE, "Column delimiter cannot be empty")
+	}
+
+	// 处理可选参数
+	var rowDelim string
+	ignoreEmpty := false
+	matchMode := 0
+
+	// row_delimiter (arg 3)
+	if argsList.Len() >= 3 {
+		rowDelimArg := argsList.Front().Next().Next().Value.(formulaArg)
+		if rowDelimArg.Type == ArgError {
+			return rowDelimArg
+		}
+		rowDelim = rowDelimArg.Value()
+	}
+
+	// ignore_empty (arg 4)
+	if argsList.Len() >= 4 {
+		ignoreEmptyArg := argsList.Front().Next().Next().Next().Value.(formulaArg).ToBool()
+		if ignoreEmptyArg.Type == ArgError {
+			return ignoreEmptyArg
+		}
+		ignoreEmpty = ignoreEmptyArg.Number != 0
+	}
+
+	// match_mode (arg 5) - 0 = case-sensitive, 1 = case-insensitive
+	if argsList.Len() >= 5 {
+		matchModeArg := argsList.Front().Next().Next().Next().Next().Value.(formulaArg).ToNumber()
+		if matchModeArg.Type != ArgNumber {
+			return matchModeArg
+		}
+		matchMode = int(matchModeArg.Number)
+	}
+
+	// pad_with (arg 6) - not implemented in basic version
+	// 在基础版本中，我们使用空字符串作为填充值
+
+	// 执行分割
+	var result [][]formulaArg
+
+	if rowDelim != "" {
+		// 二维分割：先按行分隔符分割，再按列分隔符分割
+		rows := strings.Split(text, rowDelim)
+		if ignoreEmpty {
+			// 过滤空行
+			var nonEmptyRows []string
+			for _, row := range rows {
+				if strings.TrimSpace(row) != "" {
+					nonEmptyRows = append(nonEmptyRows, row)
+				}
+			}
+			rows = nonEmptyRows
+		}
+
+		// 对每行按列分隔符分割
+		maxCols := 0
+		for _, row := range rows {
+			cols := strings.Split(row, colDelim)
+			if ignoreEmpty {
+				// 过滤空列
+				var nonEmptyCols []string
+				for _, col := range cols {
+					if strings.TrimSpace(col) != "" {
+						nonEmptyCols = append(nonEmptyCols, col)
+					}
+				}
+				cols = nonEmptyCols
+			}
+			if len(cols) > maxCols {
+				maxCols = len(cols)
+			}
+			rowArgs := make([]formulaArg, len(cols))
+			for j, col := range cols {
+				// 处理大小写匹配模式
+				if matchMode == 1 {
+					col = strings.ToLower(col)
+				}
+				rowArgs[j] = newStringFormulaArg(col)
+			}
+			result = append(result, rowArgs)
+		}
+
+		// 确保所有行的列数相同（填充空字符串）
+		for i := range result {
+			if len(result[i]) < maxCols {
+				padding := make([]formulaArg, maxCols-len(result[i]))
+				for j := range padding {
+					padding[j] = newStringFormulaArg("")
+				}
+				result[i] = append(result[i], padding...)
+			}
+		}
+	} else {
+		// 一维分割：只按列分隔符分割，返回一行多列
+		cols := strings.Split(text, colDelim)
+		if ignoreEmpty {
+			// 过滤空列
+			var nonEmptyCols []string
+			for _, col := range cols {
+				if strings.TrimSpace(col) != "" {
+					nonEmptyCols = append(nonEmptyCols, col)
+				}
+			}
+			cols = nonEmptyCols
+		}
+
+		result = make([][]formulaArg, 1)
+		result[0] = make([]formulaArg, len(cols))
+		for i, col := range cols {
+			// 处理大小写匹配模式
+			if matchMode == 1 {
+				col = strings.ToLower(col)
+			}
+			result[0][i] = newStringFormulaArg(col)
+		}
+	}
+
+	return newMatrixFormulaArg(result)
+}
+
 // TEXT function converts a supplied numeric value into text, in a
 // user-specified format. The syntax of the function is:
 //

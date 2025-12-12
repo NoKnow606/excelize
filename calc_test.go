@@ -7015,23 +7015,23 @@ func TestCalcOFFSET(t *testing.T) {
 	// Test basic OFFSET with single cell result
 	calc := map[string]string{
 		// OFFSET(reference, rows, cols)
-		"=OFFSET(A1,0,0)":     "1",  // Same cell
-		"=OFFSET(A1,1,0)":     "5",  // One row down
-		"=OFFSET(A1,0,1)":     "2",  // One column right
-		"=OFFSET(A1,2,2)":     "11", // Two rows down, two columns right
-		"=OFFSET(B2,1,1)":     "11", // From B2, offset to C3
-		"=OFFSET(D4,-1,-1)":   "11", // Negative offset (up and left)
-		"=OFFSET(D4,-3,-3)":   "1",  // Offset to A1 from D4
-		
+		"=OFFSET(A1,0,0)":   "1",  // Same cell
+		"=OFFSET(A1,1,0)":   "5",  // One row down
+		"=OFFSET(A1,0,1)":   "2",  // One column right
+		"=OFFSET(A1,2,2)":   "11", // Two rows down, two columns right
+		"=OFFSET(B2,1,1)":   "11", // From B2, offset to C3
+		"=OFFSET(D4,-1,-1)": "11", // Negative offset (up and left)
+		"=OFFSET(D4,-3,-3)": "1",  // Offset to A1 from D4
+
 		// OFFSET with height and width parameters
-		"=SUM(OFFSET(A1,0,0,2,2))":   "14",  // Sum of A1:B2 (1+2+5+6)
-		"=SUM(OFFSET(A1,1,1,2,2))":   "34",  // Sum of B2:C3 (6+7+10+11)
-		"=SUM(OFFSET(B2,1,0,2,3))":   "78",  // Sum of B3:D4 (10+11+12+14+15+16)
+		"=SUM(OFFSET(A1,0,0,2,2))":     "14", // Sum of A1:B2 (1+2+5+6)
+		"=SUM(OFFSET(A1,1,1,2,2))":     "34", // Sum of B2:C3 (6+7+10+11)
+		"=SUM(OFFSET(B2,1,0,2,3))":     "78", // Sum of B3:D4 (10+11+12+14+15+16)
 		"=AVERAGE(OFFSET(A1,0,0,4,1))": "7",  // Average of A1:A4 (1+5+9+13)/4
-		
+
 		// OFFSET with single dimension
-		"=SUM(OFFSET(A1,0,0,1,4))":   "10",  // Sum of A1:D1 (1+2+3+4)
-		"=SUM(OFFSET(A1,0,0,4,1))":   "28",  // Sum of A1:A4 (1+5+9+13)
+		"=SUM(OFFSET(A1,0,0,1,4))": "10", // Sum of A1:D1 (1+2+3+4)
+		"=SUM(OFFSET(A1,0,0,4,1))": "28", // Sum of A1:A4 (1+5+9+13)
 	}
 
 	for formula, expected := range calc {
@@ -7043,14 +7043,14 @@ func TestCalcOFFSET(t *testing.T) {
 
 	// Test OFFSET error cases
 	calcError := map[string][]string{
-		"=OFFSET(A1,-1,0)":        {formulaErrorREF, "OFFSET reference is out of bounds"},
-		"=OFFSET(A1,0,-1)":        {formulaErrorREF, "OFFSET reference is out of bounds"},
-		"=OFFSET(A1,0,0,-1,1)":    {formulaErrorREF, "OFFSET height must be positive"},
-		"=OFFSET(A1,0,0,1,-1)":    {formulaErrorREF, "OFFSET width must be positive"},
-		"=OFFSET(A1,0,0,0,1)":     {formulaErrorREF, "OFFSET height must be positive"},
-		"=OFFSET(A1)":             {formulaErrorVALUE, "OFFSET requires 3 to 5 arguments"},
-		"=OFFSET(A1,0)":           {formulaErrorVALUE, "OFFSET requires 3 to 5 arguments"},
-		"=OFFSET(A1,0,0,1,1,1)":   {formulaErrorVALUE, "OFFSET requires 3 to 5 arguments"},
+		"=OFFSET(A1,-1,0)":      {formulaErrorREF, "OFFSET reference is out of bounds"},
+		"=OFFSET(A1,0,-1)":      {formulaErrorREF, "OFFSET reference is out of bounds"},
+		"=OFFSET(A1,0,0,-1,1)":  {formulaErrorREF, "OFFSET height must be positive"},
+		"=OFFSET(A1,0,0,1,-1)":  {formulaErrorREF, "OFFSET width must be positive"},
+		"=OFFSET(A1,0,0,0,1)":   {formulaErrorREF, "OFFSET height must be positive"},
+		"=OFFSET(A1)":           {formulaErrorVALUE, "OFFSET requires 3 to 5 arguments"},
+		"=OFFSET(A1,0)":         {formulaErrorVALUE, "OFFSET requires 3 to 5 arguments"},
+		"=OFFSET(A1,0,0,1,1,1)": {formulaErrorVALUE, "OFFSET requires 3 to 5 arguments"},
 	}
 
 	for formula, expected := range calcError {
@@ -7192,4 +7192,86 @@ func TestCalcOFFSETWithSORT(t *testing.T) {
 	result, err = f.CalcCellValue("Sheet1", "G1")
 	assert.NoError(t, err)
 	assert.Equal(t, "200", result) // Product B's Q1 (has highest Q4)
+}
+
+func TestCalcTEXTSPLIT(t *testing.T) {
+	cellData := [][]interface{}{
+		{"apple,banana,orange"},   // A1: basic column split
+		{"one two three four"},    // A2: space delimiter
+		{"a,b|c,d|e,f"},           // A3: two-dimensional split
+		{"a,,b,,c"},               // A4: with empty values
+		{"Apple,BANANA,Orange"},   // A5: case sensitivity test
+		{"single"},                // A6: single element
+		{""},                      // A7: empty string
+		{"red;green;blue;yellow"}, // A8: semicolon delimiter
+		{"test"},                  // A9: for error tests
+	}
+	f := prepareCalcData(cellData)
+
+	// Test 1: Basic column split - returns first element
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B1", "=TEXTSPLIT(A1,\",\")"))
+	result, err := f.CalcCellValue("Sheet1", "B1")
+	assert.NoError(t, err)
+	assert.Equal(t, "apple", result)
+
+	// Test 2: Space delimiter
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B2", "=TEXTSPLIT(A2,\" \")"))
+	result, err = f.CalcCellValue("Sheet1", "B2")
+	assert.NoError(t, err)
+	assert.Equal(t, "one", result)
+
+	// Test 3: Two-dimensional split (first element)
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B3", "=TEXTSPLIT(A3,\",\",\"|\")"))
+	result, err = f.CalcCellValue("Sheet1", "B3")
+	assert.NoError(t, err)
+	assert.Equal(t, "a", result)
+
+	// Test 4: Ignore empty values
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B4", "=TEXTSPLIT(A4,\",\",\"\",TRUE)"))
+	result, err = f.CalcCellValue("Sheet1", "B4")
+	assert.NoError(t, err)
+	assert.Equal(t, "a", result)
+
+	// Test 5: Case insensitive mode (match_mode=1)
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B5", "=TEXTSPLIT(A5,\",\",\"\",FALSE,1)"))
+	result, err = f.CalcCellValue("Sheet1", "B5")
+	assert.NoError(t, err)
+	assert.Equal(t, "apple", result) // Should be lowercase
+
+	// Test 6: Single element
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B6", "=TEXTSPLIT(A6,\",\")"))
+	result, err = f.CalcCellValue("Sheet1", "B6")
+	assert.NoError(t, err)
+	assert.Equal(t, "single", result)
+
+	// Test 7: Empty string
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B7", "=TEXTSPLIT(A7,\",\")"))
+	result, err = f.CalcCellValue("Sheet1", "B7")
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+
+	// Test 8: Semicolon delimiter
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B8", "=TEXTSPLIT(A8,\";\")"))
+	result, err = f.CalcCellValue("Sheet1", "B8")
+	assert.NoError(t, err)
+	assert.Equal(t, "red", result)
+
+	// Error tests
+	// Test 9: Missing required argument
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B9", "=TEXTSPLIT(A9)"))
+	result, err = f.CalcCellValue("Sheet1", "B9")
+	assert.Equal(t, formulaErrorVALUE, result)
+	assert.Error(t, err)
+
+	// Test 10: Empty delimiter
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B10", "=TEXTSPLIT(A9,\"\")"))
+	result, err = f.CalcCellValue("Sheet1", "B10")
+	assert.Equal(t, formulaErrorVALUE, result)
+	assert.Error(t, err)
+
+	// Test 11: Too many arguments
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B11", "=TEXTSPLIT(A9,\",\",\"|\",TRUE,0,\"\",\"extra\")"))
+	result, err = f.CalcCellValue("Sheet1", "B11")
+	assert.Equal(t, formulaErrorVALUE, result)
+	assert.Error(t, err)
 }
