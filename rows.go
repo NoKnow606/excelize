@@ -369,10 +369,8 @@ func (rows *Rows) rowXMLHandlerFormula(rowIterator *rowXMLIterator, xmlElement *
 				formula = colCell.F.Content
 			}
 		}
-		// 只添加有公式的单元格或保持位置对齐
-		if formula != "" || len(rowIterator.cells) < rowIterator.cellCol {
-			rowIterator.cells = append(appendSpace(blank, rowIterator.cells), formula)
-		}
+		// 添加公式（空字符串也要添加以保持列位置对齐）
+		rowIterator.cells = append(appendSpace(blank, rowIterator.cells), formula)
 	}
 }
 
