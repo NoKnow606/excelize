@@ -2202,6 +2202,54 @@ func (f *File) GetCellStyle(sheet, cell string) (int, error) {
 	return ws.prepareCellStyle(col, row, ws.SheetData.Row[row-1].C[col-1].S), err
 }
 
+// GetCellStyleReadOnly provides a read-only function to get cell style index
+// without modifying the worksheet structure. This is more efficient than
+// GetCellStyle when you only need to read the style.
+//
+// Unlike GetCellStyle, this function:
+//   - Does NOT create missing rows/columns
+//   - Does NOT modify worksheet XML structure
+//   - Returns 0 if cell doesn't exist (or inherited row/column style)
+//
+// This function is concurrency safe and optimized for read-only operations.
+//
+// Example:
+//
+//	styleIdx, err := f.GetCellStyleReadOnly("Sheet1", "A1")
+//	if err != nil {
+//	    fmt.Println(err)
+//	    return
+//	}
+//	fmt.Printf("Style index: %d\n", styleIdx)
+func (f *File) GetCellStyleReadOnly(sheet, cell string) (int, error) {
+	f.mu.Lock()
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		f.mu.Unlock()
+		return 0, err
+	}
+	f.mu.Unlock()
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	col, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return 0, err
+	}
+
+	// Check if cell exists without creating it
+	var cellStyle int
+	if row <= len(ws.SheetData.Row) {
+		rowData := &ws.SheetData.Row[row-1]
+		if col <= len(rowData.C) {
+			cellStyle = rowData.C[col-1].S
+		}
+	}
+
+	// Use prepareCellStyle to handle inheritance (row/column styles)
+	return ws.prepareCellStyle(col, row, cellStyle), nil
+}
+
 // SetCellStyle provides a function to add style attribute for cells by given
 // worksheet name, range reference and style ID. This function is concurrency
 // safe. Note that diagonalDown and diagonalUp type border should be use same

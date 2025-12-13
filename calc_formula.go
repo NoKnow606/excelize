@@ -55,10 +55,30 @@ func (f *File) CalcFormulaValue(sheet, cell, formula string, opts ...Options) (s
 		return "", err
 	}
 
-	// Prepare cell (ensures row/col exist in XML structure)
-	c, _, _, err := ws.prepareCell(cell)
+	// Validate cell reference
+	col, row, err := CellNameToCoordinates(cell)
 	if err != nil {
 		return "", err
+	}
+
+	// Try to get existing cell WITHOUT creating it (read-only approach)
+	var c *xlsxC
+	var isTemporaryCell bool
+	var originalRowCount int
+
+	if row <= len(ws.SheetData.Row) {
+		rowData := &ws.SheetData.Row[row-1]
+		if col <= len(rowData.C) {
+			// Cell exists, use it
+			c = &rowData.C[col-1]
+		}
+	}
+
+	// If cell doesn't exist, create a temporary one (in memory only)
+	if c == nil {
+		isTemporaryCell = true
+		c = &xlsxC{R: cell}
+		originalRowCount = len(ws.SheetData.Row) // Save original count
 	}
 
 	// Save original formula state (if any)
@@ -84,19 +104,42 @@ func (f *File) CalcFormulaValue(sheet, cell, formula string, opts ...Options) (s
 		}
 	}
 
-	// Temporarily set formula IN MEMORY ONLY (no cache clearing!)
+	// Temporarily set formula IN MEMORY ONLY
 	if c.F == nil {
 		c.F = &xlsxF{Content: formula}
 	} else {
 		c.F.Content = formula
 	}
 
+	// If using temporary cell, we need to temporarily add it to worksheet for calculation
+	if isTemporaryCell {
+		// Ensure row exists (create only necessary rows)
+		for len(ws.SheetData.Row) < row {
+			ws.SheetData.Row = append(ws.SheetData.Row, xlsxRow{
+				R: len(ws.SheetData.Row) + 1,
+				C: make([]xlsxC, 0),
+			})
+		}
+		rowData := &ws.SheetData.Row[row-1]
+		rowData.R = row
+
+		// Add temporary cell to row
+		for len(rowData.C) < col {
+			cellName, _ := CoordinatesToCellName(len(rowData.C)+1, row)
+			rowData.C = append(rowData.C, xlsxC{R: cellName})
+		}
+		rowData.C[col-1] = *c
+	}
+
 	// Calculate the result using the temporary formula
 	result, calcErr := f.CalcCellValue(sheet, cell, opts...)
 
-	// Restore original formula state
-	if !hadFormula {
-		// Cell didn't have a formula before, remove temporary one
+	// Clean up: restore original state
+	if isTemporaryCell {
+		// Remove all temporarily created rows
+		ws.SheetData.Row = ws.SheetData.Row[:originalRowCount]
+	} else if !hadFormula {
+		// Cell existed but didn't have a formula before, remove temporary one
 		c.F = nil
 	} else {
 		// Restore original formula
@@ -104,7 +147,6 @@ func (f *File) CalcFormulaValue(sheet, cell, formula string, opts ...Options) (s
 	}
 
 	// Clear cache for this cell only to prevent stale results
-	// This ensures subsequent calls with different formulas work correctly
 	ref := fmt.Sprintf("%s!%s", sheet, cell)
 	f.calcCache.Delete(ref)
 
@@ -146,88 +188,17 @@ func (f *File) CalcFormulasValues(sheet string, formulas map[string]string, opts
 		return make(map[string]string), nil
 	}
 
-	ws, err := f.workSheetReader(sheet)
-	if err != nil {
-		return nil, err
-	}
-
 	results := make(map[string]string, len(formulas))
 	var errors []error
 
-	// Save original formulas for all cells
-	originalFormulas := make(map[string]*xlsxF, len(formulas))
-	hadFormula := make(map[string]bool, len(formulas))
-
-	// Prepare all cells and save their original state
-	for cell := range formulas {
-		c, _, _, err := ws.prepareCell(cell)
-		if err != nil {
-			errors = append(errors, fmt.Errorf("failed to prepare %s: %w", cell, err))
-			continue
-		}
-
-		if c.F != nil {
-			hadFormula[cell] = true
-			// Deep copy original formula
-			originalFormulas[cell] = &xlsxF{
-				Content: c.F.Content,
-				T:       c.F.T,
-				Ref:     c.F.Ref,
-				Si:      c.F.Si,
-				Bx:      c.F.Bx,
-				Ca:      c.F.Ca,
-				Del1:    c.F.Del1,
-				Del2:    c.F.Del2,
-				Dt2D:    c.F.Dt2D,
-				Dtr:     c.F.Dtr,
-				R1:      c.F.R1,
-				R2:      c.F.R2,
-			}
-		}
-	}
-
-	// Set all temporary formulas
+	// Calculate each formula using the optimized CalcFormulaValue
 	for cell, formula := range formulas {
-		c, _, _, err := ws.prepareCell(cell)
-		if err != nil {
-			continue // Already recorded error above
-		}
-
-		if c.F == nil {
-			c.F = &xlsxF{Content: formula}
-		} else {
-			c.F.Content = formula
-		}
-	}
-
-	// Calculate all formulas
-	for cell := range formulas {
-		result, err := f.CalcCellValue(sheet, cell, opts...)
+		result, err := f.CalcFormulaValue(sheet, cell, formula, opts...)
 		if err != nil {
 			errors = append(errors, fmt.Errorf("failed to calculate %s: %w", cell, err))
 			continue
 		}
 		results[cell] = result
-	}
-
-	// Restore all original formulas
-	for cell := range formulas {
-		c, _, _, err := ws.prepareCell(cell)
-		if err != nil {
-			continue
-		}
-
-		if !hadFormula[cell] {
-			// Cell didn't have a formula before, remove temporary one
-			c.F = nil
-		} else {
-			// Restore original formula
-			c.F = originalFormulas[cell]
-		}
-
-		// Clear cache for this cell to prevent stale results
-		ref := fmt.Sprintf("%s!%s", sheet, cell)
-		f.calcCache.Delete(ref)
 	}
 
 	// Return partial results with combined errors if any
