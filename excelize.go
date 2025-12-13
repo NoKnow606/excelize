@@ -32,6 +32,7 @@ type File struct {
 	mu               sync.Mutex
 	checked          sync.Map
 	formulaChecked   bool
+	inBatchMode      bool
 	zip64Entries     []string
 	options          *Options
 	sharedStringItem [][]uint

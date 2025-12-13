@@ -184,8 +184,15 @@ func (c *xlsxC) hasValue() bool {
 func (f *File) removeFormula(c *xlsxC, ws *xlsxWorksheet, sheet string) error {
 	// When removing formula due to SetCellValue, clear entire calcCache and rangeCache
 	// to ensure all dependent formulas are recalculated
-	f.calcCache.Clear()
-	f.rangeCache.Clear()
+	// Skip cache clearing if in batch mode (will be cleared once after batch completes)
+	f.mu.Lock()
+	inBatch := f.inBatchMode
+	f.mu.Unlock()
+
+	if !inBatch {
+		f.calcCache.Clear()
+		f.rangeCache.Clear()
+	}
 	if c.F != nil && c.Vm == nil {
 		sheetID := f.getSheetID(sheet)
 		if err := f.deleteCalcChain(sheetID, c.R); err != nil {

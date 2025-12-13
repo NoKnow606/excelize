@@ -930,14 +930,14 @@ func (f *File) CalcCellValues(sheet string, cells []string, opts ...Options) (ma
 
 	// Return partial results with combined errors if any
 	if len(errors) > 0 {
-		var errMsg string
+		var sb strings.Builder
 		for i, err := range errors {
 			if i > 0 {
-				errMsg += "; "
+				sb.WriteString("; ")
 			}
-			errMsg += err.Error()
+			sb.WriteString(err.Error())
 		}
-		return results, fmt.Errorf("%s", errMsg)
+		return results, fmt.Errorf("%s", sb.String())
 	}
 
 	return results, nil
