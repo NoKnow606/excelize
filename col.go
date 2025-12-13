@@ -310,6 +310,10 @@ func (f *File) SetColVisible(sheet, columns string, visible bool) error {
 		cols := xlsxCols{}
 		cols.Col = append(cols.Col, colData)
 		ws.Cols = &cols
+		// Clear column style cache (flatCols may reorganize columns)
+		for c := minVal; c <= maxVal; c++ {
+			ws.colStyleCache.Delete(c)
+		}
 		return nil
 	}
 	ws.Cols.Col = flatCols(colData, ws.Cols.Col, func(fc, c xlsxCol) xlsxCol {
@@ -322,6 +326,10 @@ func (f *File) SetColVisible(sheet, columns string, visible bool) error {
 		fc.Width = c.Width
 		return fc
 	})
+	// Clear column style cache for affected columns
+	for c := minVal; c <= maxVal; c++ {
+		ws.colStyleCache.Delete(c)
+	}
 	return nil
 }
 
@@ -398,6 +406,8 @@ func (f *File) SetColOutlineLevel(sheet, col string, level uint8) error {
 		cols := xlsxCols{}
 		cols.Col = append(cols.Col, colData)
 		ws.Cols = &cols
+		// Clear column style cache
+		ws.colStyleCache.Delete(colNum)
 		return err
 	}
 	ws.Cols.Col = flatCols(colData, ws.Cols.Col, func(fc, c xlsxCol) xlsxCol {
@@ -410,6 +420,8 @@ func (f *File) SetColOutlineLevel(sheet, col string, level uint8) error {
 		fc.Width = c.Width
 		return fc
 	})
+	// Clear column style cache for this column
+	ws.colStyleCache.Delete(colNum)
 	return err
 }
 
@@ -486,6 +498,11 @@ func (ws *xlsxWorksheet) setColStyle(minVal, maxVal, styleID int) {
 		fc.Width = c.Width
 		return fc
 	})
+
+	// Clear column style cache for affected columns
+	for col := minVal; col <= maxVal; col++ {
+		ws.colStyleCache.Delete(col)
+	}
 }
 
 // SetColWidth provides a function to set the width of a single column or
@@ -526,6 +543,10 @@ func (ws *xlsxWorksheet) setColWidth(minVal, maxVal int, width float64) {
 		cols := xlsxCols{}
 		cols.Col = append(cols.Col, col)
 		ws.Cols = &cols
+		// Clear column style cache
+		for c := minVal; c <= maxVal; c++ {
+			ws.colStyleCache.Delete(c)
+		}
 		return
 	}
 	ws.Cols.Col = flatCols(col, ws.Cols.Col, func(fc, c xlsxCol) xlsxCol {
@@ -537,6 +558,10 @@ func (ws *xlsxWorksheet) setColWidth(minVal, maxVal int, width float64) {
 		fc.Style = c.Style
 		return fc
 	})
+	// Clear column style cache for affected columns
+	for c := minVal; c <= maxVal; c++ {
+		ws.colStyleCache.Delete(c)
+	}
 }
 
 // flatCols provides a method for the column's operation functions to flatten

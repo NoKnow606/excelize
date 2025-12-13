@@ -866,7 +866,8 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 		return
 	}
 	if !rawCellValue {
-		styleIdx, _ = f.GetCellStyle(sheet, cell)
+		// OPTIMIZATION: Use GetCellStyleReadOnly to avoid creating rows/cols
+		styleIdx, _ = f.GetCellStyleReadOnly(sheet, cell)
 	}
 	if token.Type == ArgNumber && !token.Boolean {
 		_, precision, decimal := isNumeric(token.Value())

@@ -21,6 +21,7 @@ import (
 type xlsxWorksheet struct {
 	mu                     sync.Mutex
 	formulaSI              sync.Map
+	colStyleCache          sync.Map // Cache for column styles: col -> styleID
 	XMLName                xml.Name                     `xml:"http://schemas.openxmlformats.org/spreadsheetml/2006/main worksheet"`
 	SheetPr                *xlsxSheetPr                 `xml:"sheetPr"`
 	Dimension              *xlsxDimension               `xml:"dimension"`

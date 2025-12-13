@@ -1581,21 +1581,45 @@ func (ss *xlsxStyleSheet) getCustomNumFmtCode(numFmtID int) (string, bool) {
 // prepareCellStyle provides a function to prepare style index of cell in
 // worksheet by given column index and style index.
 func (ws *xlsxWorksheet) prepareCellStyle(col, row, style int) int {
+	// Priority 1: Cell's own style (fastest path)
 	if style != 0 {
 		return style
 	}
+
+	// Priority 2: Row default style (fast path)
 	if row <= len(ws.SheetData.Row) {
 		if styleID := ws.SheetData.Row[row-1].S; styleID != 0 {
 			return styleID
 		}
 	}
-	if ws.Cols != nil {
-		for _, c := range ws.Cols.Col {
-			if c.Min <= col && col <= c.Max && c.Style != 0 {
-				return c.Style
+
+	// Priority 3: Column style with caching (optimized)
+	if ws.Cols != nil && len(ws.Cols.Col) > 0 {
+		// Check cache first
+		if cachedStyle, ok := ws.colStyleCache.Load(col); ok {
+			if styleID := cachedStyle.(int); styleID != 0 {
+				return styleID
 			}
 		}
+
+		// Cache miss: search and cache the result
+		for _, c := range ws.Cols.Col {
+			if c.Min <= col && col <= c.Max {
+				// Cache this column's style for future lookups
+				ws.colStyleCache.Store(col, c.Style)
+				if c.Style != 0 {
+					return c.Style
+				}
+				break
+			}
+		}
+
+		// If no column style found, cache 0 to avoid future searches
+		if _, ok := ws.colStyleCache.Load(col); !ok {
+			ws.colStyleCache.Store(col, 0)
+		}
 	}
+
 	return style
 }
 
