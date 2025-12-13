@@ -2297,17 +2297,17 @@ func TestCalcCellValue(t *testing.T) {
 		assert.Equal(t, expected, result, formula)
 	}
 	mathCalcError := map[string][]string{
-		"1/0":        {"", "#DIV/0!"},
-		"1^\"text\"": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"\"text\"^1": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"1+\"text\"": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"\"text\"+1": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"1-\"text\"": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"\"text\"-1": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"1*\"text\"": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"\"text\"*1": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"1/\"text\"": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
-		"\"text\"/1": {"", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"1/0":        {"#DIV/0!", "#DIV/0!"},
+		"1^\"text\"": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"\"text\"^1": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"1+\"text\"": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"\"text\"+1": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"1-\"text\"": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"\"text\"-1": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"1*\"text\"": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"\"text\"*1": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"1/\"text\"": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
+		"\"text\"/1": {"#VALUE!", "strconv.ParseFloat: parsing \"text\": invalid syntax"},
 		// Engineering Functions
 		// BESSELI
 		"BESSELI()":       {"#VALUE!", "BESSELI requires 2 numeric arguments"},
@@ -2907,7 +2907,7 @@ func TestCalcCellValue(t *testing.T) {
 		"SUM(1*)":           {ErrInvalidFormula.Error(), ErrInvalidFormula.Error()},
 		"SUM(1/)":           {ErrInvalidFormula.Error(), ErrInvalidFormula.Error()},
 		"SUM(1*SUM(1/0))":   {"#DIV/0!", "#DIV/0!"},
-		"SUM(1*SUM(1/0)*1)": {"", "#DIV/0!"},
+		"SUM(1*SUM(1/0)*1)": {"#DIV/0!", "#DIV/0!"},
 		// SUMIF
 		"SUMIF()": {"#VALUE!", "SUMIF requires at least 2 arguments"},
 		// SUMSQ
@@ -4717,7 +4717,7 @@ func TestCalcCellValue(t *testing.T) {
 		// MDETERM
 		"MDETERM(A1:B3)": {"#VALUE!", "#VALUE!"},
 		// SUM
-		"1+SUM(SUM(A1+A2/A4)*(2-3),2)": {"#VALUE!", "#DIV/0!"},
+		"1+SUM(SUM(A1+A2/A4)*(2-3),2)": {"#DIV/0!", "#DIV/0!"},
 	}
 	for formula, expected := range referenceCalcError {
 		f := prepareCalcData(cellData)

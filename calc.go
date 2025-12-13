@@ -1155,7 +1155,14 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 	if opdStack.Len() == 0 {
 		return newEmptyFormulaArg(), ErrInvalidFormula
 	}
-	return opdStack.Peek().(formulaArg), err
+	result := opdStack.Peek().(formulaArg)
+	// 方案A: 如果最终结果是错误，转换为 Go error
+	// 这样既能让 IFERROR 在计算过程中捕获错误（ArgError），
+	// 又能让 CalcCellValue API 返回 Go error 给调用者
+	if result.Type == ArgError {
+		return result, errors.New(result.Value())
+	}
+	return result, err
 }
 
 // evalInfixExpFunc evaluate formula function in the infix expression.
@@ -1222,10 +1229,20 @@ func prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack *Stack) {
 // calcPow evaluate exponentiation arithmetic operations.
 func calcPow(rOpd, lOpd formulaArg, opdStack *Stack) error {
 	lOpdVal := lOpd.ToNumber()
+	if lOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(lOpdVal)
+		return nil
+	}
 	if lOpdVal.Type != ArgNumber {
 		return errors.New(lOpdVal.Value())
 	}
 	rOpdVal := rOpd.ToNumber()
+	if rOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(rOpdVal)
+		return nil
+	}
 	if rOpdVal.Type != ArgNumber {
 		return errors.New(rOpdVal.Value())
 	}
@@ -1690,10 +1707,20 @@ func calcSplice(rOpd, lOpd formulaArg, opdStack *Stack) error {
 // calcAdd evaluate addition arithmetic operations.
 func calcAdd(rOpd, lOpd formulaArg, opdStack *Stack) error {
 	lOpdVal := lOpd.ToNumber()
+	if lOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(lOpdVal)
+		return nil
+	}
 	if lOpdVal.Type != ArgNumber {
 		return errors.New(lOpdVal.Value())
 	}
 	rOpdVal := rOpd.ToNumber()
+	if rOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(rOpdVal)
+		return nil
+	}
 	if rOpdVal.Type != ArgNumber {
 		return errors.New(rOpdVal.Value())
 	}
@@ -1710,10 +1737,20 @@ func calcSubtract(rOpd, lOpd formulaArg, opdStack *Stack) error {
 		lOpd = newNumberFormulaArg(0)
 	}
 	lOpdVal := lOpd.ToNumber()
+	if lOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(lOpdVal)
+		return nil
+	}
 	if lOpdVal.Type != ArgNumber {
 		return errors.New(lOpdVal.Value())
 	}
 	rOpdVal := rOpd.ToNumber()
+	if rOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(rOpdVal)
+		return nil
+	}
 	if rOpdVal.Type != ArgNumber {
 		return errors.New(rOpdVal.Value())
 	}
@@ -1792,10 +1829,20 @@ func calcMultiply(rOpd, lOpd formulaArg, opdStack *Stack) error {
 	}
 	// 标量乘法（现有功能）
 	lOpdVal := lOpd.ToNumber()
+	if lOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(lOpdVal)
+		return nil
+	}
 	if lOpdVal.Type != ArgNumber {
 		return errors.New(lOpdVal.Value())
 	}
 	rOpdVal := rOpd.ToNumber()
+	if rOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(rOpdVal)
+		return nil
+	}
 	if rOpdVal.Type != ArgNumber {
 		return errors.New(rOpdVal.Value())
 	}
@@ -1806,15 +1853,27 @@ func calcMultiply(rOpd, lOpd formulaArg, opdStack *Stack) error {
 // calcDiv evaluate division arithmetic operations.
 func calcDiv(rOpd, lOpd formulaArg, opdStack *Stack) error {
 	lOpdVal := lOpd.ToNumber()
+	if lOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(lOpdVal)
+		return nil
+	}
 	if lOpdVal.Type != ArgNumber {
 		return errors.New(lOpdVal.Value())
 	}
 	rOpdVal := rOpd.ToNumber()
+	if rOpdVal.Type == ArgError {
+		// 保留错误类型，让 IFERROR 能够捕获
+		opdStack.Push(rOpdVal)
+		return nil
+	}
 	if rOpdVal.Type != ArgNumber {
 		return errors.New(rOpdVal.Value())
 	}
 	if rOpdVal.Number == 0 {
-		return errors.New(formulaErrorDIV)
+		// 方案A: 除零错误也作为 ArgError 推入栈，而不是返回 Go error
+		opdStack.Push(newErrorFormulaArg(formulaErrorDIV, formulaErrorDIV))
+		return nil
 	}
 	opdStack.Push(newNumberFormulaArg(lOpdVal.Number / rOpdVal.Number))
 	return nil
@@ -1866,12 +1925,14 @@ func calculate(opdStack *Stack, opt efp.Token) error {
 				lOpd = newNumberFormulaArg(0)
 			}
 		}
-		if rOpd.Type == ArgError {
-			return errors.New(rOpd.Value())
-		}
-		if lOpd.Type == ArgError {
-			return errors.New(lOpd.Value())
-		}
+		// 方案A: 移除错误转换，让 calc 函数自己处理 ArgError
+		// 这样 ArgError 会被推入 opdStack 而不是转换为 Go error
+		// if rOpd.Type == ArgError {
+		// 	return errors.New(rOpd.Value())
+		// }
+		// if lOpd.Type == ArgError {
+		// 	return errors.New(lOpd.Value())
+		// }
 		return fn(rOpd, lOpd, opdStack)
 	}
 	return nil
@@ -15910,6 +15971,16 @@ func (fn *formulaFuncs) IF(argsList *list.List) formulaArg {
 	if argsList.Len() > 3 {
 		return newErrorFormulaArg(formulaErrorVALUE, "IF accepts at most 3 arguments")
 	}
+
+	// 方案A: 检查所有参数，如果任何参数是错误，立即返回该错误
+	// 这确保 IF 函数不会"吞掉"错误，而是正确传播给外层的 IFERROR
+	for e := argsList.Front(); e != nil; e = e.Next() {
+		arg := e.Value.(formulaArg)
+		if arg.Type == ArgError {
+			return arg
+		}
+	}
+
 	token := argsList.Front().Value.(formulaArg)
 	var (
 		cond   bool
@@ -15930,6 +16001,10 @@ func (fn *formulaFuncs) IF(argsList *list.List) formulaArg {
 	}
 	if cond {
 		value := argsList.Front().Next().Value.(formulaArg)
+		// 如果值是错误类型，直接返回错误，不要转换成字符串
+		if value.Type == ArgError {
+			return value
+		}
 		switch value.Type {
 		case ArgNumber:
 			result = value.ToNumber()
@@ -15940,6 +16015,10 @@ func (fn *formulaFuncs) IF(argsList *list.List) formulaArg {
 	}
 	if argsList.Len() == 3 {
 		value := argsList.Back().Value.(formulaArg)
+		// 如果值是错误类型，直接返回错误，不要转换成字符串
+		if value.Type == ArgError {
+			return value
+		}
 		switch value.Type {
 		case ArgNumber:
 			result = value.ToNumber()
