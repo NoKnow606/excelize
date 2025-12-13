@@ -133,7 +133,8 @@ type Rows struct {
 	err                     error
 	curRow, seekRow         int
 	needClose, rawCellValue bool
-	sheet                   string
+	sheet                   string // XML 路径 (如 xl/worksheets/sheet1.xml)
+	sheetName               string // 工作表名称 (如 "Sheet1")
 	f                       *File
 	tempFile                *os.File
 	sst                     *xlsxSST
@@ -360,8 +361,8 @@ func (rows *Rows) rowXMLHandlerFormula(rowIterator *rowXMLIterator, xmlElement *
 		if colCell.F != nil {
 			// 处理 shared formula
 			if colCell.F.T == STCellFormulaTypeShared && colCell.F.Si != nil {
-				// 尝试获取 worksheet 来解析 shared formula
-				ws, err := rows.f.workSheetReader(rows.sheet)
+				// 使用工作表名称（而非XML路径）来获取 worksheet
+				ws, err := rows.f.workSheetReader(rows.sheetName)
 				if err == nil {
 					formula, _ = getSharedFormula(ws, *colCell.F.Si, colCell.R)
 				}
@@ -470,7 +471,7 @@ func (f *File) Rows(sheet string) (*Rows, error) {
 		f.saveFileList(name, f.replaceNameSpaceBytes(name, output))
 	}
 	var err error
-	rows := Rows{f: f, sheet: name}
+	rows := Rows{f: f, sheet: name, sheetName: sheet}
 	rows.needClose, rows.decoder, rows.tempFile, err = f.xmlDecoder(name)
 	// 优化：一次性初始化 sharedStrings，避免每行都获取 mutex 锁
 	rows.sst, _ = f.sharedStringsReader()
