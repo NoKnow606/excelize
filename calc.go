@@ -396,6 +396,7 @@ type formulaFuncs struct {
 //	ACOTH
 //	ADDRESS
 //	AGGREGATE
+//	AI (requires build tag: ai_formula)
 //	AMORDEGRC
 //	AMORLINC
 //	AND

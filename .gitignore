@@ -13,3 +13,6 @@ test/Test*.xlsm
 test/Test*.xlsx
 test/Test*.xltm
 test/Test*.xltx
+docs
+tests
+temp
