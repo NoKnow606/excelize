@@ -1172,8 +1172,8 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 	}
 	prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack)
 	// call formula function to evaluate
-	arg := callFuncByName(&formulaFuncs{f: f, sheet: sheet, cell: cell, ctx: ctx}, strings.NewReplacer(
-		"_xlfn.", "", ".", "dot").Replace(opfStack.Peek().(efp.Token).TValue),
+	arg := callFuncByName(&formulaFuncs{f: f, sheet: sheet, cell: cell, ctx: ctx}, strings.ToUpper(strings.NewReplacer(
+		"_xlfn.", "", ".", "dot").Replace(opfStack.Peek().(efp.Token).TValue)),
 		[]reflect.Value{reflect.ValueOf(argsStack.Peek().(*list.List))})
 	if arg.Type == ArgError && opfStack.Len() == 1 {
 		return arg
@@ -2525,7 +2525,7 @@ func callFuncByName(receiver interface{}, name string, params []reflect.Value) (
 		arg = rt[0].Interface().(formulaArg)
 		return
 	}
-	return newErrorFormulaArg(formulaErrorVALUE, fmt.Sprintf("not support %s function", name))
+	return newErrorFormulaArg(formulaErrorVALUE, fmt.Sprintf("not support %s function", strings.ToUpper(name)))
 }
 
 // formulaCriteriaParser parse formula criteria.
