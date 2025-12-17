@@ -117,3 +117,148 @@ func (vt *xlsxVolTypes) deleteVolTopicRef(i1, i2, i3, i4 int) {
 		}
 	}
 }
+
+// UpdateCellCache updates the formula cache for a specific cell and all cells
+// that depend on it. This function uses the calculation chain (calcChain.xml)
+// to determine which cells need their cache cleared. When a cell's cache is
+// cleared, Excel will recalculate the formula when the workbook is opened.
+//
+// This is more efficient than UpdateLinkedValue() when you only need to update
+// a single cell, as it only clears the cache for the affected cell and its
+// dependents, rather than all formula cells in the workbook.
+//
+// Note: This function requires that the workbook has a valid calcChain.xml file.
+// If the calcChain doesn't exist or the cell is not found in it, the function
+// will fall back to clearing only the specified cell's cache.
+//
+// Example:
+//
+//	f.SetCellValue("Sheet1", "A1", 100)
+//	err := f.UpdateCellCache("Sheet1", "A1")
+func (f *File) UpdateCellCache(sheet, cell string) error {
+	// Get sheet index
+	sheetIndex, err := f.GetSheetIndex(sheet)
+	if err != nil {
+		return err
+	}
+
+	// Read calcChain
+	calcChain, err := f.calcChainReader()
+	if err != nil {
+		return err
+	}
+
+	// If calcChain doesn't exist or is empty, just clear the specified cell
+	if calcChain == nil || len(calcChain.C) == 0 {
+		return f.clearCellFormulaCache(sheet, cell)
+	}
+
+	// Find the cell in calcChain
+	cellIndex := f.findCellInCalcChain(calcChain, sheetIndex, cell)
+
+	// If cell not found in calcChain, just clear the specified cell
+	if cellIndex == -1 {
+		return f.clearCellFormulaCache(sheet, cell)
+	}
+
+	// Clear cache for the cell and all subsequent cells in the same sheet
+	// (subsequent cells may depend on this cell)
+	return f.clearCachesFromIndex(calcChain, sheetIndex, cellIndex)
+}
+
+// findCellInCalcChain finds the index of a cell in the calculation chain.
+// Returns -1 if the cell is not found.
+func (f *File) findCellInCalcChain(calcChain *xlsxCalcChain, sheetIndex int, cell string) int {
+	for i, c := range calcChain.C {
+		// Match by sheet index and cell reference
+		if c.I == sheetIndex && c.R == cell {
+			return i
+		}
+		// If I is 0, it means same sheet as previous cell
+		if i > 0 && c.I == 0 && c.R == cell {
+			// Check if previous cell's sheet matches
+			prevSheetIndex := calcChain.C[i-1].I
+			if prevSheetIndex == sheetIndex {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// clearCachesFromIndex clears the cache for all cells starting from the given
+// index in the calculation chain that belong to the same sheet.
+func (f *File) clearCachesFromIndex(calcChain *xlsxCalcChain, sheetIndex, startIndex int) error {
+	// Get sheet name
+	sheetName := f.GetSheetName(sheetIndex)
+	if sheetName == "" {
+		return ErrSheetNotExist{SheetName: f.GetSheetName(sheetIndex)}
+	}
+
+	// Get worksheet
+	ws, err := f.workSheetReader(sheetName)
+	if err != nil {
+		return err
+	}
+
+	// Track current sheet index (for handling I=0 case)
+	currentSheetIndex := sheetIndex
+
+	// Clear cache for cells starting from startIndex
+	for i := startIndex; i < len(calcChain.C); i++ {
+		c := calcChain.C[i]
+
+		// Update current sheet index if specified
+		if c.I != 0 {
+			currentSheetIndex = c.I
+		}
+
+		// Only clear cache for cells in the same sheet
+		if currentSheetIndex != sheetIndex {
+			continue
+		}
+
+		// Clear the cell's cache
+		if err := f.clearCellFormulaCacheInWorksheet(ws, c.R); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// clearCellFormulaCache clears the formula cache for a single cell.
+func (f *File) clearCellFormulaCache(sheet, cell string) error {
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		return err
+	}
+	return f.clearCellFormulaCacheInWorksheet(ws, cell)
+}
+
+// clearCellFormulaCacheInWorksheet clears the formula cache value for a cell in a worksheet.
+func (f *File) clearCellFormulaCacheInWorksheet(ws *xlsxWorksheet, cell string) error {
+	_, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return err
+	}
+
+	// Find the cell in the worksheet
+	for i := range ws.SheetData.Row {
+		if ws.SheetData.Row[i].R == row {
+			for j := range ws.SheetData.Row[i].C {
+				if ws.SheetData.Row[i].C[j].R == cell {
+					// Clear cache if cell has a formula
+					if ws.SheetData.Row[i].C[j].F != nil {
+						ws.SheetData.Row[i].C[j].V = ""
+						ws.SheetData.Row[i].C[j].T = ""
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	// Cell not found or doesn't have a formula - not an error
+	return nil
+}

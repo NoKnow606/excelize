@@ -1179,8 +1179,10 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 	}
 	prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack)
 	// call formula function to evaluate
-	arg := callFuncByName(&formulaFuncs{f: f, sheet: sheet, cell: cell, ctx: ctx}, strings.ToUpper(strings.NewReplacer(
-		"_xlfn.", "", ".", "dot").Replace(opfStack.Peek().(efp.Token).TValue)),
+	funcName := opfStack.Peek().(efp.Token).TValue
+	funcName = strings.ToUpper(funcName)
+	funcName = strings.NewReplacer("_XLFN.", "", "_xlfn.", "", ".", "dot").Replace(funcName)
+	arg := callFuncByName(&formulaFuncs{f: f, sheet: sheet, cell: cell, ctx: ctx}, funcName,
 		[]reflect.Value{reflect.ValueOf(argsStack.Peek().(*list.List))})
 	if arg.Type == ArgError && opfStack.Len() == 1 {
 		return arg
@@ -6442,9 +6444,10 @@ func calcStdevPow(result, count float64, n, m formulaArg) (float64, float64) {
 func calcStdev(stdeva bool, result, count float64, mean, token formulaArg) (float64, float64) {
 	for _, row := range token.ToList() {
 		if row.Type == ArgNumber || row.Type == ArgString {
-			if !stdeva && (row.Value() == "TRUE" || row.Value() == "FALSE") {
+			upperValue := strings.ToUpper(row.Value())
+			if !stdeva && (upperValue == "TRUE" || upperValue == "FALSE") {
 				continue
-			} else if stdeva && (row.Value() == "TRUE" || row.Value() == "FALSE") {
+			} else if stdeva && (upperValue == "TRUE" || upperValue == "FALSE") {
 				num := row.ToBool()
 				if num.Type == ArgNumber {
 					result, count = calcStdevPow(result, count, num, mean)
@@ -6474,9 +6477,10 @@ func (fn *formulaFuncs) stdev(stdeva bool, argsList *list.List) formulaArg {
 		token := arg.Value.(formulaArg)
 		switch token.Type {
 		case ArgString, ArgNumber:
-			if !stdeva && (token.Value() == "TRUE" || token.Value() == "FALSE") {
+			upperValue := strings.ToUpper(token.Value())
+			if !stdeva && (upperValue == "TRUE" || upperValue == "FALSE") {
 				continue
-			} else if stdeva && (token.Value() == "TRUE" || token.Value() == "FALSE") {
+			} else if stdeva && (upperValue == "TRUE" || upperValue == "FALSE") {
 				num := token.ToBool()
 				if num.Type == ArgNumber {
 					result, count = calcStdevPow(result, count, num, mean)
@@ -8644,9 +8648,10 @@ func (fn *formulaFuncs) countSum(countText bool, args []formulaArg) (count, sum 
 				count++
 			}
 		case ArgString:
-			if !countText && (arg.Value() == "TRUE" || arg.Value() == "FALSE") {
+			upperValue := strings.ToUpper(arg.Value())
+			if !countText && (upperValue == "TRUE" || upperValue == "FALSE") {
 				continue
-			} else if countText && (arg.Value() == "TRUE" || arg.Value() == "FALSE") {
+			} else if countText && (upperValue == "TRUE" || upperValue == "FALSE") {
 				num := arg.ToBool()
 				if num.Type == ArgNumber {
 					count++
@@ -11183,7 +11188,8 @@ func (fn *formulaFuncs) maxValue(maxa bool, argsList *list.List) formulaArg {
 		arg := token.Value.(formulaArg)
 		switch arg.Type {
 		case ArgString:
-			if !maxa && (arg.Value() == "TRUE" || arg.Value() == "FALSE") {
+			upperValue := strings.ToUpper(arg.Value())
+			if !maxa && (upperValue == "TRUE" || upperValue == "FALSE") {
 				continue
 			} else {
 				num := arg.ToBool()
@@ -11326,7 +11332,8 @@ func (fn *formulaFuncs) minValue(mina bool, argsList *list.List) formulaArg {
 		arg := token.Value.(formulaArg)
 		switch arg.Type {
 		case ArgString:
-			if !mina && (arg.Value() == "TRUE" || arg.Value() == "FALSE") {
+			upperValue := strings.ToUpper(arg.Value())
+			if !mina && (upperValue == "TRUE" || upperValue == "FALSE") {
 				continue
 			} else {
 				num := arg.ToBool()
@@ -12786,7 +12793,7 @@ func (fn *formulaFuncs) N(argsList *list.List) formulaArg {
 	if arg := token.ToNumber(); arg.Type == ArgNumber {
 		num = arg.Number
 	}
-	if token.Value() == "TRUE" {
+	if strings.ToUpper(token.Value()) == "TRUE" {
 		num = 1
 	}
 	return newNumberFormulaArg(num)
@@ -12926,11 +12933,12 @@ func (fn *formulaFuncs) AND(argsList *list.List) formulaArg {
 		case ArgUnknown:
 			continue
 		case ArgString:
-			if token.String == "TRUE" {
+			upperStr := strings.ToUpper(token.String)
+			if upperStr == "TRUE" {
 				continue
 			}
-			if token.String == "FALSE" {
-				return newStringFormulaArg(token.String)
+			if upperStr == "FALSE" {
+				return newStringFormulaArg(upperStr)
 			}
 			return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
 		case ArgNumber:
@@ -13051,10 +13059,11 @@ func (fn *formulaFuncs) OR(argsList *list.List) formulaArg {
 		case ArgUnknown:
 			continue
 		case ArgString:
-			if token.String == "FALSE" {
+			upperStr := strings.ToUpper(token.String)
+			if upperStr == "FALSE" {
 				continue
 			}
-			if token.String == "TRUE" {
+			if upperStr == "TRUE" {
 				or = true
 				continue
 			}
