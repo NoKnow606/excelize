@@ -6137,7 +6137,9 @@ func TestCalcMATCH(t *testing.T) {
 		assert.EqualError(t, err, expected, formula)
 		assert.Equal(t, expected, result, formula)
 	}
-	assert.Equal(t, newErrorFormulaArg(formulaErrorNA, formulaErrorNA), calcMatch(2, nil, []formulaArg{}))
+	// Test calcMatch with invalid matchType
+	fn := formulaFuncs{f: f}
+	assert.Equal(t, newErrorFormulaArg(formulaErrorNA, formulaErrorNA), fn.calcMatch(2, nil, []formulaArg{}))
 }
 
 func TestCalcISFORMULA(t *testing.T) {

@@ -16569,13 +16569,13 @@ func calcMatchMatrix(vertical bool, matchType int, criteria *formulaCriteria, lo
 
 // calcMatch returns the position of the value by given match type, criteria
 // and lookup array for the formula function MATCH.
-func calcMatch(matchType int, criteria *formulaCriteria, lookupArray []formulaArg) formulaArg {
+func (fn *formulaFuncs) calcMatch(matchType int, criteria *formulaCriteria, lookupArray []formulaArg) formulaArg {
 	idx := -1
 	switch matchType {
 	case 0: // Exact match
 		// Use hash index for large datasets (>100 elements)
 		// Hash lookup is O(1) vs O(n) for linear search
-		if len(lookupArray) > 100 && criteria.Type == criteriaEq {
+		if len(lookupArray) > 100 {
 			// Build hash index with type-aware keys
 			hashIndex := make(map[string]int)
 			lookupIsNumber := criteria.Condition.Type == ArgNumber
@@ -16699,7 +16699,7 @@ func (fn *formulaFuncs) MATCH(argsList *list.List) formulaArg {
 	default:
 		return newErrorFormulaArg(formulaErrorNA, lookupArrayErr)
 	}
-	return calcMatch(matchType, formulaCriteriaParser(argsList.Front().Value.(formulaArg)), lookupArray)
+	return fn.calcMatch(matchType, formulaCriteriaParser(argsList.Front().Value.(formulaArg)), lookupArray)
 }
 
 // TRANSPOSE function 'transposes' an array of cells (i.e. the function copies
