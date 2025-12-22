@@ -772,3 +772,90 @@ func TestGetStyle(t *testing.T) {
 	assert.Nil(t, style)
 	assert.EqualError(t, err, "XML syntax error on line 1: invalid UTF-8")
 }
+
+func TestGetCellStylesReadOnly(t *testing.T) {
+	f := NewFile()
+
+	// Create styles
+	style1, err := f.NewStyle(&Style{Fill: Fill{Type: "pattern", Pattern: 1, Color: []string{"FF0000"}}})
+	assert.NoError(t, err)
+	style2, err := f.NewStyle(&Style{Fill: Fill{Type: "pattern", Pattern: 1, Color: []string{"00FF00"}}})
+	assert.NoError(t, err)
+
+	// Set cell styles
+	assert.NoError(t, f.SetCellStyle("Sheet1", "A1", "A1", style1))
+	assert.NoError(t, f.SetCellStyle("Sheet1", "B2", "B2", style2))
+	assert.NoError(t, f.SetCellStyle("Sheet1", "C3", "C3", style1))
+
+	// Test batch get styles
+	styles, err := f.GetCellStylesReadOnly("Sheet1", []string{"A1", "B2", "C3", "D4"})
+	assert.NoError(t, err)
+	assert.Equal(t, style1, styles["A1"])
+	assert.Equal(t, style2, styles["B2"])
+	assert.Equal(t, style1, styles["C3"])
+	assert.Equal(t, 0, styles["D4"]) // Non-existent cell
+
+	// Test with invalid cell
+	_, err = f.GetCellStylesReadOnly("Sheet1", []string{"A1", "InvalidCell"})
+	assert.Error(t, err)
+
+	// Test with invalid sheet
+	_, err = f.GetCellStylesReadOnly("InvalidSheet", []string{"A1"})
+	assert.Error(t, err)
+
+	// Test empty cells list
+	styles, err = f.GetCellStylesReadOnly("Sheet1", []string{})
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(styles))
+}
+
+func TestGetCellStylesWithDetails(t *testing.T) {
+	f := NewFile()
+
+	// Create styles with different properties
+	style1, err := f.NewStyle(&Style{
+		Font: &Font{Bold: true, Color: "FF0000"},
+		Fill: Fill{Type: "pattern", Pattern: 1, Color: []string{"FFFF00"}},
+	})
+	assert.NoError(t, err)
+	style2, err := f.NewStyle(&Style{
+		Font: &Font{Italic: true, Color: "00FF00"},
+		Fill: Fill{Type: "pattern", Pattern: 1, Color: []string{"00FFFF"}},
+	})
+	assert.NoError(t, err)
+
+	// Set cell styles
+	assert.NoError(t, f.SetCellStyle("Sheet1", "A1", "A1", style1))
+	assert.NoError(t, f.SetCellStyle("Sheet1", "B2", "B2", style2))
+	assert.NoError(t, f.SetCellStyle("Sheet1", "C3", "C3", style1)) // Same as A1
+
+	// Test batch get styles with details
+	styles, err := f.GetCellStylesWithDetails("Sheet1", []string{"A1", "B2", "C3", "D4"})
+	assert.NoError(t, err)
+	assert.Equal(t, 4, len(styles))
+
+	// Verify A1 style
+	assert.NotNil(t, styles["A1"])
+	assert.True(t, styles["A1"].Font.Bold)
+	assert.Equal(t, "FF0000", styles["A1"].Font.Color)
+
+	// Verify B2 style
+	assert.NotNil(t, styles["B2"])
+	assert.True(t, styles["B2"].Font.Italic)
+	assert.Equal(t, "00FF00", styles["B2"].Font.Color)
+
+	// Verify C3 style (same as A1, should use cache)
+	assert.NotNil(t, styles["C3"])
+	assert.True(t, styles["C3"].Font.Bold)
+
+	// Verify D4 (non-existent cell, should have default style)
+	assert.NotNil(t, styles["D4"])
+
+	// Test with invalid cell
+	_, err = f.GetCellStylesWithDetails("Sheet1", []string{"InvalidCell"})
+	assert.Error(t, err)
+
+	// Test with invalid sheet
+	_, err = f.GetCellStylesWithDetails("InvalidSheet", []string{"A1"})
+	assert.Error(t, err)
+}

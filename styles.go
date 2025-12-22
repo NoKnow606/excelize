@@ -2250,6 +2250,142 @@ func (f *File) GetCellStyleReadOnly(sheet, cell string) (int, error) {
 	return ws.prepareCellStyle(col, row, cellStyle), nil
 }
 
+// GetCellStylesReadOnly provides a batch read-only function to get cell style
+// indexes for multiple cells without modifying the worksheet structure.
+//
+// This function is more efficient than calling GetCellStyleReadOnly multiple
+// times because it only locks the worksheet once.
+//
+// Example:
+//
+//	styles, err := f.GetCellStylesReadOnly("Sheet1", []string{"A1", "B2", "C3"})
+//	if err != nil {
+//	    fmt.Println(err)
+//	    return
+//	}
+//	for cell, styleID := range styles {
+//	    fmt.Printf("Cell %s has style ID: %d\n", cell, styleID)
+//	}
+func (f *File) GetCellStylesReadOnly(sheet string, cells []string) (map[string]int, error) {
+	f.mu.Lock()
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.mu.Unlock()
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	results := make(map[string]int, len(cells))
+	for _, cell := range cells {
+		col, row, err := CellNameToCoordinates(cell)
+		if err != nil {
+			return nil, err
+		}
+
+		var cellStyle int
+		if row <= len(ws.SheetData.Row) {
+			rowData := &ws.SheetData.Row[row-1]
+			if col <= len(rowData.C) {
+				cellStyle = rowData.C[col-1].S
+			}
+		}
+		results[cell] = ws.prepareCellStyle(col, row, cellStyle)
+	}
+	return results, nil
+}
+
+// GetCellStylesWithDetails provides a batch read-only function to get cell
+// style details for multiple cells without modifying the worksheet structure.
+//
+// This function returns the full Style object for each cell, eliminating the
+// need to call GetStyle separately for each styleID.
+//
+// Example:
+//
+//	styles, err := f.GetCellStylesWithDetails("Sheet1", []string{"A1", "B2", "C3"})
+//	if err != nil {
+//	    fmt.Println(err)
+//	    return
+//	}
+//	for cell, style := range styles {
+//	    if style != nil && style.Font != nil {
+//	        fmt.Printf("Cell %s font: %v\n", cell, style.Font.Bold)
+//	    }
+//	}
+func (f *File) GetCellStylesWithDetails(sheet string, cells []string) (map[string]*Style, error) {
+	f.mu.Lock()
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	s, err := f.stylesReader()
+	if err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.mu.Unlock()
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	// Cache to avoid parsing same styleID multiple times
+	styleCache := make(map[int]*Style)
+	results := make(map[string]*Style, len(cells))
+
+	for _, cell := range cells {
+		col, row, err := CellNameToCoordinates(cell)
+		if err != nil {
+			return nil, err
+		}
+
+		var cellStyle int
+		if row <= len(ws.SheetData.Row) {
+			rowData := &ws.SheetData.Row[row-1]
+			if col <= len(rowData.C) {
+				cellStyle = rowData.C[col-1].S
+			}
+		}
+		styleID := ws.prepareCellStyle(col, row, cellStyle)
+
+		// Check cache first
+		if cachedStyle, ok := styleCache[styleID]; ok {
+			results[cell] = cachedStyle
+			continue
+		}
+
+		// Parse style
+		if styleID < 0 || s.CellXfs == nil || len(s.CellXfs.Xf) <= styleID {
+			results[cell] = nil
+			continue
+		}
+
+		style := &Style{}
+		xf := s.CellXfs.Xf[styleID]
+		if extractStyleCondFuncs["fill"](xf, s) {
+			f.extractFills(s.Fills.Fill[*xf.FillID], s, style)
+		}
+		if extractStyleCondFuncs["border"](xf, s) {
+			f.extractBorders(s.Borders.Border[*xf.BorderID], s, style)
+		}
+		if extractStyleCondFuncs["font"](xf, s) {
+			style.Font = extractFont(s.Fonts.Font[*xf.FontID])
+		}
+		if extractStyleCondFuncs["alignment"](xf, s) {
+			f.extractAlignment(xf.Alignment, s, style)
+		}
+		if extractStyleCondFuncs["protection"](xf, s) {
+			f.extractProtection(xf.Protection, s, style)
+		}
+		f.extractNumFmt(xf.NumFmtID, s, style)
+
+		styleCache[styleID] = style
+		results[cell] = style
+	}
+	return results, nil
+}
+
 // SetCellStyle provides a function to add style attribute for cells by given
 // worksheet name, range reference and style ID. This function is concurrency
 // safe. Note that diagonalDown and diagonalUp type border should be use same
