@@ -92,7 +92,7 @@ func TestGetRangeDataConcurrent(t *testing.T) {
 	assert.Equal(t, "FF0000", data[0][0].Style.Fill.Color[0])
 
 	// Verify second column has formulas
-	assert.Contains(t, data[0][1].Formula, "A1")
+	assert.Contains(t, data[0][1].Formula, "=A1")
 
 	// Verify other cells have values
 	assert.Equal(t, "R1C3", data[0][2].Value)

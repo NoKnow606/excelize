@@ -406,8 +406,8 @@ func (f *File) getCellDataFromWorksheet(ws *xlsxWorksheet, sst *xlsxSST, s *xlsx
 			}
 
 			var formula string
-			if colData.F != nil {
-				formula = colData.F.Content
+			if colData.F != nil && colData.F.Content != "" {
+				formula = "=" + colData.F.Content
 			}
 
 			return CellData{
