@@ -506,6 +506,35 @@ func TestSetSheetName(t *testing.T) {
 	for i, expected := range []string{"'Sheet 2'!$A$1:$A$2", "$B$2", "$A1$2:A2", "'Sheet 2'!$A$1:'Sheet 2'!A1:'Sheet 2'!$A$1,'Sheet 2'!A1:Sheet3!A1,Sheet3!A1", "'Sheet 3'!$A1$2:A2"} {
 		assert.Equal(t, expected, f.WorkBook.DefinedNames.DefinedName[i].Data)
 	}
+
+	// Test formula updates when renaming sheets
+	f2 := NewFile()
+	_, err = f2.NewSheet("Data")
+	assert.NoError(t, err)
+	_, err = f2.NewSheet("Summary")
+	assert.NoError(t, err)
+
+	// Set values and formulas
+	assert.NoError(t, f2.SetCellValue("Data", "A1", 100))
+	assert.NoError(t, f2.SetCellFormula("Summary", "A1", "Data!A1*2"))
+	assert.NoError(t, f2.SetCellFormula("Summary", "A2", "'Data'!A1+10"))
+	assert.NoError(t, f2.SetCellFormula("Summary", "A3", "SUM(Data!A1:A10)"))
+
+	// Rename Data sheet
+	assert.NoError(t, f2.SetSheetName("Data", "数据表"))
+
+	// Verify formulas are updated
+	formula1, err := f2.GetCellFormula("Summary", "A1")
+	assert.NoError(t, err)
+	assert.Equal(t, "数据表!A1*2", formula1)
+
+	formula2, err := f2.GetCellFormula("Summary", "A2")
+	assert.NoError(t, err)
+	assert.Equal(t, "数据表!A1+10", formula2)
+
+	formula3, err := f2.GetCellFormula("Summary", "A3")
+	assert.NoError(t, err)
+	assert.Equal(t, "SUM(数据表!A1:A10)", formula3)
 }
 
 func TestWorksheetWriter(t *testing.T) {

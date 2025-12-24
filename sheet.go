@@ -369,10 +369,9 @@ func (f *File) getActiveSheetID() int {
 }
 
 // SetSheetName provides a function to set the worksheet name by given source and
-// target worksheet names. Maximum 31 characters are allowed in sheet title and
-// this function only changes the name of the sheet and will not update the
-// sheet name in the formula or reference associated with the cell. So there
-// may be problem formula error or reference missing.
+// target worksheet names. Maximum 31 characters are allowed in sheet title.
+// This function updates the sheet name and automatically adjusts all formulas
+// that reference the renamed sheet.
 func (f *File) SetSheetName(source, target string) error {
 	var err error
 	if err = checkSheetName(source); err != nil {
@@ -394,13 +393,60 @@ func (f *File) SetSheetName(source, target string) error {
 			delete(f.sheetMap, source)
 		}
 	}
-	if wb.DefinedNames == nil {
-		return err
+	if wb.DefinedNames != nil {
+		for i, dn := range wb.DefinedNames.DefinedName {
+			wb.DefinedNames.DefinedName[i].Data = adjustRangeSheetName(dn.Data, source, target)
+		}
 	}
-	for i, dn := range wb.DefinedNames.DefinedName {
-		wb.DefinedNames.DefinedName[i].Data = adjustRangeSheetName(dn.Data, source, target)
+
+	// Update formulas in all worksheets
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for sheetName := range f.sheetMap {
+		if ws, err := f.workSheetReader(sheetName); err == nil {
+			f.updateFormulasInWorksheet(ws, source, target)
+		}
 	}
+
 	return err
+}
+
+// updateFormulasInWorksheet updates all formulas in a worksheet that reference the renamed sheet
+func (f *File) updateFormulasInWorksheet(ws *xlsxWorksheet, oldName, newName string) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	// Escape sheet names for pattern matching
+	oldNameEscaped := escapeSheetName(oldName)
+	newNameEscaped := escapeSheetName(newName)
+
+	// Update formulas in all cells
+	for rowIdx := range ws.SheetData.Row {
+		for cellIdx := range ws.SheetData.Row[rowIdx].C {
+			cell := &ws.SheetData.Row[rowIdx].C[cellIdx]
+			if cell.F != nil && cell.F.Content != "" {
+				cell.F.Content = updateFormulaSheetName(cell.F.Content, oldNameEscaped, newNameEscaped)
+			}
+		}
+	}
+}
+
+// updateFormulaSheetName replaces sheet name references in a formula
+func updateFormulaSheetName(formula, oldName, newName string) string {
+	// Handle patterns like: SheetName!A1, 'Sheet Name'!A1
+	// Need to handle both quoted and unquoted sheet names
+
+	// Pattern 1: 'OldName'!
+	if strings.Contains(oldName, "'") {
+		formula = strings.ReplaceAll(formula, oldName+"!", newName+"!")
+	} else {
+		// Pattern 2: OldName! (without quotes)
+		formula = strings.ReplaceAll(formula, oldName+"!", newName+"!")
+		// Pattern 3: 'OldName'! (with quotes)
+		formula = strings.ReplaceAll(formula, "'"+oldName+"'!", newName+"!")
+	}
+
+	return formula
 }
 
 // GetSheetName provides a function to get the sheet name of the workbook by

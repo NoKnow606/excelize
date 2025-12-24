@@ -284,7 +284,7 @@ func (f *File) adjustCellRef(cellRef string, dir adjustDirection, num, offset in
 func (f *File) adjustFormula(sheet, sheetN string, cell *xlsxC, dir adjustDirection, num, offset int, si bool) error {
 	var err error
 	if cell.f != "" {
-		if cell.f, err = f.adjustFormulaRef(sheet, sheetN, cell.f, false, dir, num, offset); err != nil {
+		if cell.f, err = f.adjustFormulaRef(sheet, sheetN, cell.f, false, dir, num, offset, si); err != nil {
 			return err
 		}
 	}
@@ -300,7 +300,7 @@ func (f *File) adjustFormula(sheet, sheetN string, cell *xlsxC, dir adjustDirect
 		}
 	}
 	if cell.F.Content != "" {
-		if cell.F.Content, err = f.adjustFormulaRef(sheet, sheetN, cell.F.Content, false, dir, num, offset); err != nil {
+		if cell.F.Content, err = f.adjustFormulaRef(sheet, sheetN, cell.F.Content, false, dir, num, offset, si); err != nil {
 			return err
 		}
 	}
@@ -319,7 +319,7 @@ func escapeSheetName(name string) string {
 }
 
 // adjustFormulaColumnName adjust column name in the formula reference.
-func adjustFormulaColumnName(name, operand string, abs, keepRelative bool, dir adjustDirection, num, offset int) (string, string, bool, error) {
+func adjustFormulaColumnName(name, operand string, abs, keepRelative bool, dir adjustDirection, num, offset int, isDuplicate bool) (string, string, bool, error) {
 	if name == "" || (!abs && keepRelative) {
 		return "", operand + name, abs, nil
 	}
@@ -328,8 +328,20 @@ func adjustFormulaColumnName(name, operand string, abs, keepRelative bool, dir a
 		return "", operand, false, err
 	}
 	if dir == columns && col >= num {
+		// Check if the referenced column is being deleted
+		// Don't produce #REF! when:
+		// - isDuplicate is true (DuplicateRowTo case)
+		// - keepRelative is true (defined names case - they should adjust to the new column)
+		if !isDuplicate && !keepRelative && offset < 0 && col >= num && col < num-offset {
+			// Column is being deleted, return #REF!
+			return "", operand + "#REF!", false, nil
+		}
 		if col += offset; col < 1 {
-			col = 1
+			// Reference moved out of bounds, return #REF!
+			// Unless keepRelative is true (defined names should not produce #REF!)
+			if !keepRelative {
+				return "", operand + "#REF!", false, nil
+			}
 		}
 		colName, err := ColumnNumberToName(col)
 		return "", operand + colName, false, err
@@ -338,14 +350,26 @@ func adjustFormulaColumnName(name, operand string, abs, keepRelative bool, dir a
 }
 
 // adjustFormulaRowNumber adjust row number in the formula reference.
-func adjustFormulaRowNumber(name, operand string, abs, keepRelative bool, dir adjustDirection, num, offset int) (string, string, bool, error) {
+func adjustFormulaRowNumber(name, operand string, abs, keepRelative bool, dir adjustDirection, num, offset int, isDuplicate bool) (string, string, bool, error) {
 	if name == "" || (!abs && keepRelative) {
 		return "", operand + name, abs, nil
 	}
 	row, _ := strconv.Atoi(name)
 	if dir == rows && row >= num {
+		// Check if the referenced row is being deleted
+		// Don't produce #REF! when:
+		// - isDuplicate is true (DuplicateRowTo case)
+		// - keepRelative is true (defined names case - they should adjust to the new row)
+		if !isDuplicate && !keepRelative && offset < 0 && row >= num && row < num-offset {
+			// Row is being deleted, return #REF!
+			return "", operand + "#REF!", false, nil
+		}
 		if row += offset; row < 1 {
-			row = 1
+			// Reference moved out of bounds, return #REF!
+			// Unless keepRelative is true (defined names should not produce #REF!)
+			if !keepRelative {
+				return "", operand + "#REF!", false, nil
+			}
 		}
 		if row > TotalRows {
 			return "", operand + name, false, ErrMaxRows
@@ -356,18 +380,18 @@ func adjustFormulaRowNumber(name, operand string, abs, keepRelative bool, dir ad
 }
 
 // adjustFormulaOperandRef adjust cell reference in the operand tokens for the formula.
-func adjustFormulaOperandRef(row, col, operand string, abs, keepRelative bool, dir adjustDirection, num int, offset int) (string, string, string, bool, error) {
+func adjustFormulaOperandRef(row, col, operand string, abs, keepRelative bool, dir adjustDirection, num int, offset int, isDuplicate bool) (string, string, string, bool, error) {
 	var err error
-	col, operand, abs, err = adjustFormulaColumnName(col, operand, abs, keepRelative, dir, num, offset)
+	col, operand, abs, err = adjustFormulaColumnName(col, operand, abs, keepRelative, dir, num, offset, isDuplicate)
 	if err != nil {
 		return row, col, operand, abs, err
 	}
-	row, operand, abs, err = adjustFormulaRowNumber(row, operand, abs, keepRelative, dir, num, offset)
+	row, operand, abs, err = adjustFormulaRowNumber(row, operand, abs, keepRelative, dir, num, offset, isDuplicate)
 	return row, col, operand, abs, err
 }
 
 // adjustFormulaOperand adjust range operand tokens for the formula.
-func (f *File) adjustFormulaOperand(sheet, sheetN string, keepRelative bool, token efp.Token, dir adjustDirection, num int, offset int) (string, error) {
+func (f *File) adjustFormulaOperand(sheet, sheetN string, keepRelative bool, token efp.Token, dir adjustDirection, num int, offset int, isDuplicate bool) (string, error) {
 	var (
 		err                          error
 		abs                          bool
@@ -387,7 +411,7 @@ func (f *File) adjustFormulaOperand(sheet, sheetN string, keepRelative bool, tok
 	}
 	for _, r := range cell {
 		if r == '$' {
-			if col, operand, _, err = adjustFormulaColumnName(col, operand, abs, keepRelative, dir, num, offset); err != nil {
+			if col, operand, _, err = adjustFormulaColumnName(col, operand, abs, keepRelative, dir, num, offset, isDuplicate); err != nil {
 				return operand, err
 			}
 			abs = true
@@ -400,24 +424,24 @@ func (f *File) adjustFormulaOperand(sheet, sheetN string, keepRelative bool, tok
 		}
 		if '0' <= r && r <= '9' {
 			row += string(r)
-			col, operand, abs, err = adjustFormulaColumnName(col, operand, abs, keepRelative, dir, num, offset)
+			col, operand, abs, err = adjustFormulaColumnName(col, operand, abs, keepRelative, dir, num, offset, isDuplicate)
 			if err != nil {
 				return operand, err
 			}
 			continue
 		}
-		if row, col, operand, abs, err = adjustFormulaOperandRef(row, col, operand, abs, keepRelative, dir, num, offset); err != nil {
+		if row, col, operand, abs, err = adjustFormulaOperandRef(row, col, operand, abs, keepRelative, dir, num, offset, isDuplicate); err != nil {
 			return operand, err
 		}
 		operand += string(r)
 	}
-	_, _, operand, _, err = adjustFormulaOperandRef(row, col, operand, abs, keepRelative, dir, num, offset)
+	_, _, operand, _, err = adjustFormulaOperandRef(row, col, operand, abs, keepRelative, dir, num, offset, isDuplicate)
 	return operand, err
 }
 
 // adjustFormulaRef returns adjusted formula by giving adjusting direction and
 // the base number of column or row, and offset.
-func (f *File) adjustFormulaRef(sheet, sheetN, formula string, keepRelative bool, dir adjustDirection, num, offset int) (string, error) {
+func (f *File) adjustFormulaRef(sheet, sheetN, formula string, keepRelative bool, dir adjustDirection, num, offset int, isDuplicate bool) (string, error) {
 	var (
 		val          string
 		definedNames []string
@@ -442,7 +466,7 @@ func (f *File) adjustFormulaRef(sheet, sheetN, formula string, keepRelative bool
 				val += token.TValue
 				continue
 			}
-			operand, err := f.adjustFormulaOperand(sheet, sheetN, keepRelative, token, dir, num, offset)
+			operand, err := f.adjustFormulaOperand(sheet, sheetN, keepRelative, token, dir, num, offset, isDuplicate)
 			if err != nil {
 				return val, err
 			}
@@ -631,7 +655,7 @@ func (f *File) adjustHyperlinks(ws *xlsxWorksheet, sheet string, dir adjustDirec
 	}
 	for i := range ws.Hyperlinks.Hyperlink {
 		link := &ws.Hyperlinks.Hyperlink[i] // get reference
-		link.Ref, _ = f.adjustFormulaRef(sheet, sheet, link.Ref, false, dir, num, offset)
+		link.Ref, _ = f.adjustFormulaRef(sheet, sheet, link.Ref, false, dir, num, offset, false)
 	}
 }
 
@@ -988,14 +1012,14 @@ func (f *File) adjustDataValidations(ws *xlsxWorksheet, sheet string, dir adjust
 			}
 			if worksheet.DataValidations.DataValidation[i].Formula1.isFormula() {
 				formula := formulaUnescaper.Replace(worksheet.DataValidations.DataValidation[i].Formula1.Content)
-				if formula, err = f.adjustFormulaRef(sheet, sheetN, formula, false, dir, num, offset); err != nil {
+				if formula, err = f.adjustFormulaRef(sheet, sheetN, formula, false, dir, num, offset, false); err != nil {
 					return err
 				}
 				worksheet.DataValidations.DataValidation[i].Formula1 = &xlsxInnerXML{Content: formulaEscaper.Replace(formula)}
 			}
 			if worksheet.DataValidations.DataValidation[i].Formula2.isFormula() {
 				formula := formulaUnescaper.Replace(worksheet.DataValidations.DataValidation[i].Formula2.Content)
-				if formula, err = f.adjustFormulaRef(sheet, sheetN, formula, false, dir, num, offset); err != nil {
+				if formula, err = f.adjustFormulaRef(sheet, sheetN, formula, false, dir, num, offset, false); err != nil {
 					return err
 				}
 				worksheet.DataValidations.DataValidation[i].Formula2 = &xlsxInnerXML{Content: formulaEscaper.Replace(formula)}
@@ -1149,7 +1173,7 @@ func (f *File) adjustDefinedNames(sheet string, dir adjustDirection, num, offset
 	if wb.DefinedNames != nil {
 		for i := 0; i < len(wb.DefinedNames.DefinedName); i++ {
 			data := wb.DefinedNames.DefinedName[i].Data
-			if data, err = f.adjustFormulaRef(sheet, "", data, true, dir, num, offset); err == nil {
+			if data, err = f.adjustFormulaRef(sheet, "", data, true, dir, num, offset, false); err == nil {
 				wb.DefinedNames.DefinedName[i].Data = data
 			}
 		}

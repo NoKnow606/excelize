@@ -570,9 +570,9 @@ func TestAdjustFormula(t *testing.T) {
 	assert.Equal(t, newCellNameToCoordinatesError("-", newInvalidCellNameError("-")), f.adjustFormula("Sheet1", "Sheet1", &xlsxC{F: &xlsxF{Ref: "-"}}, rows, 0, 0, false))
 	assert.Equal(t, ErrColumnNumber, f.adjustFormula("Sheet1", "Sheet1", &xlsxC{F: &xlsxF{Ref: "XFD1:XFD1"}}, columns, 0, 1, false))
 
-	_, err := f.adjustFormulaRef("Sheet1", "Sheet1", "XFE1", false, columns, 0, 1)
+	_, err := f.adjustFormulaRef("Sheet1", "Sheet1", "XFE1", false, columns, 0, 1, false)
 	assert.Equal(t, ErrColumnNumber, err)
-	_, err = f.adjustFormulaRef("Sheet1", "Sheet1", "XFD1", false, columns, 0, 1)
+	_, err = f.adjustFormulaRef("Sheet1", "Sheet1", "XFD1", false, columns, 0, 1, false)
 	assert.Equal(t, ErrColumnNumber, err)
 
 	f = NewFile()
