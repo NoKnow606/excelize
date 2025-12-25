@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"io"
+	"strconv"
 )
 
 // calcChainReader provides a function to get the pointer to the structure
@@ -136,10 +137,10 @@ func (vt *xlsxVolTypes) deleteVolTopicRef(i1, i2, i3, i4 int) {
 //	f.SetCellValue("Sheet1", "A1", 100)
 //	err := f.UpdateCellCache("Sheet1", "A1")
 func (f *File) UpdateCellCache(sheet, cell string) error {
-	// Get sheet index
-	sheetIndex, err := f.GetSheetIndex(sheet)
-	if err != nil {
-		return err
+	// Get sheet ID (1-based, matches calcChain)
+	sheetID := f.getSheetID(sheet)
+	if sheetID == -1 {
+		return ErrSheetNotExist{SheetName: sheet}
 	}
 
 	// Read calcChain
@@ -154,7 +155,7 @@ func (f *File) UpdateCellCache(sheet, cell string) error {
 	}
 
 	// Find the cell in calcChain
-	cellIndex := f.findCellInCalcChain(calcChain, sheetIndex, cell)
+	cellIndex := f.findCellInCalcChain(calcChain, sheetID, cell)
 
 	// If cell not found in calcChain, just clear the specified cell
 	if cellIndex == -1 {
@@ -163,7 +164,7 @@ func (f *File) UpdateCellCache(sheet, cell string) error {
 
 	// Clear cache for the cell and all subsequent cells in the same sheet
 	// (subsequent cells may depend on this cell)
-	return f.clearCachesFromIndex(calcChain, sheetIndex, cellIndex)
+	return f.clearCachesFromIndex(calcChain, sheetID, cellIndex)
 }
 
 // findCellInCalcChain finds the index of a cell in the calculation chain.
@@ -188,11 +189,11 @@ func (f *File) findCellInCalcChain(calcChain *xlsxCalcChain, sheetIndex int, cel
 
 // clearCachesFromIndex clears the cache for all cells starting from the given
 // index in the calculation chain that belong to the same sheet.
-func (f *File) clearCachesFromIndex(calcChain *xlsxCalcChain, sheetIndex, startIndex int) error {
-	// Get sheet name
-	sheetName := f.GetSheetName(sheetIndex)
+func (f *File) clearCachesFromIndex(calcChain *xlsxCalcChain, sheetID, startIndex int) error {
+	// Get sheet name from sheetID
+	sheetName := f.GetSheetMap()[sheetID]
 	if sheetName == "" {
-		return ErrSheetNotExist{SheetName: f.GetSheetName(sheetIndex)}
+		return ErrSheetNotExist{SheetName: ""}
 	}
 
 	// Get worksheet
@@ -201,20 +202,20 @@ func (f *File) clearCachesFromIndex(calcChain *xlsxCalcChain, sheetIndex, startI
 		return err
 	}
 
-	// Track current sheet index (for handling I=0 case)
-	currentSheetIndex := sheetIndex
+	// Track current sheet ID (for handling I=0 case)
+	currentSheetID := sheetID
 
 	// Clear cache for cells starting from startIndex
 	for i := startIndex; i < len(calcChain.C); i++ {
 		c := calcChain.C[i]
 
-		// Update current sheet index if specified
+		// Update current sheet ID if specified
 		if c.I != 0 {
-			currentSheetIndex = c.I
+			currentSheetID = c.I
 		}
 
 		// Only clear cache for cells in the same sheet
-		if currentSheetIndex != sheetIndex {
+		if currentSheetID != sheetID {
 			continue
 		}
 
@@ -260,5 +261,206 @@ func (f *File) clearCellFormulaCacheInWorksheet(ws *xlsxWorksheet, cell string) 
 	}
 
 	// Cell not found or doesn't have a formula - not an error
+	return nil
+}
+
+// UpdateCellAndRecalculate updates a cell value and immediately recalculates all
+// dependent formula cells, updating their cached values. This is useful when you
+// need the formula results immediately without waiting for Excel to recalculate.
+//
+// Unlike UpdateCellCache which only clears the cache (letting Excel recalculate
+// on open), this function performs the calculation immediately and stores the
+// results back into the cell cache.
+//
+// The function uses the calculation chain (calcChain.xml) to determine which
+// cells depend on the updated cell and recalculates them in order.
+//
+// Note: This function requires that the workbook has a valid calcChain.xml file.
+// If the calcChain doesn't exist, it will only recalculate the specified cell.
+//
+// Example:
+//
+//	// Set A1 = 10, B1 = A1*2, C1 = B1+5
+//	f.SetCellValue("Sheet1", "A1", 10)
+//	f.SetCellFormula("Sheet1", "B1", "=A1*2")
+//	f.SetCellFormula("Sheet1", "C1", "=B1+5")
+//
+//	// Update A1 to 20 and recalculate B1 and C1 immediately
+//	f.SetCellValue("Sheet1", "A1", 20)
+//	err := f.UpdateCellAndRecalculate("Sheet1", "A1")
+//	// Now B1 cache = 40, C1 cache = 45
+func (f *File) UpdateCellAndRecalculate(sheet, cell string) error {
+	// Get sheet ID (1-based, matches calcChain)
+	sheetID := f.getSheetID(sheet)
+	if sheetID == -1 {
+		return ErrSheetNotExist{SheetName: sheet}
+	}
+
+	// Read calcChain
+	calcChain, err := f.calcChainReader()
+	if err != nil {
+		return err
+	}
+
+	// If calcChain doesn't exist or is empty, just recalculate the specified cell if it has a formula
+	if calcChain == nil || len(calcChain.C) == 0 {
+		return f.recalculateCell(sheet, cell)
+	}
+
+	// Find the cell in calcChain
+	cellIndex := f.findCellInCalcChain(calcChain, sheetID, cell)
+
+	// If cell is in calcChain, recalculate from that point onward
+	if cellIndex != -1 {
+		return f.recalculateFromIndex(calcChain, sheetID, cellIndex)
+	}
+
+	// Cell not in calcChain - it's a value cell or not tracked
+	// Recalculate ALL formulas in this sheet (they might depend on this cell)
+	return f.recalculateAllInSheet(calcChain, sheetID)
+}
+
+// recalculateFromIndex recalculates all cells starting from the given index
+// in the calculation chain that belong to the same sheet.
+func (f *File) recalculateFromIndex(calcChain *xlsxCalcChain, sheetID, startIndex int) error {
+	// Get sheet name from sheetID
+	sheetName := f.GetSheetMap()[sheetID]
+	if sheetName == "" {
+		return ErrSheetNotExist{SheetName: ""}
+	}
+
+	// Track current sheet ID (for handling I=0 case)
+	currentSheetID := sheetID
+
+	// Recalculate cells starting from startIndex
+	for i := startIndex; i < len(calcChain.C); i++ {
+		c := calcChain.C[i]
+
+		// Update current sheet ID if specified
+		if c.I != 0 {
+			currentSheetID = c.I
+		}
+
+		// Only recalculate cells in the same sheet
+		if currentSheetID != sheetID {
+			continue
+		}
+
+		// Recalculate the cell
+		if err := f.recalculateCell(sheetName, c.R); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// recalculateAllInSheet recalculates all cells in the calcChain for a given sheet.
+func (f *File) recalculateAllInSheet(calcChain *xlsxCalcChain, sheetID int) error {
+	// Get sheet name from sheetID
+	sheetName := f.GetSheetMap()[sheetID]
+	if sheetName == "" {
+		return ErrSheetNotExist{SheetName: ""}
+	}
+
+	// Track current sheet ID (for handling I=0 case)
+	currentSheetID := -1
+
+	// Recalculate all cells in the sheet
+	for i := range calcChain.C {
+		c := calcChain.C[i]
+
+		// Update current sheet ID if specified
+		if c.I != 0 {
+			currentSheetID = c.I
+		}
+
+		// Only recalculate cells in the target sheet
+		if currentSheetID != sheetID {
+			continue
+		}
+
+		// Recalculate the cell
+		if err := f.recalculateCell(sheetName, c.R); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// recalculateCell recalculates a single formula cell and updates its cache.
+func (f *File) recalculateCell(sheet, cell string) error {
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		return err
+	}
+
+	// Check if the cell has a formula
+	col, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return err
+	}
+
+	var cellRef *xlsxC
+	for i := range ws.SheetData.Row {
+		if ws.SheetData.Row[i].R == row {
+			for j := range ws.SheetData.Row[i].C {
+				if ws.SheetData.Row[i].C[j].R == cell {
+					cellRef = &ws.SheetData.Row[i].C[j]
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// If cell doesn't exist or doesn't have a formula, nothing to do
+	if cellRef == nil || cellRef.F == nil {
+		return nil
+	}
+
+	// Calculate the formula value
+	result, err := f.CalcCellValue(sheet, cell)
+	if err != nil {
+		// If calculation fails, clear the cache instead of returning error
+		cellRef.V = ""
+		cellRef.T = ""
+		return nil
+	}
+
+	// Update the cache with the calculated value
+	return f.updateCellCache(ws, col, row, cell, result)
+}
+
+// updateCellCache updates the cached value for a cell in the worksheet.
+func (f *File) updateCellCache(ws *xlsxWorksheet, col, row int, cell, value string) error {
+	// Find the cell in the worksheet
+	for i := range ws.SheetData.Row {
+		if ws.SheetData.Row[i].R == row {
+			for j := range ws.SheetData.Row[i].C {
+				if ws.SheetData.Row[i].C[j].R == cell {
+					// Update cache value
+					ws.SheetData.Row[i].C[j].V = value
+					// Determine type based on value
+					if value == "" {
+						ws.SheetData.Row[i].C[j].T = ""
+					} else if value == "TRUE" || value == "FALSE" {
+						ws.SheetData.Row[i].C[j].T = "b"
+					} else {
+						// Try to parse as number
+						if _, err := strconv.ParseFloat(value, 64); err == nil {
+							ws.SheetData.Row[i].C[j].T = "n"
+						} else {
+							ws.SheetData.Row[i].C[j].T = "str"
+						}
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	// Cell not found - should not happen if CalcCellValue succeeded
 	return nil
 }
