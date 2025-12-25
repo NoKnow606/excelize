@@ -360,7 +360,12 @@ func (fa formulaArg) ToBool() formulaArg {
 func (fa formulaArg) ToList() []formulaArg {
 	switch fa.Type {
 	case ArgMatrix:
-		var args []formulaArg
+		// Pre-allocate slice with exact capacity to avoid reallocations
+		totalSize := 0
+		for _, row := range fa.Matrix {
+			totalSize += len(row)
+		}
+		args := make([]formulaArg, 0, totalSize)
 		for _, row := range fa.Matrix {
 			args = append(args, row...)
 		}
@@ -951,7 +956,7 @@ func (f *File) CalcCellValues(sheet string, cells []string, opts ...Options) (ma
 // reference.
 func (f *File) calcCellValue(ctx *calcContext, sheet, cell string) (result formulaArg, err error) {
 	var formula string
-	if formula, err = f.getCellFormula(sheet, cell, true); err != nil {
+	if formula, err = f.getCellFormulaReadOnly(sheet, cell, true); err != nil {
 		return
 	}
 	ps := efp.ExcelParser()
@@ -2241,7 +2246,7 @@ func (f *File) cellResolver(ctx *calcContext, sheet, cell string) (formulaArg, e
 	// 检查是否是跨工作表引用（当前计算的工作表与单元格所在工作表不同）
 	isCrossSheet := ctx.entry != "" && !strings.HasPrefix(ctx.entry, sheet+"!")
 
-	if formula, _ := f.getCellFormula(sheet, cell, true); len(formula) != 0 {
+	if formula, _ := f.getCellFormulaReadOnly(sheet, cell, true); len(formula) != 0 {
 		// 对于跨工作表引用，优先使用缓存值
 		if isCrossSheet {
 			if cachedValue, err := f.GetCellValue(sheet, cell); err == nil && cachedValue != "" {
@@ -2309,7 +2314,19 @@ func (f *File) cellResolver(ctx *calcContext, sheet, cell string) (formulaArg, e
 
 // generateRangeCacheKey generates a cache key for a given sheet and value range.
 func generateRangeCacheKey(sheet string, valueRange []int) string {
-	return fmt.Sprintf("%s!R%dC%d:R%dC%d", sheet, valueRange[0], valueRange[2], valueRange[1], valueRange[3])
+	// Use strings.Builder to avoid allocations
+	var b strings.Builder
+	b.Grow(len(sheet) + 32) // Pre-allocate approximate size
+	b.WriteString(sheet)
+	b.WriteString("!R")
+	b.WriteString(strconv.Itoa(valueRange[0]))
+	b.WriteString("C")
+	b.WriteString(strconv.Itoa(valueRange[2]))
+	b.WriteString(":R")
+	b.WriteString(strconv.Itoa(valueRange[1]))
+	b.WriteString("C")
+	b.WriteString(strconv.Itoa(valueRange[3]))
+	return b.String()
 }
 
 // optimizeValueRange intelligently truncates full-column references to the actual
@@ -2352,21 +2369,27 @@ func (f *File) clearCellCache(sheet, cell string) {
 		return
 	}
 
-	// Iterate through rangeCache and delete entries containing this cell
-	f.rangeCache.Range(func(key, value interface{}) bool {
-		cacheKey := key.(string)
+	// Collect keys to delete first to avoid deadlock
+	// (Range holds RLock, Delete needs Lock)
+	var keysToDelete []string
+	f.rangeCache.Range(func(key string, value interface{}) bool {
 		// Check if cache key belongs to this sheet and might contain the cell
-		if len(cacheKey) > len(sheet) && cacheKey[:len(sheet)] == sheet {
+		if len(key) > len(sheet) && key[:len(sheet)] == sheet {
 			// Parse range from cache key: "Sheet!R1C1:R100C5"
 			// If the cell is within this range, delete the cache entry
 			// For simplicity, we'll delete all range caches for this sheet
 			// A more sophisticated approach would parse and check exact ranges
-			if strings.HasPrefix(cacheKey, sheet+"!") {
-				f.rangeCache.Delete(key)
+			if strings.HasPrefix(key, sheet+"!") {
+				keysToDelete = append(keysToDelete, key)
 			}
 		}
 		return true
 	})
+
+	// Delete keys after Range completes
+	for _, key := range keysToDelete {
+		f.rangeCache.Delete(key)
+	}
 	_, _ = col, row // Use variables to avoid unused variable error
 }
 
@@ -2535,7 +2558,9 @@ func (f *File) rangeResolver(ctx *calcContext, cellRefs, cellRanges *list.List) 
 			return
 		}
 
-		// Store result in range cache
+		// Store result in LRU range cache
+		// Old entries are automatically evicted when capacity is reached
+		// Note: Cache can be cleared at the end of batch calculation in CalcCellValuesDependencyAware
 		f.rangeCache.Store(cacheKey, arg.Matrix)
 		return
 	}
@@ -16488,7 +16513,7 @@ func (fn *formulaFuncs) HLOOKUP(argsList *list.List) formulaArg {
 	// Use hash index for exact match mode with large datasets (>100 columns)
 	// Hash lookup is O(1) vs O(n) for linear search
 	if matchMode.Number == matchModeExact && len(tableArray.Matrix) > 0 && len(tableArray.Matrix[0]) > 100 {
-		matchIdx, wasExact = lookupHashSearch(false, lookupValue, tableArray)
+		matchIdx, wasExact = fn.lookupHashSearch(false, lookupValue, tableArray)
 	} else if matchMode.Number == matchModeWildcard || len(tableArray.Matrix) == TotalRows {
 		matchIdx, wasExact = lookupLinearSearch(false, lookupValue, tableArray, matchMode, newNumberFormulaArg(searchModeLinear))
 	} else {
@@ -16580,27 +16605,59 @@ func (fn *formulaFuncs) calcMatch(matchType int, criteria *formulaCriteria, look
 		// Use hash index for large datasets (>100 elements)
 		// Hash lookup is O(1) vs O(n) for linear search
 		if len(lookupArray) > 100 {
-			// Build hash index with type-aware keys
-			hashIndex := make(map[string]int)
+			// Generate cache key based on first and last values
+			// This is a heuristic: assumes lookup array is stable
 			lookupIsNumber := criteria.Condition.Type == ArgNumber
-
-			for i, arg := range lookupArray {
-				var key string
+			var cacheKey string
+			if len(lookupArray) > 0 {
+				// Use strings.Builder for efficient string construction
+				var b strings.Builder
+				b.Grow(64) // Pre-allocate
+				b.WriteString("match:")
+				b.WriteString(strconv.Itoa(len(lookupArray)))
+				b.WriteString(":")
 				if lookupIsNumber {
-					// Convert to number for comparison
-					if numArg := arg.ToNumber(); numArg.Type == ArgNumber {
-						key = "N:" + numArg.Value()
-					} else {
-						continue // Skip non-numeric cells when looking for numbers
-					}
+					b.WriteString("n:")
 				} else {
-					// Use string comparison
-					key = "S:" + arg.Value()
+					b.WriteString("s:")
+				}
+				b.WriteString(lookupArray[0].Value())
+				b.WriteString(":")
+				b.WriteString(lookupArray[len(lookupArray)-1].Value())
+				cacheKey = b.String()
+			} else {
+				cacheKey = "match:0:empty"
+			}
+
+			// Try to get cached index
+			var hashIndex map[string]int
+			if cached, found := fn.f.matchIndexCache.Load(cacheKey); found {
+				hashIndex = cached.(map[string]int)
+			} else {
+				// Build hash index with type-aware keys
+				hashIndex = make(map[string]int, len(lookupArray))
+
+				for i, arg := range lookupArray {
+					var key string
+					if lookupIsNumber {
+						// Convert to number for comparison
+						if numArg := arg.ToNumber(); numArg.Type == ArgNumber {
+							key = "N:" + numArg.Value()
+						} else {
+							continue // Skip non-numeric cells when looking for numbers
+						}
+					} else {
+						// Use string comparison
+						key = "S:" + arg.Value()
+					}
+
+					if _, exists := hashIndex[key]; !exists {
+						hashIndex[key] = i
+					}
 				}
 
-				if _, exists := hashIndex[key]; !exists {
-					hashIndex[key] = i
-				}
+				// Store in cache
+				fn.f.matchIndexCache.Store(cacheKey, hashIndex)
 			}
 
 			// Perform hash lookup with type-aware key
@@ -16784,31 +16841,92 @@ func lookupLinearSearch(vertical bool, lookupValue, lookupArray, matchMode, sear
 
 // lookupHashSearch uses a hash map for O(1) exact match lookups.
 // This is particularly efficient for large datasets with exact match mode.
-func lookupHashSearch(vertical bool, lookupValue, lookupArray formulaArg) (int, bool) {
-	// Build hash index with type-aware keys
-	// We need to handle numbers and strings separately to match Excel behavior
-	hashIndex := make(map[string]int)
-
+func (fn *formulaFuncs) lookupHashSearch(vertical bool, lookupValue, lookupArray formulaArg) (int, bool) {
 	// Determine lookup value type for proper comparison
 	lookupIsNumber := lookupValue.Type == ArgNumber
 
-	if vertical {
-		for i, row := range lookupArray.Matrix {
-			if len(row) > 0 {
-				cell := row[0]
-				// Create type-aware key: prefix with type to avoid collision
-				// between number 100 and string "100"
+	// Generate cache key based on lookup array characteristics
+	var cacheKey string
+	if vertical && len(lookupArray.Matrix) > 0 {
+		// Vertical lookup: use first column characteristics
+		var b strings.Builder
+		b.Grow(64)
+		b.WriteString("xlookup:v:")
+		b.WriteString(strconv.Itoa(len(lookupArray.Matrix)))
+		b.WriteString(":")
+		if lookupIsNumber {
+			b.WriteString("n:")
+		} else {
+			b.WriteString("s:")
+		}
+		if len(lookupArray.Matrix[0]) > 0 {
+			b.WriteString(lookupArray.Matrix[0][0].Value())
+			b.WriteString(":")
+			lastIdx := len(lookupArray.Matrix) - 1
+			if len(lookupArray.Matrix[lastIdx]) > 0 {
+				b.WriteString(lookupArray.Matrix[lastIdx][0].Value())
+			}
+		}
+		cacheKey = b.String()
+	} else if !vertical && len(lookupArray.Matrix) > 0 && len(lookupArray.Matrix[0]) > 0 {
+		// Horizontal lookup: use first row characteristics
+		var b strings.Builder
+		b.Grow(64)
+		b.WriteString("xlookup:h:")
+		b.WriteString(strconv.Itoa(len(lookupArray.Matrix[0])))
+		b.WriteString(":")
+		if lookupIsNumber {
+			b.WriteString("n:")
+		} else {
+			b.WriteString("s:")
+		}
+		b.WriteString(lookupArray.Matrix[0][0].Value())
+		b.WriteString(":")
+		b.WriteString(lookupArray.Matrix[0][len(lookupArray.Matrix[0])-1].Value())
+		cacheKey = b.String()
+	} else {
+		cacheKey = "xlookup:empty"
+	}
+
+	// Try to get cached index
+	var hashIndex map[string]int
+	if cached, found := fn.f.matchIndexCache.Load(cacheKey); found {
+		hashIndex = cached.(map[string]int)
+	} else {
+		// Build hash index with type-aware keys
+		hashIndex = make(map[string]int)
+
+		if vertical {
+			for i, row := range lookupArray.Matrix {
+				if len(row) > 0 {
+					cell := row[0]
+					var key string
+					if lookupIsNumber {
+						if numCell := cell.ToNumber(); numCell.Type == ArgNumber {
+							key = "N:" + numCell.Value()
+						} else {
+							continue
+						}
+					} else {
+						key = "S:" + cell.Value()
+					}
+
+					if _, exists := hashIndex[key]; !exists {
+						hashIndex[key] = i
+					}
+				}
+			}
+		} else {
+			for i, cell := range lookupArray.Matrix[0] {
 				var key string
 				if lookupIsNumber {
-					// Convert cell to number for comparison
 					if numCell := cell.ToNumber(); numCell.Type == ArgNumber {
-						key = "N:" + numCell.Value() // Number key
+						key = "N:" + numCell.Value()
 					} else {
-						continue // Skip non-numeric cells when looking for numbers
+						continue
 					}
 				} else {
-					// Use string comparison
-					key = "S:" + cell.Value() // String key
+					key = "S:" + cell.Value()
 				}
 
 				if _, exists := hashIndex[key]; !exists {
@@ -16816,23 +16934,9 @@ func lookupHashSearch(vertical bool, lookupValue, lookupArray formulaArg) (int, 
 				}
 			}
 		}
-	} else {
-		for i, cell := range lookupArray.Matrix[0] {
-			var key string
-			if lookupIsNumber {
-				if numCell := cell.ToNumber(); numCell.Type == ArgNumber {
-					key = "N:" + numCell.Value()
-				} else {
-					continue
-				}
-			} else {
-				key = "S:" + cell.Value()
-			}
 
-			if _, exists := hashIndex[key]; !exists {
-				hashIndex[key] = i
-			}
-		}
+		// Store in cache
+		fn.f.matchIndexCache.Store(cacheKey, hashIndex)
 	}
 
 	// Perform hash lookup with type-aware key
@@ -16866,7 +16970,7 @@ func (fn *formulaFuncs) VLOOKUP(argsList *list.List) formulaArg {
 	// Use hash index for exact match mode with large datasets (>100 rows)
 	// Hash lookup is O(1) vs O(n) for linear search
 	if matchMode.Number == matchModeExact && len(tableArray.Matrix) > 100 {
-		matchIdx, wasExact = lookupHashSearch(true, lookupValue, tableArray)
+		matchIdx, wasExact = fn.lookupHashSearch(true, lookupValue, tableArray)
 	} else if matchMode.Number == matchModeWildcard || len(tableArray.Matrix) == TotalRows {
 		matchIdx, wasExact = lookupLinearSearch(true, lookupValue, tableArray, matchMode, newNumberFormulaArg(searchModeLinear))
 	} else {
@@ -17139,7 +17243,7 @@ func (fn *formulaFuncs) XLOOKUP(argsList *list.List) formulaArg {
 		if matchMode.Number == matchModeExact &&
 			searchMode.Number == searchModeLinear &&
 			len(lookupArray.Matrix) > 100 {
-			matchIdx, _ = lookupHashSearch(verticalLookup, lookupValue, lookupArray)
+			matchIdx, _ = fn.lookupHashSearch(verticalLookup, lookupValue, lookupArray)
 		} else {
 			matchIdx, _ = lookupLinearSearch(verticalLookup, lookupValue, lookupArray, matchMode, searchMode)
 		}

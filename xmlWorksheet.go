@@ -19,7 +19,7 @@ import (
 // xlsxWorksheet directly maps the worksheet element in the namespace
 // http://schemas.openxmlformats.org/spreadsheetml/2006/main.
 type xlsxWorksheet struct {
-	mu                     sync.Mutex
+	mu                     sync.RWMutex
 	formulaSI              sync.Map
 	colStyleCache          sync.Map // Cache for column styles: col -> styleID
 	XMLName                xml.Name                     `xml:"http://schemas.openxmlformats.org/spreadsheetml/2006/main worksheet"`

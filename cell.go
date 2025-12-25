@@ -708,6 +708,32 @@ func (f *File) getCellFormula(sheet, cell string, transformed bool) (string, err
 	})
 }
 
+// getCellFormulaReadOnly is a read-only version of getCellFormula that uses
+// RLock for better concurrency. It should be used when multiple goroutines
+// need to read cell formulas simultaneously (e.g., in batch calculation).
+func (f *File) getCellFormulaReadOnly(sheet, cell string, transformed bool) (string, error) {
+	return f.getCellStringFuncReadOnly(sheet, cell, func(x *xlsxWorksheet, c *xlsxC) (string, bool, error) {
+		if transformed && !f.formulaChecked {
+			if err := f.setArrayFormulaCells(); err != nil {
+				return "", false, err
+			}
+			f.formulaChecked = true
+		}
+		if transformed && c.f != "" {
+			return c.f, true, nil
+		}
+		if c.F == nil {
+			return "", false, nil
+		}
+		if c.F.T == STCellFormulaTypeShared && c.F.Si != nil {
+			formula, err := getSharedFormula(x, *c.F.Si, c.R)
+			return formula, true, err
+		}
+		return c.F.Content, true, nil
+	})
+}
+
+
 // FormulaOpts can be passed to SetCellFormula to use other formula types.
 type FormulaOpts struct {
 	Type *string // Formula type
@@ -1537,6 +1563,75 @@ func (f *File) getCellStringFunc(sheet, cell string, fn func(x *xlsxWorksheet, c
 	return "", nil
 }
 
+// getCellStringFuncReadOnly does common value extraction workflow for read-only
+// operations. It uses RLock for better concurrency when multiple goroutines are
+// reading cells simultaneously. This function assumes the cell structure exists
+// and does not create missing rows/columns.
+func (f *File) getCellStringFuncReadOnly(sheet, cell string, fn func(x *xlsxWorksheet, c *xlsxC) (string, bool, error)) (string, error) {
+	f.mu.Lock()
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		f.mu.Unlock()
+		return "", err
+	}
+	f.mu.Unlock()
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	// Use read-only version of mergeCellsParser
+	cell, err = ws.mergeCellsParserReadOnly(cell)
+	if err != nil {
+		return "", err
+	}
+
+	_, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return "", err
+	}
+	lastRowNum := 0
+	rowCount := len(ws.SheetData.Row)
+	if rowCount > 0 {
+		lastRowNum = ws.SheetData.Row[rowCount-1].R
+	}
+
+	// keep in mind: row starts from 1
+	if row > lastRowNum {
+		return "", nil
+	}
+
+	idx, found := sort.Find(rowCount, func(i int) int {
+		// Bounds check to prevent panic if array was modified
+		if i >= len(ws.SheetData.Row) {
+			return 1
+		}
+		if ws.SheetData.Row[i].R == row {
+			return 0
+		}
+		if ws.SheetData.Row[i].R > row {
+			return -1
+		}
+		return 1
+	})
+	if !found || idx >= len(ws.SheetData.Row) {
+		return "", nil
+	}
+	rowData := ws.SheetData.Row[idx]
+	for colIdx := range rowData.C {
+		colData := &rowData.C[colIdx]
+		if cell == colData.R {
+			val, ok, err := fn(ws, colData)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				return val, nil
+			}
+			break
+		}
+	}
+	return "", nil
+}
+
 // formattedValue provides a function to returns a value after formatted. If
 // it is possible to apply a format to the cell value, it will do so, if not
 // then an error will be returned, along with the raw value of the cell.
@@ -1638,6 +1733,11 @@ func (ws *xlsxWorksheet) prepareCellStyle(col, row, style int) int {
 
 // mergeCellsParser provides a function to check merged cells in worksheet by
 // given cell reference.
+// mergeCellsParser provides a function to check if a given cell reference is a
+// merged cell. If the cell is a merged cell, it returns the top-left cell reference
+// of the merged range. Otherwise, it returns the original cell reference.
+//
+// This function modifies ws.MergeCells.Cells[i].rect (lazy initialization).
 func (ws *xlsxWorksheet) mergeCellsParser(cell string) (string, error) {
 	cell = strings.ToUpper(cell)
 	col, row, err := CellNameToCoordinates(cell)
@@ -1670,6 +1770,49 @@ func (ws *xlsxWorksheet) mergeCellsParser(cell string) (string, error) {
 	}
 	return cell, nil
 }
+
+// mergeCellsParserReadOnly is a read-only version of mergeCellsParser that does not
+// modify worksheet data. It assumes rect is already initialized. If rect is not
+// initialized, it will compute it on-the-fly without storing it.
+//
+// This function is safe to call under RLock.
+func (ws *xlsxWorksheet) mergeCellsParserReadOnly(cell string) (string, error) {
+	cell = strings.ToUpper(cell)
+	col, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return cell, err
+	}
+	if ws.MergeCells != nil {
+		for i := 0; i < len(ws.MergeCells.Cells); i++ {
+			if ws.MergeCells.Cells[i] == nil {
+				continue
+			}
+
+			var rect []int
+			// Check if rect is already initialized
+			if len(ws.MergeCells.Cells[i].rect) > 0 {
+				rect = ws.MergeCells.Cells[i].rect
+			} else if ref := ws.MergeCells.Cells[i].Ref; ref != "" {
+				// Compute rect on-the-fly without storing it
+				if strings.Count(ref, ":") != 1 {
+					ref += ":" + ref
+				}
+				rect, err = rangeRefToCoordinates(ref)
+				if err != nil {
+					return cell, err
+				}
+				_ = sortCoordinates(rect)
+			}
+
+			if len(rect) > 0 && cellInRange([]int{col, row}, rect) {
+				cell = strings.Split(ws.MergeCells.Cells[i].Ref, ":")[0]
+				break
+			}
+		}
+	}
+	return cell, nil
+}
+
 
 // checkCellInRangeRef provides a function to determine if a given cell reference
 // in a range.

@@ -3,14 +3,33 @@ package excelize
 import (
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-// CalcCellValuesDependencyAware 依赖感知的并发计算
-// 策略: 先串行计算一小批公式来预热缓存,然后并发计算剩余公式
-func (f *File) CalcCellValuesDependencyAware(sheet string, cells []string, opts ...Options) (map[string]string, error) {
+// CalcCellValuesDependencyAwareOptions provides options for dependency-aware calculation
+type CalcCellValuesDependencyAwareOptions struct {
+	// EnableDebug enables debug output for performance monitoring
+	EnableDebug bool
+	// Options for cell value calculation
+	CalcOptions Options
+}
+
+// CalcCellValuesDependencyAware calculates multiple cell values with dependency-aware optimization.
+// It uses a two-phase strategy:
+// 1. Phase 1 (Warmup): Sequentially calculates a small batch of formulas to warm up caches
+//    (especially useful for VLOOKUP/XLOOKUP that share lookup tables)
+// 2. Phase 2 (Concurrent): Calculates remaining formulas using multiple goroutines
+//
+// This is most effective when:
+//   - You have many formulas (> 1000 cells)
+//   - Formulas share dependencies (e.g., multiple VLOOKUP referencing same table)
+//   - You need maximum performance
+//
+// For simpler cases or when formulas are independent, consider using CalcCellValuesConcurrent instead.
+func (f *File) CalcCellValuesDependencyAware(sheet string, cells []string, options CalcCellValuesDependencyAwareOptions) (map[string]string, error) {
 	if len(cells) == 0 {
 		return make(map[string]string), nil
 	}
@@ -25,51 +44,73 @@ func (f *File) CalcCellValuesDependencyAware(sheet string, cells []string, opts 
 	}
 	f.mu.Unlock()
 
-	start := time.Now()
 	results := make(map[string]string, len(cells))
+	var allErrors []error
 
-	// 阶段1: 预热缓存 - 只计算每列的第一个单元格
+	// Phase 1: Warmup - calculate first cell of each column to warm up caches
+	// This is especially helpful for lookup formulas (VLOOKUP, XLOOKUP, etc.)
 	warmupCells := make(map[string]string) // col -> first cell
 	for _, cell := range cells {
-		col, _, _ := CellNameToCoordinates(cell)
+		col, _, err := CellNameToCoordinates(cell)
+		if err != nil {
+			continue
+		}
 		colName, _ := ColumnNumberToName(col)
 		if _, exists := warmupCells[colName]; !exists {
 			warmupCells[colName] = cell
 		}
 	}
 
+	// Sort warmup cells for deterministic order
 	warmupList := make([]string, 0, len(warmupCells))
 	for _, cell := range warmupCells {
 		warmupList = append(warmupList, cell)
 	}
+	sort.Strings(warmupList)
 
-	fmt.Printf("Phase 1: Warming up cache with %d cells (one per column)...\n", len(warmupList))
-	warmupStart := time.Now()
+	var warmupStart time.Time
+	if options.EnableDebug {
+		warmupStart = time.Now()
+		fmt.Printf("Phase 1: Warming up cache with %d cells (one per column)...\n", len(warmupList))
+	}
+
+	// Pre-warm worksheet cache to avoid repeated namespace conversion
+	// This significantly reduces memory allocation during formula calculation
+	_, _ = f.workSheetReader(sheet)
+
+	// Pre-warm commonly referenced sheets (e.g., lookup tables)
+	// This is a heuristic: warm up first 3 sheets which often contain lookup data
+	sheetList := f.GetSheetList()
+	for i := 0; i < len(sheetList) && i < 3; i++ {
+		if sheetList[i] != sheet {
+			_, _ = f.workSheetReader(sheetList[i])
+		}
+	}
+
+	// Calculate warmup cells sequentially
 	for _, cell := range warmupList {
-		fmt.Printf("  Warming up: %s\n", cell)
-		t1 := time.Now()
-		result, err := f.CalcCellValue(sheet, cell, opts...)
-		fmt.Printf("  %s took %v, result: %s\n", cell, time.Since(t1), result)
+		result, err := f.CalcCellValue(sheet, cell, options.CalcOptions)
 		if err != nil {
-			return results, fmt.Errorf("warmup failed at %s: %w", cell, err)
+			// Collect error but continue (consistent with phase 2)
+			allErrors = append(allErrors, fmt.Errorf("failed to calculate %s: %w", cell, err))
+			if options.EnableDebug {
+				fmt.Printf("  Warning: %s failed: %v\n", cell, err)
+			}
+			continue
 		}
 		results[cell] = result
 	}
-	warmupElapsed := time.Since(warmupStart)
-	fmt.Printf("Phase 1 completed: %d cells in %v (%.1f cells/sec)\n",
-		len(warmupList), warmupElapsed, float64(len(warmupList))/warmupElapsed.Seconds())
 
-	// 检查 rangeCache
-	cacheCount := 0
-	f.rangeCache.Range(func(key, value interface{}) bool {
-		cacheCount++
-		return true
-	})
-	fmt.Printf("  rangeCache entries: %d\n", cacheCount)
+	if options.EnableDebug {
+		warmupElapsed := time.Since(warmupStart)
+		cacheCount := f.rangeCache.Len()
+		fmt.Printf("Phase 1 completed: %d cells calculated, rangeCache entries: %d, elapsed: %v\n",
+			len(warmupList), cacheCount, warmupElapsed)
+	}
 
-	// 阶段2: 并发计算剩余公式
+	// Phase 2: Concurrent calculation of remaining formulas
 	remaining := make([]string, 0, len(cells)-len(warmupList))
-	warmupSet := make(map[string]bool)
+	warmupSet := make(map[string]bool, len(warmupList))
 	for _, cell := range warmupList {
 		warmupSet[cell] = true
 	}
@@ -80,109 +121,112 @@ func (f *File) CalcCellValuesDependencyAware(sheet string, cells []string, opts 
 	}
 
 	if len(remaining) == 0 {
+		// All cells were in warmup phase
+		if len(allErrors) > 0 {
+			return results, combineErrors(allErrors)
+		}
 		return results, nil
 	}
 
-	fmt.Printf("Phase 2: Concurrent calculation of %d cells...\n", len(remaining))
-	concurrentStart := time.Now()
+	var concurrentStart time.Time
+	if options.EnableDebug {
+		concurrentStart = time.Now()
+		fmt.Printf("Phase 2: Concurrent calculation of %d cells...\n", len(remaining))
+	}
 
+	// Calculate optimal number of workers and chunk size
 	numWorkers := runtime.NumCPU()
+	if len(remaining) < numWorkers {
+		numWorkers = len(remaining)
+	}
 	chunkSize := (len(remaining) + numWorkers - 1) / numWorkers
 
 	type workerResult struct {
 		results map[string]string
 		errors  []error
-		elapsed time.Duration
 	}
 
 	resultChan := make(chan workerResult, numWorkers)
 	var wg sync.WaitGroup
 
+	// Launch workers
 	for i := 0; i < numWorkers; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > len(remaining) {
-			end = len(remaining)
+		chunkStart := i * chunkSize
+		chunkEnd := chunkStart + chunkSize
+		if chunkEnd > len(remaining) {
+			chunkEnd = len(remaining)
 		}
-		if start >= len(remaining) {
+		if chunkStart >= len(remaining) {
 			break
 		}
 
 		wg.Add(1)
 		go func(cellChunk []string, workerID int) {
 			defer wg.Done()
-			localResults := make(map[string]string)
+			localResults := make(map[string]string, len(cellChunk))
 			var localErrors []error
 
-			workerStart := time.Now()
-			for idx, cell := range cellChunk {
-				t1 := time.Now()
-				result, err := f.CalcCellValue(sheet, cell, opts...)
-				elapsed := time.Since(t1)
-
-				// 打印前10个和慢的公式
-				if idx < 10 || elapsed > 10*time.Millisecond {
-					fmt.Printf("Worker %d: cell %s took %v\n", workerID, cell, elapsed)
-				}
-
+			for _, cell := range cellChunk {
+				result, err := f.CalcCellValue(sheet, cell, options.CalcOptions)
 				if err != nil {
 					localErrors = append(localErrors, fmt.Errorf("failed to calculate %s: %w", cell, err))
 					continue
 				}
 				localResults[cell] = result
 			}
-			workerElapsed := time.Since(workerStart)
 
 			resultChan <- workerResult{
 				results: localResults,
 				errors:  localErrors,
-				elapsed: workerElapsed,
 			}
-		}(remaining[start:end], i)
+		}(remaining[chunkStart:chunkEnd], i)
 	}
 
+	// Wait for all workers and close channel
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 
-	var errors []error
-	var maxTime, minTime time.Duration
-	minTime = time.Hour
-
+	// Collect results from all workers
 	for wr := range resultChan {
 		for k, v := range wr.results {
 			results[k] = v
 		}
-		errors = append(errors, wr.errors...)
-		if wr.elapsed > maxTime {
-			maxTime = wr.elapsed
-		}
-		if wr.elapsed < minTime {
-			minTime = wr.elapsed
-		}
+		allErrors = append(allErrors, wr.errors...)
 	}
 
-	concurrentElapsed := time.Since(concurrentStart)
-	fmt.Printf("Phase 2 completed: %d cells in %v (%.1f cells/sec)\n",
-		len(remaining), concurrentElapsed, float64(len(remaining))/concurrentElapsed.Seconds())
-	fmt.Printf("  Worker times: min=%v, max=%v, diff=%v (%.1f%% efficiency)\n",
-		minTime, maxTime, maxTime-minTime, float64(minTime)/float64(maxTime)*100)
+	if options.EnableDebug {
+		concurrentElapsed := time.Since(concurrentStart)
+		fmt.Printf("Phase 2 completed: %d cells calculated, elapsed: %v\n", len(remaining), concurrentElapsed)
+		fmt.Printf("Total: %d cells, %d successful, %d failed\n",
+			len(cells), len(results), len(allErrors))
+	}
 
-	totalElapsed := time.Since(start)
-	fmt.Printf("\nTotal: %d cells in %v (%.1f cells/sec)\n",
-		len(cells), totalElapsed, float64(len(cells))/totalElapsed.Seconds())
+	// Clear range cache after batch calculation to free memory
+	// rangeCache can hold large matrices that are no longer needed after batch completion
+	// This prevents memory exhaustion in long-running processes or multiple batch calculations
+	f.rangeCache.Clear()
 
-	if len(errors) > 0 {
-		var sb strings.Builder
-		for i, err := range errors {
-			if i > 0 {
-				sb.WriteString("; ")
-			}
-			sb.WriteString(err.Error())
-		}
-		return results, fmt.Errorf("%s", sb.String())
+	// Return partial results with combined errors if any
+	if len(allErrors) > 0 {
+		return results, combineErrors(allErrors)
 	}
 
 	return results, nil
+}
+
+// combineErrors combines multiple errors into a single error message
+func combineErrors(errors []error) error {
+	if len(errors) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	for i, err := range errors {
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		sb.WriteString(err.Error())
+	}
+	return fmt.Errorf("%s", sb.String())
 }

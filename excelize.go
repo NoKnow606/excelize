@@ -43,7 +43,8 @@ type File struct {
 	tempFiles        sync.Map
 	xmlAttr          sync.Map
 	calcCache        sync.Map
-	rangeCache       sync.Map
+	rangeCache       *lruCache      // LRU cache for range matrices to limit memory usage
+	matchIndexCache  sync.Map       // Cache for MATCH hash indexes: key -> map[string]int
 	CalcChain        *xlsxCalcChain
 	CharsetReader    func(charset string, input io.Reader) (rdr io.Reader, err error)
 	Comments         map[string]*xlsxComments
@@ -164,6 +165,7 @@ func newFile() *File {
 		Relationships:    sync.Map{},
 		CharsetReader:    charset.NewReaderLabel,
 		ZipWriter:        func(w io.Writer) ZipWriter { return zip.NewWriter(w) },
+		rangeCache:       newLRUCache(50), // Limit to 50 range matrices to control memory
 	}
 }
 
