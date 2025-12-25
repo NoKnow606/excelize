@@ -7277,3 +7277,67 @@ func TestCalcTEXTSPLIT(t *testing.T) {
 	assert.Equal(t, formulaErrorVALUE, result)
 	assert.Error(t, err)
 }
+
+func TestCalcMAXCrossSheetFormulaCells(t *testing.T) {
+	f := NewFile()
+	defer func() {
+		assert.NoError(t, f.Close())
+	}()
+
+	// Sheet1: Base data
+	assert.NoError(t, f.SetCellValue("Sheet1", "A1", 10))
+	assert.NoError(t, f.SetCellValue("Sheet1", "A2", 20))
+	assert.NoError(t, f.SetCellValue("Sheet1", "A3", 30))
+
+	// Sheet2: Formula cells referencing Sheet1
+	f.NewSheet("Sheet2")
+	assert.NoError(t, f.SetCellFormula("Sheet2", "B1", "=Sheet1!A1*2"))
+	assert.NoError(t, f.SetCellFormula("Sheet2", "B2", "=Sheet1!A2*2"))
+	assert.NoError(t, f.SetCellFormula("Sheet2", "B3", "=Sheet1!A3*2"))
+
+	// Sheet3: Use MAX/MIN/COUNT on cross-sheet formula cells
+	f.NewSheet("Sheet3")
+	assert.NoError(t, f.SetCellFormula("Sheet3", "C1", "=MAX(Sheet2!B1:B3)"))
+	assert.NoError(t, f.SetCellFormula("Sheet3", "C2", "=MIN(Sheet2!B1:B3)"))
+	assert.NoError(t, f.SetCellFormula("Sheet3", "C3", "=COUNT(Sheet2!B1:B3)"))
+
+	// Calculate and verify
+	max, err := f.CalcCellValue("Sheet3", "C1", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Equal(t, "60", max, "MAX should return 60")
+
+	min, err := f.CalcCellValue("Sheet3", "C2", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Equal(t, "20", min, "MIN should return 20")
+
+	count, err := f.CalcCellValue("Sheet3", "C3", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Equal(t, "3", count, "COUNT should return 3")
+}
+
+func TestCalcMAXCrossSheetDateFormulas(t *testing.T) {
+	f := NewFile()
+	defer func() {
+		assert.NoError(t, f.Close())
+	}()
+
+	// Sheet1: Date values (as Excel serial numbers)
+	assert.NoError(t, f.SetCellValue("Sheet1", "A1", 45971)) // 2025-11-10
+	assert.NoError(t, f.SetCellValue("Sheet1", "A2", 45976)) // 2025-11-15
+	assert.NoError(t, f.SetCellValue("Sheet1", "A3", 45966)) // 2025-11-05
+
+	// Sheet2: Formula cells calculating dates
+	f.NewSheet("Sheet2")
+	assert.NoError(t, f.SetCellFormula("Sheet2", "B1", "=Sheet1!A1"))
+	assert.NoError(t, f.SetCellFormula("Sheet2", "B2", "=Sheet1!A2"))
+	assert.NoError(t, f.SetCellFormula("Sheet2", "B3", "=Sheet1!A3"))
+
+	// Sheet3: MAX on cross-sheet date formula cells
+	f.NewSheet("Sheet3")
+	assert.NoError(t, f.SetCellFormula("Sheet3", "C1", "=MAX(Sheet2!B1:B3)"))
+
+	// Calculate and verify
+	max, err := f.CalcCellValue("Sheet3", "C1", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Equal(t, "45976", max, "MAX should return the latest date (45976)")
+}

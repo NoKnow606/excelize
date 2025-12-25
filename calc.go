@@ -2249,8 +2249,13 @@ func (f *File) cellResolver(ctx *calcContext, sheet, cell string) (formulaArg, e
 	if formula, _ := f.getCellFormulaReadOnly(sheet, cell, true); len(formula) != 0 {
 		// 对于跨工作表引用，优先使用缓存值
 		if isCrossSheet {
-			if cachedValue, err := f.GetCellValue(sheet, cell); err == nil && cachedValue != "" {
-				return newStringFormulaArg(cachedValue), nil
+			if cachedValue, err := f.GetCellValue(sheet, cell, Options{RawCellValue: true}); err == nil && cachedValue != "" {
+				arg := newStringFormulaArg(cachedValue)
+				// 根据cell类型转换arg类型，确保数值类型正确
+				if cellType, _ := f.GetCellType(sheet, cell); cellType == CellTypeNumber || cellType == CellTypeUnset {
+					return arg.ToNumber(), nil
+				}
+				return arg, nil
 			} else {
 			}
 		}
@@ -2268,8 +2273,13 @@ func (f *File) cellResolver(ctx *calcContext, sheet, cell string) (formulaArg, e
 
 				// 如果计算失败，回退到缓存值
 				if calcErr != nil || arg.Type == ArgError {
-					if cachedValue, err := f.GetCellValue(sheet, cell); err == nil && cachedValue != "" {
-						return newStringFormulaArg(cachedValue), nil
+					if cachedValue, err := f.GetCellValue(sheet, cell, Options{RawCellValue: true}); err == nil && cachedValue != "" {
+						fallbackArg := newStringFormulaArg(cachedValue)
+						// 根据cell类型转换arg类型
+						if cellType, _ := f.GetCellType(sheet, cell); cellType == CellTypeNumber || cellType == CellTypeUnset {
+							return fallbackArg.ToNumber(), nil
+						}
+						return fallbackArg, nil
 					}
 				}
 				return arg, nil
