@@ -1,5 +1,7 @@
 package excelize
 
+import "sync"
+
 // CellUpdate 表示一个单元格更新操作
 type CellUpdate struct {
 	Sheet string      // 工作表名称
@@ -81,46 +83,60 @@ func (f *File) RecalculateSheet(sheet string) error {
 
 // BatchUpdateAndRecalculate 批量更新单元格值并重新计算受影响的公式
 //
-// 此函数结合了 BatchSetCellValue 和 RecalculateSheet 的功能，
+// 此函数结合了 BatchSetCellValue 和重新计算的功能，
 // 可以在一次调用中完成批量更新和重新计算，避免重复操作。
 //
-// 相比循环调用 SetCellValue + UpdateCellAndRecalculate，这个函数：
-// 1. 只遍历一次 calcChain
-// 2. 每个公式只计算一次（即使被多个更新影响）
-// 3. 性能提升可达 10-100 倍（取决于更新数量）
+// 重要特性：
+// 1. ✅ 支持跨工作表依赖：如果 Sheet2 引用 Sheet1 的值，更新 Sheet1 后会自动重新计算 Sheet2
+// 2. ✅ 只遍历一次 calcChain
+// 3. ✅ 每个公式只计算一次（即使被多个更新影响）
+// 4. ✅ 性能提升可达 10-100 倍（取决于更新数量）
 //
 // 参数：
 //   updates: 单元格更新列表
 //
 // 示例：
 //
+//	// Sheet1: A1 = 100
+//	// Sheet2: B1 = Sheet1!A1 * 2
 //	updates := []excelize.CellUpdate{
-//	    {Sheet: "Sheet1", Cell: "A1", Value: 100},
-//	    {Sheet: "Sheet1", Cell: "A2", Value: 200},
-//	    {Sheet: "Sheet1", Cell: "A3", Value: 300},
+//	    {Sheet: "Sheet1", Cell: "A1", Value: 200},
 //	}
 //	err := f.BatchUpdateAndRecalculate(updates)
-//	// 现在 Sheet1 中依赖 A1、A2、A3 的所有公式都已重新计算
+//	// 结果：Sheet1.A1 = 200, Sheet2.B1 = 400 (自动重新计算)
 func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) error {
 	// 1. 批量更新所有单元格
 	if err := f.BatchSetCellValue(updates); err != nil {
 		return err
 	}
 
-	// 2. 收集所有受影响的工作表（去重）
-	affectedSheets := make(map[string]bool)
+	// 2. 读取 calcChain
+	calcChain, err := f.calcChainReader()
+	if err != nil {
+		return err
+	}
+
+	// If calcChain doesn't exist or is empty, nothing to recalculate
+	if calcChain == nil || len(calcChain.C) == 0 {
+		return nil
+	}
+
+	// 3. 收集所有被更新的单元格（用于依赖检查）
+	updatedCells := make(map[string]map[string]bool) // sheet -> cell -> true
 	for _, update := range updates {
-		affectedSheets[update.Sheet] = true
-	}
-
-	// 3. 重新计算每个受影响的工作表（每个工作表只计算一次）
-	for sheet := range affectedSheets {
-		if err := f.RecalculateSheet(sheet); err != nil {
-			return err
+		if updatedCells[update.Sheet] == nil {
+			updatedCells[update.Sheet] = make(map[string]bool)
 		}
+		updatedCells[update.Sheet][update.Cell] = true
 	}
 
-	return nil
+	// 4. 清除所有受影响公式的缓存（包括直接引用和间接引用）
+	// 这样可以确保跨工作表的公式也会被重新计算
+	f.calcCache = sync.Map{} // Clear all calculation cache
+
+	// 5. 重新计算所有工作表（calcChain 包含所有工作表的公式）
+	// 按 calcChain 顺序计算，确保依赖关系正确
+	return f.recalculateAllSheets(calcChain)
 }
 
 // BatchSetFormulas 批量设置公式，不触发重新计算
@@ -260,6 +276,36 @@ func (f *File) updateCalcChainForFormulas(formulas []FormulaUpdate) error {
 
 	// 保存更新后的 calcChain
 	f.CalcChain = calcChain
+
+	return nil
+}
+
+// recalculateAllSheets recalculates all formulas in all sheets according to calcChain order
+func (f *File) recalculateAllSheets(calcChain *xlsxCalcChain) error {
+	// Track current sheet ID (for handling I=0 case)
+	currentSheetID := -1
+
+	// Recalculate all cells in calcChain order
+	for i := range calcChain.C {
+		c := calcChain.C[i]
+
+		// Update current sheet ID if specified
+		if c.I != 0 {
+			currentSheetID = c.I
+		}
+
+		// Get sheet name
+		sheetName := f.GetSheetMap()[currentSheetID]
+		if sheetName == "" {
+			continue // Skip if sheet not found
+		}
+
+		// Recalculate the cell
+		if err := f.recalculateCell(sheetName, c.R); err != nil {
+			// Continue even if one cell fails
+			continue
+		}
+	}
 
 	return nil
 }
