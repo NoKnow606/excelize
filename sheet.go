@@ -199,22 +199,21 @@ func (f *File) workSheetWriter() {
 
 // trimRow provides a function to trim empty rows.
 func trimRow(sheetData *xlsxSheetData) []xlsxRow {
-	var (
-		row xlsxRow
-		i   int
-	)
-
-	for k := 0; k < len(sheetData.Row); k++ {
-		row = sheetData.Row[k]
-		if row = trimCell(row); len(row.C) != 0 || row.hasAttr() {
-			sheetData.Row[i] = row
-			i++
-			continue
-		}
-		sheetData.Row = append(sheetData.Row[:k], sheetData.Row[k+1:]...)
-		k--
+	if len(sheetData.Row) == 0 {
+		return sheetData.Row
 	}
-	return sheetData.Row[:i]
+
+	// Use two-pointer technique to avoid slice index out of range
+	writeIdx := 0
+	for readIdx := 0; readIdx < len(sheetData.Row); readIdx++ {
+		row := trimCell(sheetData.Row[readIdx])
+		// Keep non-empty rows or rows with attributes
+		if len(row.C) != 0 || row.hasAttr() {
+			sheetData.Row[writeIdx] = row
+			writeIdx++
+		}
+	}
+	return sheetData.Row[:writeIdx]
 }
 
 // trimCell provides a function to trim blank cells which created by fillColumns.
