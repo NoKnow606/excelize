@@ -1068,11 +1068,24 @@ func (ws *xlsxWorksheet) checkRow() error {
 
 		if colCount < lastCol {
 			sourceList := rowData.C
-			targetList := make([]xlsxC, 0, lastCol)
+
+			// Calculate the actual max column from sourceList to prevent index out of range
+			maxCol := lastCol
+			for _, cell := range sourceList {
+				colNum, _, err := CellNameToCoordinates(cell.R)
+				if err != nil {
+					continue
+				}
+				if colNum > maxCol {
+					maxCol = colNum
+				}
+			}
+
+			targetList := make([]xlsxC, 0, maxCol)
 
 			rowData.C = ws.SheetData.Row[rowIdx].C[:0]
 
-			for colIdx := 0; colIdx < lastCol; colIdx++ {
+			for colIdx := 0; colIdx < maxCol; colIdx++ {
 				cellName, err := CoordinatesToCellName(colIdx+1, rowIdx+1)
 				if err != nil {
 					return err
@@ -1088,6 +1101,12 @@ func (ws *xlsxWorksheet) checkRow() error {
 				if err != nil {
 					return err
 				}
+
+				// Boundary check to prevent index out of range panic
+				if colNum-1 < 0 || colNum-1 >= len(ws.SheetData.Row[rowIdx].C) {
+					continue
+				}
+
 				ws.SheetData.Row[rowIdx].C[colNum-1] = *colData
 			}
 		}
