@@ -717,3 +717,38 @@ func (f *File) recalculateAffectedCells(calcChain *xlsxCalcChain, affectedFormul
 
 	return affected, nil
 }
+
+// RebuildCalcChain 扫描所有工作表的公式并重建 calcChain
+func (f *File) RebuildCalcChain() error {
+	var formulas []FormulaUpdate
+
+	for _, sheetName := range f.GetSheetList() {
+		ws, err := f.workSheetReader(sheetName)
+		if err != nil {
+			continue
+		}
+
+		if ws.SheetData.Row == nil {
+			continue
+		}
+
+		for _, row := range ws.SheetData.Row {
+			for _, cell := range row.C {
+				if cell.F != nil && cell.F.Content != "" {
+					formulas = append(formulas, FormulaUpdate{
+						Sheet:   sheetName,
+						Cell:    cell.R,
+						Formula: cell.F.Content,
+					})
+				}
+			}
+		}
+	}
+
+	if len(formulas) == 0 {
+		return nil
+	}
+
+	_, err := f.BatchSetFormulasAndRecalculate(formulas)
+	return err
+}
