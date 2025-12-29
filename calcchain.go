@@ -420,8 +420,8 @@ func (f *File) recalculateCell(sheet, cell string) error {
 		return nil
 	}
 
-	// Calculate the formula value
-	result, err := f.CalcCellValue(sheet, cell)
+	// Calculate the formula value using raw values (not formatted)
+	result, err := f.CalcCellValue(sheet, cell, Options{RawCellValue: true})
 	if err != nil {
 		// If calculation fails, clear the cache instead of returning error
 		cellRef.V = ""
