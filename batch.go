@@ -28,7 +28,8 @@ type FormulaUpdate struct {
 // 请在调用后使用 RecalculateSheet 或 UpdateCellAndRecalculate。
 //
 // 参数：
-//   updates: 单元格更新列表
+//
+//	updates: 单元格更新列表
 //
 // 示例：
 //
@@ -53,7 +54,8 @@ func (f *File) BatchSetCellValue(updates []CellUpdate) error {
 // 这在批量更新单元格后需要重新计算依赖公式时非常有用。
 //
 // 参数：
-//   sheet: 工作表名称
+//
+//	sheet: 工作表名称
 //
 // 注意：此函数只会重新计算该工作表中的公式，不会影响其他工作表。
 //
@@ -104,11 +106,13 @@ type AffectedCell struct {
 // 5. ✅ 返回所有受影响的单元格列表
 //
 // 参数：
-//   updates: 单元格更新列表
+//
+//	updates: 单元格更新列表
 //
 // 返回：
-//   []AffectedCell: 所有重新计算的单元格列表
-//   error: 错误信息
+//
+//	[]AffectedCell: 所有重新计算的单元格列表
+//	error: 错误信息
 //
 // 示例：
 //
@@ -165,7 +169,8 @@ func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) ([]AffectedCell, 
 // 这个函数可以提高性能并支持自动更新 calcChain。
 //
 // 参数：
-//   formulas: 公式更新列表
+//
+//	formulas: 公式更新列表
 //
 // 示例：
 //
@@ -199,11 +204,13 @@ func (f *File) BatchSetFormulas(formulas []FormulaUpdate) error {
 // 相比循环调用 SetCellFormula + UpdateCellAndRecalculate，性能提升显著。
 //
 // 参数：
-//   formulas: 公式更新列表
+//
+//	formulas: 公式更新列表
 //
 // 返回：
-//   []AffectedCell: 所有重新计算的单元格列表
-//   error: 错误信息
+//
+//	[]AffectedCell: 所有重新计算的单元格列表
+//	error: 错误信息
 //
 // 示例：
 //
@@ -371,7 +378,7 @@ func (f *File) updateCalcChainForFormulas(formulas []FormulaUpdate) error {
 		// 添加到 calcChain
 		newEntry := xlsxCalcChainC{
 			R: formula.Cell,
-			I: sheetID,  // I is the sheet ID (1-based)
+			I: sheetID, // I is the sheet ID (1-based)
 		}
 
 		calcChain.C = append(calcChain.C, newEntry)
@@ -452,6 +459,8 @@ func (f *File) recalculateAllSheetsWithTracking(calcChain *xlsxCalcChain) ([]Aff
 
 	return affected, nil
 }
+
+// findAffectedFormulas 找出所有受影响的公式单元格（包括间接依赖
 // findAffectedFormulas 找出所有受影响的公式单元格（包括间接依赖）
 // 通过解析公式中的单元格引用，找出哪些公式依赖于被更新的单元格
 func (f *File) findAffectedFormulas(calcChain *xlsxCalcChain, updatedCells map[string]map[string]bool) map[string]bool {
@@ -663,7 +672,53 @@ func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affe
 		}
 	}
 
+	// 检查范围引用（A1:B10, Sheet!A1:B10 等）
+	rangeRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^\s\(\)!]+!))?(\$?[A-Z]+\$?[0-9]+):(\$?[A-Z]+\$?[0-9]+)`)
+	rangeMatches := rangeRefPattern.FindAllStringSubmatch(formula, -1)
+
+	for _, match := range rangeMatches {
+		refSheet := currentSheet
+		if match[1] != "" {
+			refSheet = match[1]
+		} else if match[2] != "" {
+			refSheet = strings.TrimSuffix(match[2], "!")
+		}
+
+		startCell := strings.ReplaceAll(match[3], "$", "")
+		endCell := strings.ReplaceAll(match[4], "$", "")
+
+		// 检查受影响的单元格是否在这个范围内
+		for cellKey := range affectedCells {
+			parts := strings.Split(cellKey, "!")
+			if len(parts) == 2 && parts[0] == refSheet {
+				if f.cellInRange(parts[1], startCell, endCell) {
+					return true
+				}
+			}
+		}
+	}
+
 	return false
+}
+
+// cellInRange 检查单元格是否在范围内
+func (f *File) cellInRange(cell, startCell, endCell string) bool {
+	col, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return false
+	}
+
+	startCol, startRow, err := CellNameToCoordinates(startCell)
+	if err != nil {
+		return false
+	}
+
+	endCol, endRow, err := CellNameToCoordinates(endCell)
+	if err != nil {
+		return false
+	}
+
+	return col >= startCol && col <= endCol && row >= startRow && row <= endRow
 }
 
 // getCellFromWorksheet 从工作表中获取单元格数据
@@ -711,14 +766,8 @@ func (f *File) recalculateAffectedCells(calcChain *xlsxCalcChain, affectedFormul
 			continue
 		}
 
-		// 从 XML 读取缓存值（而不是从 calcCache，因为 cache 已被清除）
-		ws, _ := f.workSheetReader(sheetName)
-		col, row, _ := CellNameToCoordinates(c.R)
-		cellData := f.getCellFromWorksheet(ws, col, row)
-		cachedValue := ""
-		if cellData != nil {
-			cachedValue = cellData.V
-		}
+		// 读取格式化后的值用于返回
+		cachedValue, _ := f.GetCellValue(sheetName, c.R)
 
 		affected = append(affected, AffectedCell{
 			Sheet:       sheetName,
