@@ -711,11 +711,13 @@ func (f *File) recalculateAffectedCells(calcChain *xlsxCalcChain, affectedFormul
 			continue
 		}
 
-		// 获取缓存值
-		cacheKey := cellKey + "!raw=false"
+		// 从 XML 读取缓存值（而不是从 calcCache，因为 cache 已被清除）
+		ws, _ := f.workSheetReader(sheetName)
+		col, row, _ := CellNameToCoordinates(c.R)
+		cellData := f.getCellFromWorksheet(ws, col, row)
 		cachedValue := ""
-		if value, ok := f.calcCache.Load(cacheKey); ok && value != nil {
-			cachedValue = value.(string)
+		if cellData != nil {
+			cachedValue = cellData.V
 		}
 
 		affected = append(affected, AffectedCell{
