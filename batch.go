@@ -584,16 +584,18 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 		}
 	}
 
-	// 简单的单元格引用匹配（A1, Sheet1!A1, $A$1 等）
-	cellRefPattern := regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_.]*!)?(\$?[A-Z]+\$?[0-9]+)`)
+	// 单元格引用匹配（支持单引号表名）
+	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_.]*!))?(\$?[A-Z]+\$?[0-9]+)`)
 	matches := cellRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range matches {
 		refSheet := currentSheet
 		if match[1] != "" {
-			refSheet = strings.TrimSuffix(match[1], "!")
+			refSheet = match[1] // 单引号表名
+		} else if match[2] != "" {
+			refSheet = strings.TrimSuffix(match[2], "!")
 		}
-		refCell := strings.ReplaceAll(match[2], "$", "")
+		refCell := strings.ReplaceAll(match[3], "$", "")
 
 		if updatedCells[refSheet] != nil && updatedCells[refSheet][refCell] {
 			return true
@@ -636,16 +638,18 @@ func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affe
 		}
 	}
 
-	// 单元格引用匹配
-	cellRefPattern := regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_.]*!)?(\$?[A-Z]+\$?[0-9]+)`)
+	// 单元格引用匹配（支持单引号表名）
+	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_.]*!))?(\$?[A-Z]+\$?[0-9]+)`)
 	matches := cellRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range matches {
 		refSheet := currentSheet
 		if match[1] != "" {
-			refSheet = strings.TrimSuffix(match[1], "!")
+			refSheet = match[1] // 单引号表名
+		} else if match[2] != "" {
+			refSheet = strings.TrimSuffix(match[2], "!")
 		}
-		refCell := strings.ReplaceAll(match[2], "$", "")
+		refCell := strings.ReplaceAll(match[3], "$", "")
 		cellKey := refSheet + "!" + refCell
 
 		if affectedCells[cellKey] {
@@ -734,12 +738,19 @@ func (f *File) RebuildCalcChain() error {
 
 		for _, row := range ws.SheetData.Row {
 			for _, cell := range row.C {
-				if cell.F != nil && cell.F.Content != "" {
-					formulas = append(formulas, FormulaUpdate{
-						Sheet:   sheetName,
-						Cell:    cell.R,
-						Formula: cell.F.Content,
-					})
+				if cell.F != nil {
+					formula := cell.F.Content
+					// 处理共享公式
+					if formula == "" && cell.F.T == STCellFormulaTypeShared && cell.F.Si != nil {
+						formula, _ = getSharedFormula(ws, *cell.F.Si, cell.R)
+					}
+					if formula != "" {
+						formulas = append(formulas, FormulaUpdate{
+							Sheet:   sheetName,
+							Cell:    cell.R,
+							Formula: formula,
+						})
+					}
 				}
 			}
 		}
