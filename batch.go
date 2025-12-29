@@ -554,8 +554,8 @@ func (f *File) findAffectedFormulas(calcChain *xlsxCalcChain, updatedCells map[s
 
 // formulaReferencesUpdatedCells 检查公式是否引用了被更新的单元格
 func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updatedCells map[string]map[string]bool) bool {
-	// 检查全列引用（A:A, $A:$A, 'Sheet'!A:A 等）
-	colRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_.]*!))?(\$?[A-Z]+):(\$?[A-Z]+)`)
+	// 检查全列引用（A:A, $A:$A, 'Sheet'!A:A, 中文表名!A:A 等）
+	colRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^!]+!))?(\$?[A-Z]+):(\$?[A-Z]+)`)
 	colMatches := colRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range colMatches {
@@ -584,8 +584,8 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 		}
 	}
 
-	// 单元格引用匹配（支持单引号表名）
-	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_.]*!))?(\$?[A-Z]+\$?[0-9]+)`)
+	// 单元格引用匹配（支持单引号表名和中文表名）
+	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^!]+!))?(\$?[A-Z]+\$?[0-9]+)`)
 	matches := cellRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range matches {
@@ -607,8 +607,8 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 
 // formulaReferencesAffectedCells 检查公式是否引用了受影响的单元格
 func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affectedCells map[string]bool) bool {
-	// 检查全列引用（A:A, $A:$A, 'Sheet'!A:A 等）
-	colRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_.]*!))?(\$?[A-Z]+):(\$?[A-Z]+)`)
+	// 检查全列引用（A:A, $A:$A, 'Sheet'!A:A, 中文表名!A:A 等）
+	colRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^!]+!))?(\$?[A-Z]+):(\$?[A-Z]+)`)
 	colMatches := colRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range colMatches {
@@ -638,8 +638,8 @@ func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affe
 		}
 	}
 
-	// 单元格引用匹配（支持单引号表名）
-	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_.]*!))?(\$?[A-Z]+\$?[0-9]+)`)
+	// 单元格引用匹配（支持单引号表名和中文表名）
+	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^!]+!))?(\$?[A-Z]+\$?[0-9]+)`)
 	matches := cellRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range matches {
