@@ -391,8 +391,17 @@ func (f *File) getCellDataFromWorksheet(ws *xlsxWorksheet, sst *xlsxSST, s *xlsx
 			}
 
 			var formula string
-			if colData.F != nil && colData.F.Content != "" {
-				formula = "=" + colData.F.Content
+			if colData.F != nil {
+				// Handle shared formulas
+				if colData.F.T == STCellFormulaTypeShared && colData.F.Si != nil {
+					sharedFormula, err := getSharedFormula(ws, *colData.F.Si, colData.R)
+					if err == nil && sharedFormula != "" {
+						formula = "=" + sharedFormula
+					}
+				} else if colData.F.Content != "" {
+					// Regular formula
+					formula = "=" + colData.F.Content
+				}
 			}
 
 			return CellData{
