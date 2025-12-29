@@ -554,6 +554,9 @@ func (f *File) findAffectedFormulas(calcChain *xlsxCalcChain, updatedCells map[s
 
 // formulaReferencesUpdatedCells 检查公式是否引用了被更新的单元格
 func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updatedCells map[string]map[string]bool) bool {
+	// 去掉公式两端的单引号（如果有）
+	formula = strings.Trim(formula, "'")
+
 	// 检查全列引用（A:A, $A:$A, 'Sheet'!A:A, 中文表名!A:A 等）
 	colRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^\s\(\)!]+!))?(\$?[A-Z]+):(\$?[A-Z]+)`)
 	colMatches := colRefPattern.FindAllStringSubmatch(formula, -1)
@@ -607,6 +610,9 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 
 // formulaReferencesAffectedCells 检查公式是否引用了受影响的单元格
 func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affectedCells map[string]bool) bool {
+	// 去掉公式两端的单引号（如果有）
+	formula = strings.Trim(formula, "'")
+
 	// 检查全列引用（A:A, $A:$A, 'Sheet'!A:A, 中文表名!A:A 等）
 	colRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^\s\(\)!]+!))?(\$?[A-Z]+):(\$?[A-Z]+)`)
 	colMatches := colRefPattern.FindAllStringSubmatch(formula, -1)
