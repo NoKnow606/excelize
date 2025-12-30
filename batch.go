@@ -1,7 +1,10 @@
 package excelize
 
 import (
+	"fmt"
+	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -179,6 +182,8 @@ func (f *File) RecalculateSheet(sheet string) error {
 //	    fmt.Printf("%s!%s = %s\n", cell.Sheet, cell.Cell, cell.CachedValue)
 //	}
 func (f *File) RecalculateAll() ([]AffectedCell, error) {
+	totalStart := time.Now()
+
 	calcChain, err := f.calcChainReader()
 	if err != nil {
 		return nil, err
@@ -188,9 +193,41 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 		return nil, nil
 	}
 
+	log.Printf("📊 [RecalculateAll] Starting: %d formulas to calculate", len(calcChain.C))
+
+	// === 批量SUMIFS优化 ===
+	// 在逐个计算之前，先检测并批量计算SUMIFS公式
+	batchStart := time.Now()
+	batchResults := f.detectAndCalculateBatchSUMIFS()
+	batchDuration := time.Since(batchStart)
+
+	batchCount := len(batchResults)
+	if batchCount > 0 {
+		log.Printf("⚡ [RecalculateAll] Batch SUMIFS optimization: %d formulas calculated in %v (avg: %v/formula)",
+			batchCount, batchDuration, batchDuration/time.Duration(batchCount))
+
+		// 将批量结果存入calcCache，这样后续逐个计算时会直接使用缓存
+		for fullCell, value := range batchResults {
+			// fullCell format: "Sheet!Cell"
+			cacheKey := fullCell + "!raw=true"
+			f.calcCache.Store(cacheKey, fmt.Sprintf("%g", value))
+		}
+	}
+
 	var affected []AffectedCell
 	sheetList := f.GetSheetList()
 	currentSheetIndex := -1
+	var currentWs *xlsxWorksheet
+	var currentSheetName string
+
+	// Pre-build cell map for current sheet to avoid O(n²) lookups
+	cellMap := make(map[string]*xlsxC)
+
+	sheetBuildTime := time.Duration(0)
+	calcTime := time.Duration(0)
+	formulaCount := 0
+	batchHitCount := 0                        // Track how many formulas used batch results
+	progressInterval := len(calcChain.C) / 10 // Report every 10%
 
 	for i := range calcChain.C {
 		c := calcChain.C[i]
@@ -203,8 +240,70 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 		}
 
 		sheetName := sheetList[currentSheetIndex]
-		if err := f.recalculateCell(sheetName, c.R); err != nil {
+
+		// If sheet changed, rebuild cell map
+		if sheetName != currentSheetName {
+			buildStart := time.Now()
+			currentSheetName = sheetName
+			currentWs, err = f.workSheetReader(sheetName)
+			if err != nil {
+				continue
+			}
+
+			// Build cell map for fast lookup
+			cellMap = make(map[string]*xlsxC)
+			if currentWs != nil && currentWs.SheetData.Row != nil {
+				for rowIdx := range currentWs.SheetData.Row {
+					for cellIdx := range currentWs.SheetData.Row[rowIdx].C {
+						cell := &currentWs.SheetData.Row[rowIdx].C[cellIdx]
+						cellMap[cell.R] = cell
+					}
+				}
+			}
+			buildDuration := time.Since(buildStart)
+			sheetBuildTime += buildDuration
+			log.Printf("  📄 [RecalculateAll] Built cell map for sheet '%s': %d cells in %v", sheetName, len(cellMap), buildDuration)
+		}
+
+		// Fast lookup using cellMap
+		cellRef, exists := cellMap[c.R]
+		if !exists || cellRef.F == nil {
 			continue
+		}
+
+		// Calculate the formula value using raw values
+		calcStart := time.Now()
+		result, err := f.CalcCellValue(sheetName, c.R, Options{RawCellValue: true})
+		calcDuration := time.Since(calcStart)
+
+		// Check if this was a batch cache hit (very fast calculation)
+		if calcDuration < 1*time.Microsecond {
+			batchHitCount++
+		}
+
+		calcTime += calcDuration
+
+		if err != nil {
+			// If calculation fails, clear the cache
+			cellRef.V = ""
+			cellRef.T = ""
+			continue
+		}
+
+		// Update cache value directly (we already have the cell reference)
+		cellRef.V = result
+		// Determine type based on value
+		if result == "" {
+			cellRef.T = ""
+		} else if result == "TRUE" || result == "FALSE" {
+			cellRef.T = "b"
+		} else {
+			// Try to parse as number
+			if _, err := strconv.ParseFloat(result, 64); err == nil {
+				cellRef.T = "n"
+			} else {
+				cellRef.T = "str"
+			}
 		}
 
 		cachedValue, _ := f.GetCellValue(sheetName, c.R)
@@ -213,6 +312,33 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 			Cell:        c.R,
 			CachedValue: cachedValue,
 		})
+
+		formulaCount++
+
+		// Progress logging
+		if progressInterval > 0 && formulaCount%progressInterval == 0 {
+			progress := float64(formulaCount) / float64(len(calcChain.C)) * 100
+			elapsed := time.Since(totalStart)
+			avgPerFormula := elapsed / time.Duration(formulaCount)
+			remaining := time.Duration(len(calcChain.C)-formulaCount) * avgPerFormula
+			log.Printf("  ⏳ [RecalculateAll] Progress: %.0f%% (%d/%d), elapsed: %v, avg: %v/formula, remaining: ~%v",
+				progress, formulaCount, len(calcChain.C), elapsed, avgPerFormula, remaining)
+		}
+	}
+
+	totalDuration := time.Since(totalStart)
+	log.Printf("✅ [RecalculateAll] Completed: %d formulas in %v", formulaCount, totalDuration)
+	log.Printf("  📊 Breakdown: CellMap build: %v, Formula calc: %v, Avg per formula: %v",
+		sheetBuildTime, calcTime, calcTime/time.Duration(formulaCount))
+
+	// Log batch optimization statistics
+	if batchCount > 0 {
+		log.Printf("  ⚡ Batch SUMIFS stats: %d formulas batched, %d cache hits during calculation",
+			batchCount, batchHitCount)
+		if batchHitCount > 0 {
+			batchSavings := batchDuration
+			log.Printf("  💰 Estimated time saved by batch optimization: %v", batchSavings)
+		}
 	}
 
 	return affected, nil
@@ -482,12 +608,6 @@ func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) ([]Affec
 	// 8. 收集受影响单元格的缓存值
 	var affected []AffectedCell
 	for cellKey := range affectedFormulas {
-		cacheKey := cellKey + "!raw=false"
-		cachedValue := ""
-		if value, ok := f.calcCache.Load(cacheKey); ok && value != nil {
-			cachedValue = value.(string)
-		}
-
 		// 解析 cellKey (Sheet!Cell)
 		parts := make([]string, 0, 2)
 		lastIdx := 0
@@ -500,9 +620,22 @@ func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) ([]Affec
 		parts = append(parts, cellKey[lastIdx:])
 
 		if len(parts) == 2 {
+			sheet := parts[0]
+			cell := parts[1]
+
+			// 尝试从缓存获取，如果没有则直接读取单元格值
+			cacheKey := cellKey + "!raw=false"
+			cachedValue := ""
+			if value, ok := f.calcCache.Load(cacheKey); ok && value != nil {
+				cachedValue = value.(string)
+			} else {
+				// 缓存中没有，直接读取
+				cachedValue, _ = f.GetCellValue(sheet, cell)
+			}
+
 			affected = append(affected, AffectedCell{
-				Sheet:       parts[0],
-				Cell:        parts[1],
+				Sheet:       sheet,
+				Cell:        cell,
 				CachedValue: cachedValue,
 			})
 		}
@@ -767,7 +900,8 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 	}
 
 	// 单元格引用匹配（支持单引号表名和中文表名）
-	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^\s\(\)!]+!))?(\$?[A-Z]+\$?[0-9]+)`)
+	// 使用\b单词边界或(?:^|[^A-Za-z0-9_])确保不会匹配到运算符
+	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|(?:^|[^A-Za-z0-9_])([A-Za-z0-9_]+!))?(\$?[A-Z]+\$?[0-9]+)`)
 	matches := cellRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range matches {
@@ -775,7 +909,10 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 		if match[1] != "" {
 			refSheet = match[1] // 单引号表名
 		} else if match[2] != "" {
+			// 移除尾部的!，并且移除前面的非字母数字字符（如=, +等）
 			refSheet = strings.TrimSuffix(match[2], "!")
+			// 移除前导的非字母数字字符
+			refSheet = strings.TrimLeft(refSheet, "=+-*/^&|<>(),")
 		}
 		refCell := strings.ReplaceAll(match[3], "$", "")
 
@@ -824,7 +961,8 @@ func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affe
 	}
 
 	// 单元格引用匹配（支持单引号表名和中文表名）
-	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|([^\s\(\)!]+!))?(\$?[A-Z]+\$?[0-9]+)`)
+	// 使用\b单词边界或(?:^|[^A-Za-z0-9_])确保不会匹配到运算符
+	cellRefPattern := regexp.MustCompile(`(?:'([^']+)'!|(?:^|[^A-Za-z0-9_])([A-Za-z0-9_]+!))?(\$?[A-Z]+\$?[0-9]+)`)
 	matches := cellRefPattern.FindAllStringSubmatch(formula, -1)
 
 	for _, match := range matches {
@@ -832,7 +970,10 @@ func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affe
 		if match[1] != "" {
 			refSheet = match[1] // 单引号表名
 		} else if match[2] != "" {
+			// 移除尾部的!，并且移除前面的非字母数字字符（如=, +等）
 			refSheet = strings.TrimSuffix(match[2], "!")
+			// 移除前导的非字母数字字符
+			refSheet = strings.TrimLeft(refSheet, "=+-*/^&|<>(),")
 		}
 		refCell := strings.ReplaceAll(match[3], "$", "")
 		cellKey := refSheet + "!" + refCell

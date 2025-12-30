@@ -6777,7 +6777,7 @@ func (fn *formulaFuncs) SUMIFS(argsList *list.List) formulaArg {
 	for arg := argsList.Front().Next(); arg != nil; arg = arg.Next() {
 		args = append(args, arg.Value.(formulaArg))
 	}
-	for _, ref := range formulaIfsMatch(args) {
+	for _, ref := range fn.formulaIfsMatch(args) {
 		if ref.Row >= len(sumRange) || ref.Col >= len(sumRange[ref.Row]) {
 			return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
 		}
@@ -7179,7 +7179,7 @@ func (fn *formulaFuncs) AVERAGEIFS(argsList *list.List) formulaArg {
 		args = append(args, arg.Value.(formulaArg))
 	}
 	count := 0.0
-	for _, ref := range formulaIfsMatch(args) {
+	for _, ref := range fn.formulaIfsMatch(args) {
 		if num := sumRange[ref.Row][ref.Col].ToNumber(); num.Type == ArgNumber {
 			sum += num.Number
 			count++
@@ -8849,29 +8849,210 @@ func (fn *formulaFuncs) COUNTIF(argsList *list.List) formulaArg {
 }
 
 // formulaIfsMatch function returns cells reference array which match criteria.
-func formulaIfsMatch(args []formulaArg) (cellRefs []cellRef) {
+// This is now a method of formulaFuncs to enable caching optimization.
+func (fn *formulaFuncs) formulaIfsMatch(args []formulaArg) (cellRefs []cellRef) {
+	// Generate cache key based on range references and criteria values
+	// Use cellRanges info for stable cache keys (not matrix address which changes)
+	var cacheKey strings.Builder
+	cacheKey.Grow(len(args) * 64) // Pre-allocate approximate size
+
+	for i := 0; i < len(args)-1; i += 2 {
+		rangeArg := args[i]
+		criteria := args[i+1]
+
+		// Build stable key from cellRanges/cellRefs
+		// Format: "SheetName:StartRow:StartCol:EndRow:EndCol:CriteriaValue"
+		if rangeArg.cellRanges != nil && rangeArg.cellRanges.Len() > 0 {
+			// Use range info (cellRanges contains cellRange structs)
+			for r := rangeArg.cellRanges.Front(); r != nil; r = r.Next() {
+				cr := r.Value.(cellRange)
+				cacheKey.WriteString(cr.From.Sheet)
+				cacheKey.WriteString(":")
+				cacheKey.WriteString(strconv.Itoa(cr.From.Row))
+				cacheKey.WriteString(":")
+				cacheKey.WriteString(strconv.Itoa(cr.From.Col))
+				cacheKey.WriteString("-")
+				cacheKey.WriteString(strconv.Itoa(cr.To.Row))
+				cacheKey.WriteString(":")
+				cacheKey.WriteString(strconv.Itoa(cr.To.Col))
+				if r.Next() != nil {
+					cacheKey.WriteString(",")
+				}
+			}
+		} else if rangeArg.cellRefs != nil && rangeArg.cellRefs.Len() > 0 {
+			// Use cell refs
+			for r := rangeArg.cellRefs.Front(); r != nil; r = r.Next() {
+				cr := r.Value.(cellRef)
+				cacheKey.WriteString(cr.Sheet)
+				cacheKey.WriteString(":")
+				cacheKey.WriteString(strconv.Itoa(cr.Row))
+				cacheKey.WriteString(":")
+				cacheKey.WriteString(strconv.Itoa(cr.Col))
+				if r.Next() != nil {
+					cacheKey.WriteString(",")
+				}
+			}
+		} else {
+			// Fallback: use matrix size
+			if len(rangeArg.Matrix) > 0 {
+				cacheKey.WriteString(strconv.Itoa(len(rangeArg.Matrix)))
+				cacheKey.WriteString("x")
+				cacheKey.WriteString(strconv.Itoa(len(rangeArg.Matrix[0])))
+			}
+		}
+
+		cacheKey.WriteString(":")
+
+		// Use criteria string value
+		criteriaStr := criteria.Value()
+		cacheKey.WriteString(criteriaStr)
+
+		if i < len(args)-2 {
+			cacheKey.WriteString("|")
+		}
+	}
+
+	key := cacheKey.String()
+
+	// Check cache first
+	if cached, ok := fn.f.ifsMatchCache.Load(key); ok {
+		if refs, isRefs := cached.([]cellRef); isRefs {
+			return refs
+		}
+	}
+
+	// Cache miss - perform the matching with optimized algorithm
+	// Optimization: Build index for each criteria_range for O(1) lookup
 	for i := 0; i < len(args)-1; i += 2 {
 		var match []cellRef
 		matrix, criteria := args[i].Matrix, formulaCriteriaParser(args[i+1])
+
 		if i == 0 {
-			for rowIdx, row := range matrix {
-				for colIdx, col := range row {
-					if ok, _ := formulaCriteriaEval(col, criteria); ok {
-						match = append(match, cellRef{Col: colIdx, Row: rowIdx})
+			// First criteria - build or use index
+			// Generate index key from range info
+			var indexKey string
+			rangeArg := args[i]
+			if rangeArg.cellRanges != nil && rangeArg.cellRanges.Len() > 0 {
+				for r := rangeArg.cellRanges.Front(); r != nil; r = r.Next() {
+					cr := r.Value.(cellRange)
+					indexKey = fmt.Sprintf("%s:%d:%d-%d:%d", cr.From.Sheet, cr.From.Row, cr.From.Col, cr.To.Row, cr.To.Col)
+					break // Use first range
+				}
+			}
+
+			// Try to get or build index for this range
+			var rangeIndex map[string][]cellRef
+			if indexKey != "" {
+				if cached, ok := fn.f.rangeIndexCache.Load(indexKey); ok {
+					rangeIndex = cached.(map[string][]cellRef)
+				} else {
+					// Build index for this range
+					rangeIndex = make(map[string][]cellRef)
+					for rowIdx, row := range matrix {
+						for colIdx, col := range row {
+							val := col.Value()
+							if val != "" { // Only index non-empty values
+								rangeIndex[val] = append(rangeIndex[val], cellRef{Col: colIdx, Row: rowIdx})
+							}
+						}
+					}
+					// Store index in cache
+					fn.f.rangeIndexCache.Store(indexKey, rangeIndex)
+				}
+			}
+
+			// Use index for equality criteria
+			if criteria.Type == criteriaEq && rangeIndex != nil {
+				targetVal := criteria.Condition.Value()
+				if positions, exists := rangeIndex[targetVal]; exists {
+					match = positions
+				}
+			} else if criteria.Type == criteriaEq {
+				// No index - direct comparison
+				targetVal := criteria.Condition.Value()
+				for rowIdx, row := range matrix {
+					for colIdx, col := range row {
+						if col.Value() == targetVal {
+							match = append(match, cellRef{Col: colIdx, Row: rowIdx})
+						}
+					}
+				}
+			} else {
+				// Non-equality criteria - fall back to linear scan
+				for rowIdx, row := range matrix {
+					for colIdx, col := range row {
+						if ok, _ := formulaCriteriaEval(col, criteria); ok {
+							match = append(match, cellRef{Col: colIdx, Row: rowIdx})
+						}
 					}
 				}
 			}
 		} else {
-			match = []cellRef{}
-			for _, ref := range cellRefs {
-				value := matrix[ref.Row][ref.Col]
-				if ok, _ := formulaCriteriaEval(value, criteria); ok {
-					match = append(match, ref)
+			// Subsequent criteria - filter existing matches using index
+			var indexKey string
+			rangeArg := args[i]
+			if rangeArg.cellRanges != nil && rangeArg.cellRanges.Len() > 0 {
+				for r := rangeArg.cellRanges.Front(); r != nil; r = r.Next() {
+					cr := r.Value.(cellRange)
+					indexKey = fmt.Sprintf("%s:%d:%d-%d:%d", cr.From.Sheet, cr.From.Row, cr.From.Col, cr.To.Row, cr.To.Col)
+					break
+				}
+			}
+
+			// Try to use index for filtering
+			if criteria.Type == criteriaEq && indexKey != "" {
+				if cached, ok := fn.f.rangeIndexCache.Load(indexKey); ok {
+					rangeIndex := cached.(map[string][]cellRef)
+					targetVal := criteria.Condition.Value()
+
+					// Find intersection of previous matches and current criteria matches
+					if positions, exists := rangeIndex[targetVal]; exists {
+						// Build a set of positions for fast lookup
+						posSet := make(map[cellRef]bool)
+						for _, pos := range positions {
+							posSet[pos] = true
+						}
+
+						// Filter previous matches
+						var filtered []cellRef
+						for _, ref := range cellRefs {
+							if posSet[ref] {
+								filtered = append(filtered, ref)
+							}
+						}
+						match = filtered
+					}
+				} else {
+					// Fallback to normal filtering
+					match = []cellRef{}
+					for _, ref := range cellRefs {
+						if ref.Row < len(matrix) && ref.Col < len(matrix[ref.Row]) {
+							value := matrix[ref.Row][ref.Col]
+							if ok, _ := formulaCriteriaEval(value, criteria); ok {
+								match = append(match, ref)
+							}
+						}
+					}
+				}
+			} else {
+				// Non-equality or no index - normal filtering
+				match = []cellRef{}
+				for _, ref := range cellRefs {
+					if ref.Row < len(matrix) && ref.Col < len(matrix[ref.Row]) {
+						value := matrix[ref.Row][ref.Col]
+						if ok, _ := formulaCriteriaEval(value, criteria); ok {
+							match = append(match, ref)
+						}
+					}
 				}
 			}
 		}
 		cellRefs = match[:]
 	}
+
+	// Store in cache
+	fn.f.ifsMatchCache.Store(key, cellRefs)
+
 	return
 }
 
@@ -8890,7 +9071,7 @@ func (fn *formulaFuncs) COUNTIFS(argsList *list.List) formulaArg {
 	for arg := argsList.Front(); arg != nil; arg = arg.Next() {
 		args = append(args, arg.Value.(formulaArg))
 	}
-	return newNumberFormulaArg(float64(len(formulaIfsMatch(args))))
+	return newNumberFormulaArg(float64(len(fn.formulaIfsMatch(args))))
 }
 
 // CRITBINOM function returns the inverse of the Cumulative Binomial
@@ -11198,7 +11379,7 @@ func (fn *formulaFuncs) MAXIFS(argsList *list.List) formulaArg {
 	for arg := argsList.Front().Next(); arg != nil; arg = arg.Next() {
 		args = append(args, arg.Value.(formulaArg))
 	}
-	for _, ref := range formulaIfsMatch(args) {
+	for _, ref := range fn.formulaIfsMatch(args) {
 		if num := maxRange[ref.Row][ref.Col].ToNumber(); num.Type == ArgNumber && maxVal < num.Number {
 			maxVal = num.Number
 		}
@@ -11342,7 +11523,7 @@ func (fn *formulaFuncs) MINIFS(argsList *list.List) formulaArg {
 	for arg := argsList.Front().Next(); arg != nil; arg = arg.Next() {
 		args = append(args, arg.Value.(formulaArg))
 	}
-	for _, ref := range formulaIfsMatch(args) {
+	for _, ref := range fn.formulaIfsMatch(args) {
 		if num := minRange[ref.Row][ref.Col].ToNumber(); num.Type == ArgNumber && minVal > num.Number {
 			minVal = num.Number
 		}

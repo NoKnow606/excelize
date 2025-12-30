@@ -43,8 +43,10 @@ type File struct {
 	tempFiles        sync.Map
 	xmlAttr          sync.Map
 	calcCache        sync.Map
-	rangeCache       *lruCache      // LRU cache for range matrices to limit memory usage
-	matchIndexCache  sync.Map       // Cache for MATCH hash indexes: key -> map[string]int
+	rangeCache       *lruCache // LRU cache for range matrices to limit memory usage
+	matchIndexCache  sync.Map  // Cache for MATCH hash indexes: key -> map[string]int
+	ifsMatchCache    sync.Map  // Cache for SUMIFS/COUNTIFS criteria matching: key -> []cellRef
+	rangeIndexCache  sync.Map  // Cache for range value indexes: rangeKey -> map[value][]cellRef
 	CalcChain        *xlsxCalcChain
 	CharsetReader    func(charset string, input io.Reader) (rdr io.Reader, err error)
 	Comments         map[string]*xlsxComments
