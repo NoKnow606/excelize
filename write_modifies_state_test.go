@@ -26,7 +26,7 @@ func TestWriteModifiesWorksheetState(t *testing.T) {
 		{Sheet: sheetName, Cell: "A100", Value: "Data100"},
 		{Sheet: sheetName, Cell: "B100", Value: 999},
 	}
-	_, err = f.BatchUpdateAndRecalculate(updates)
+	err = f.BatchUpdateAndRecalculate(updates)
 	assert.NoError(t, err)
 
 	// Verify before Write
@@ -198,7 +198,7 @@ func TestWriteWithInsertRowsAndBatchUpdate(t *testing.T) {
 		{Sheet: sheetName, Cell: "A2", Value: "Inserted"},
 		{Sheet: sheetName, Cell: "B2", Value: 123},
 	}
-	_, err = f.BatchUpdateAndRecalculate(updates)
+	err = f.BatchUpdateAndRecalculate(updates)
 	assert.NoError(t, err)
 	fmt.Println("✅ Step 2: BatchUpdate")
 
@@ -220,7 +220,7 @@ func TestWriteWithInsertRowsAndBatchUpdate(t *testing.T) {
 	updates2 := []CellUpdate{
 		{Sheet: sheetName, Cell: "C2", Value: "AfterWrite"},
 	}
-	_, err = f.BatchUpdateAndRecalculate(updates2)
+	err = f.BatchUpdateAndRecalculate(updates2)
 	assert.NoError(t, err)
 	fmt.Println("✅ Step 5: BatchUpdate after Write")
 

@@ -177,7 +177,7 @@ func TestCheckRowWithBatchUpdateThenGetRows(t *testing.T) {
 		{Sheet: sheetName, Cell: "Z1", Value: "Col26"},
 		{Sheet: sheetName, Cell: "AA1", Value: "Col27"},
 	}
-	_, err := f.BatchUpdateAndRecalculate(updates)
+	err := f.BatchUpdateAndRecalculate(updates)
 	assert.NoError(t, err)
 	fmt.Println("✅ BatchUpdate succeeded")
 

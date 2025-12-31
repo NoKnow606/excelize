@@ -1,6 +1,7 @@
 package excelize
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"regexp"
@@ -168,42 +169,46 @@ func (f *File) RecalculateSheet(sheet string) error {
 // RecalculateAll 重新计算所有工作表中的所有公式并更新缓存值
 //
 // 此函数会遍历 calcChain 中的所有公式单元格，重新计算并更新缓存值。
-// 返回所有重新计算的单元格列表。
+// 计算结果会直接更新到工作表的单元格缓存中。
+//
+// 注意：为了避免内存溢出，此函数不再返回受影响单元格的列表。
+// 所有计算结果已经直接更新到工作表中，可以通过 GetCellValue 读取。
 //
 // 返回：
 //
-//	[]AffectedCell: 所有重新计算的单元格列表
 //	error: 错误信息
 //
 // 示例：
 //
-//	affected, err := f.RecalculateAll()
-//	for _, cell := range affected {
-//	    fmt.Printf("%s!%s = %s\n", cell.Sheet, cell.Cell, cell.CachedValue)
+//	err := f.RecalculateAll()
+//	if err != nil {
+//	    log.Fatal(err)
 //	}
-func (f *File) RecalculateAll() ([]AffectedCell, error) {
+//	// 读取计算后的值
+//	value, _ := f.GetCellValue("Sheet1", "A1")
+func (f *File) RecalculateAll() error {
 	totalStart := time.Now()
 
 	calcChain, err := f.calcChainReader()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if calcChain == nil || len(calcChain.C) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	log.Printf("📊 [RecalculateAll] Starting: %d formulas to calculate", len(calcChain.C))
 
-	// === 批量SUMIFS优化 ===
-	// 在逐个计算之前，先检测并批量计算SUMIFS公式
+	// === 批量SUMIFS/AVERAGEIFS优化 ===
+	// 在逐个计算之前，先检测并批量计算SUMIFS/AVERAGEIFS公式
 	batchStart := time.Now()
 	batchResults := f.detectAndCalculateBatchSUMIFS()
 	batchDuration := time.Since(batchStart)
 
 	batchCount := len(batchResults)
 	if batchCount > 0 {
-		log.Printf("⚡ [RecalculateAll] Batch SUMIFS optimization: %d formulas calculated in %v (avg: %v/formula)",
+		log.Printf("⚡ [RecalculateAll] Batch SUMIFS/AVERAGEIFS/SUMPRODUCT optimization: %d formulas calculated in %v (avg: %v/formula)",
 			batchCount, batchDuration, batchDuration/time.Duration(batchCount))
 
 		// 将批量结果存入calcCache，这样后续逐个计算时会直接使用缓存
@@ -214,11 +219,11 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 		}
 	}
 
-	var affected []AffectedCell
 	sheetList := f.GetSheetList()
 	currentSheetIndex := -1
 	var currentWs *xlsxWorksheet
 	var currentSheetName string
+	sheetFormulaCount := 0 // Track formulas within current sheet
 
 	// Pre-build cell map for current sheet to avoid O(n²) lookups
 	cellMap := make(map[string]*xlsxC)
@@ -227,7 +232,13 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 	calcTime := time.Duration(0)
 	formulaCount := 0
 	batchHitCount := 0                        // Track how many formulas used batch results
-	progressInterval := len(calcChain.C) / 10 // Report every 10%
+	progressInterval := len(calcChain.C) / 20 // Report every 5% (changed from 10%)
+	slowFormulaCount := 0                     // Track slow formulas (>100ms)
+	timeoutCount := 0                         // Track timeout formulas (>5s)
+
+	// Track columns that have timed out - skip all cells in that column
+	// Map: "SheetName!Column" -> true (e.g., "补货计划!H" -> true)
+	timeoutColumns := make(map[string]bool)
 
 	for i := range calcChain.C {
 		c := calcChain.C[i]
@@ -245,6 +256,7 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 		if sheetName != currentSheetName {
 			buildStart := time.Now()
 			currentSheetName = sheetName
+			sheetFormulaCount = 0 // Reset counter for new sheet
 			currentWs, err = f.workSheetReader(sheetName)
 			if err != nil {
 				continue
@@ -262,7 +274,6 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 			}
 			buildDuration := time.Since(buildStart)
 			sheetBuildTime += buildDuration
-			log.Printf("  📄 [RecalculateAll] Built cell map for sheet '%s': %d cells in %v", sheetName, len(cellMap), buildDuration)
 		}
 
 		// Fast lookup using cellMap
@@ -271,10 +282,86 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 			continue
 		}
 
-		// Calculate the formula value using raw values
+		sheetFormulaCount++ // Increment sheet-level counter
+
+		// Extract column letter from cell reference (e.g., "H2" -> "H")
+		colLetter := ""
+		for _, ch := range c.R {
+			if ch >= 'A' && ch <= 'Z' {
+				colLetter += string(ch)
+			} else {
+				break
+			}
+		}
+
+		// Check if this column has already timed out - if so, skip it
+		columnKey := sheetName + "!" + colLetter
+		if timeoutColumns[columnKey] {
+			// Skip this cell silently - column already timed out
+			cellRef.V = ""
+			cellRef.T = ""
+			formulaCount++
+			timeoutCount++
+			continue
+		}
+
+		// Calculate the formula value using raw values with timeout
+		// Use context to ensure goroutine cleanup
 		calcStart := time.Now()
-		result, err := f.CalcCellValue(sheetName, c.R, Options{RawCellValue: true})
+
+		type calcResult struct {
+			result string
+			err    error
+		}
+
+		// Create context with timeout for proper goroutine lifecycle management
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel() // Ensure context is always cancelled to free resources
+
+		resultChan := make(chan calcResult, 1)
+
+		// Run calculation in goroutine
+		// The buffered channel ensures the goroutine can exit even if we timeout
+		go func() {
+			res, err := f.CalcCellValue(sheetName, c.R, Options{RawCellValue: true})
+			select {
+			case resultChan <- calcResult{result: res, err: err}:
+				// Result sent successfully
+			case <-ctx.Done():
+				// Context cancelled, don't block on send
+				return
+			}
+		}()
+
+		// Wait for result with timeout
+		var result string
+		var err error
+		var timedOut bool
+
+		select {
+		case calcRes := <-resultChan:
+			result = calcRes.result
+			err = calcRes.err
+		case <-ctx.Done():
+			timedOut = true
+			// Mark this entire column as timed out
+			timeoutColumns[columnKey] = true
+		}
+
 		calcDuration := time.Since(calcStart)
+
+		// Track slow formulas (>100ms) to help identify bottlenecks
+		if timedOut {
+			slowFormulaCount++
+			timeoutCount++
+			// Clear the cell value and continue to next formula
+			cellRef.V = ""
+			cellRef.T = ""
+			formulaCount++
+			continue
+		} else if calcDuration > 100*time.Millisecond {
+			slowFormulaCount++
+		}
 
 		// Check if this was a batch cache hit (very fast calculation)
 		if calcDuration < 1*time.Microsecond {
@@ -306,34 +393,47 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 			}
 		}
 
-		cachedValue, _ := f.GetCellValue(sheetName, c.R)
-		affected = append(affected, AffectedCell{
-			Sheet:       sheetName,
-			Cell:        c.R,
-			CachedValue: cachedValue,
-		})
+		// 🔥 MEMORY FIX: Don't build affected list - it consumes too much memory
+		// For 216k formulas, affected list would use ~50-100 MB
+		// The worksheet cache (cellRef.V) is already updated, which is the main goal
 
 		formulaCount++
 
-		// Progress logging
+		// Progress logging - every 5%
 		if progressInterval > 0 && formulaCount%progressInterval == 0 {
 			progress := float64(formulaCount) / float64(len(calcChain.C)) * 100
 			elapsed := time.Since(totalStart)
 			avgPerFormula := elapsed / time.Duration(formulaCount)
 			remaining := time.Duration(len(calcChain.C)-formulaCount) * avgPerFormula
-			log.Printf("  ⏳ [RecalculateAll] Progress: %.0f%% (%d/%d), elapsed: %v, avg: %v/formula, remaining: ~%v",
-				progress, formulaCount, len(calcChain.C), elapsed, avgPerFormula, remaining)
+			log.Printf("  ⏳ [RecalculateAll] Progress: %.0f%% (%d/%d), sheet: '%s', elapsed: %v, avg: %v/formula, remaining: ~%v, slow formulas: %d",
+				progress, formulaCount, len(calcChain.C), currentSheetName, elapsed, avgPerFormula, remaining, slowFormulaCount)
 		}
 	}
 
 	totalDuration := time.Since(totalStart)
 	log.Printf("✅ [RecalculateAll] Completed: %d formulas in %v", formulaCount, totalDuration)
+
+	// Avoid division by zero
+	avgPerFormula := time.Duration(0)
+	if formulaCount > 0 {
+		avgPerFormula = calcTime / time.Duration(formulaCount)
+	}
 	log.Printf("  📊 Breakdown: CellMap build: %v, Formula calc: %v, Avg per formula: %v",
-		sheetBuildTime, calcTime, calcTime/time.Duration(formulaCount))
+		sheetBuildTime, calcTime, avgPerFormula)
+
+	// Log slow formula statistics
+	if slowFormulaCount > 0 {
+		log.Printf("  ⚠️  Slow formulas detected: %d formulas took >100ms to calculate", slowFormulaCount)
+	}
+
+	// Log timeout statistics
+	if timeoutCount > 0 {
+		log.Printf("  ⏱️  Timeout formulas: %d formulas exceeded 5s and were skipped", timeoutCount)
+	}
 
 	// Log batch optimization statistics
 	if batchCount > 0 {
-		log.Printf("  ⚡ Batch SUMIFS stats: %d formulas batched, %d cache hits during calculation",
+		log.Printf("  ⚡ Batch SUMIFS/AVERAGEIFS/SUMPRODUCT stats: %d formulas batched, %d cache hits during calculation",
 			batchCount, batchHitCount)
 		if batchHitCount > 0 {
 			batchSavings := batchDuration
@@ -341,7 +441,7 @@ func (f *File) RecalculateAll() ([]AffectedCell, error) {
 		}
 	}
 
-	return affected, nil
+	return nil
 }
 
 // AffectedCell 表示受影响的单元格
@@ -361,7 +461,10 @@ type AffectedCell struct {
 // 2. ✅ 只遍历一次 calcChain
 // 3. ✅ 每个公式只计算一次（即使被多个更新影响）
 // 4. ✅ 性能提升可达 10-100 倍（取决于更新数量）
-// 5. ✅ 返回所有受影响的单元格列表
+// 5. ✅ 自动更新所有受影响单元格的缓存值
+//
+// 注意：为了避免内存溢出，此函数不再返回受影响单元格的列表。
+// 所有计算结果已经直接更新到工作表中，可以通过 GetCellValue 读取。
 //
 // 参数：
 //
@@ -369,7 +472,6 @@ type AffectedCell struct {
 //
 // 返回：
 //
-//	[]AffectedCell: 所有重新计算的单元格列表
 //	error: 错误信息
 //
 // 示例：
@@ -379,10 +481,11 @@ type AffectedCell struct {
 //	updates := []excelize.CellUpdate{
 //	    {Sheet: "Sheet1", Cell: "A1", Value: 200},
 //	}
-//	affected, err := f.BatchUpdateAndRecalculate(updates)
+//	err := f.BatchUpdateAndRecalculate(updates)
 //	// 结果：Sheet1.A1 = 200, Sheet2.B1 = 400 (自动重新计算)
-//	// affected = [{Sheet: "Sheet1", Cell: "B1"}, {Sheet: "Sheet2", Cell: "B1"}]
-func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) ([]AffectedCell, error) {
+//	// 读取计算后的值
+//	value, _ := f.GetCellValue("Sheet2", "B1")
+func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) error {
 	// 初始化调试统计
 	if enableBatchDebug {
 		batchStatsMu.Lock()
@@ -396,18 +499,18 @@ func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) ([]AffectedCell, 
 
 	// 1. 批量更新所有单元格
 	if err := f.BatchSetCellValue(updates); err != nil {
-		return nil, err
+		return err
 	}
 
 	// 2. 读取 calcChain
 	calcChain, err := f.calcChainReader()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// If calcChain doesn't exist or is empty, nothing to recalculate
 	if calcChain == nil || len(calcChain.C) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	// 3. 收集所有被更新的单元格（用于依赖检查）
@@ -439,15 +542,15 @@ func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) ([]AffectedCell, 
 	}
 
 	// 6. 重新计算受影响的公式
-	affected, err := f.recalculateAffectedCells(calcChain, affectedFormulas)
+	err = f.recalculateAffectedCells(calcChain, affectedFormulas)
 
 	// 记录总耗时
 	if enableBatchDebug && currentBatchStats != nil {
 		currentBatchStats.TotalDuration = time.Since(batchStart)
-		currentBatchStats.TotalCells = len(affected)
+		currentBatchStats.TotalCells = len(affectedFormulas)
 	}
 
-	return affected, err
+	return err
 }
 
 // BatchSetFormulas 批量设置公式，不触发重新计算
@@ -486,7 +589,10 @@ func (f *File) BatchSetFormulas(formulas []FormulaUpdate) error {
 // 2. ✅ 自动计算所有公式的值
 // 3. ✅ 自动更新 calcChain（计算链）
 // 4. ✅ 触发依赖公式的重新计算
-// 5. ✅ 返回所有受影响的单元格列表
+// 5. ✅ 自动更新所有受影响单元格的缓存值
+//
+// 注意：为了避免内存溢出，此函数不再返回受影响单元格的列表。
+// 所有计算结果已经直接更新到工作表中，可以通过 GetCellValue 读取。
 //
 // 相比循环调用 SetCellFormula + UpdateCellAndRecalculate，性能提升显著。
 //
@@ -496,7 +602,6 @@ func (f *File) BatchSetFormulas(formulas []FormulaUpdate) error {
 //
 // 返回：
 //
-//	[]AffectedCell: 所有重新计算的单元格列表
 //	error: 错误信息
 //
 // 示例：
@@ -507,17 +612,18 @@ func (f *File) BatchSetFormulas(formulas []FormulaUpdate) error {
 //	    {Sheet: "Sheet1", Cell: "B3", Formula: "=A3*2"},
 //	    {Sheet: "Sheet1", Cell: "C1", Formula: "=SUM(B1:B3)"},
 //	}
-//	affected, err := f.BatchSetFormulasAndRecalculate(formulas)
+//	err := f.BatchSetFormulasAndRecalculate(formulas)
 //	// 现在所有公式都已设置、计算，并且 calcChain 已更新
-//	// affected = [{Sheet: "Sheet1", Cell: "B1"}, {Sheet: "Sheet1", Cell: "B2"}, ...]
-func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) ([]AffectedCell, error) {
+//	// 读取计算后的值
+//	value, _ := f.GetCellValue("Sheet1", "C1")
+func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) error {
 	if len(formulas) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	// 1. 批量设置公式
 	if err := f.BatchSetFormulas(formulas); err != nil {
-		return nil, err
+		return err
 	}
 
 	// 2. 收集所有受影响的工作表和单元格
@@ -528,7 +634,7 @@ func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) ([]Affec
 
 	// 3. 为每个工作表更新 calcChain
 	if err := f.updateCalcChainForFormulas(formulas); err != nil {
-		return nil, err
+		return err
 	}
 
 	// 4. 收集被设置公式的单元格
@@ -543,18 +649,18 @@ func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) ([]Affec
 	// 5. 重新计算所有公式
 	for sheet := range affectedSheets {
 		if err := f.RecalculateSheet(sheet); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	// 6. 读取 calcChain 并找出依赖于新公式的其他单元格
 	calcChain, err := f.calcChainReader()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if calcChain == nil || len(calcChain.C) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	// 构建列索引
@@ -605,43 +711,8 @@ func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) ([]Affec
 		}
 	}
 
-	// 8. 收集受影响单元格的缓存值
-	var affected []AffectedCell
-	for cellKey := range affectedFormulas {
-		// 解析 cellKey (Sheet!Cell)
-		parts := make([]string, 0, 2)
-		lastIdx := 0
-		for i, c := range cellKey {
-			if c == '!' {
-				parts = append(parts, cellKey[lastIdx:i])
-				lastIdx = i + 1
-			}
-		}
-		parts = append(parts, cellKey[lastIdx:])
-
-		if len(parts) == 2 {
-			sheet := parts[0]
-			cell := parts[1]
-
-			// 尝试从缓存获取，如果没有则直接读取单元格值
-			cacheKey := cellKey + "!raw=false"
-			cachedValue := ""
-			if value, ok := f.calcCache.Load(cacheKey); ok && value != nil {
-				cachedValue = value.(string)
-			} else {
-				// 缓存中没有，直接读取
-				cachedValue, _ = f.GetCellValue(sheet, cell)
-			}
-
-			affected = append(affected, AffectedCell{
-				Sheet:       sheet,
-				Cell:        cell,
-				CachedValue: cachedValue,
-			})
-		}
-	}
-
-	return affected, nil
+	// 7. 不再构建affected列表，所有计算结果已经更新到工作表缓存中
+	return nil
 }
 
 // updateCalcChainForFormulas 更新 calcChain 以包含新设置的公式
@@ -1050,8 +1121,7 @@ func (f *File) getCellFromWorksheet(ws *xlsxWorksheet, col, row int) *xlsxC {
 }
 
 // recalculateAffectedCells 只重新计算受影响的单元格
-func (f *File) recalculateAffectedCells(calcChain *xlsxCalcChain, affectedFormulas map[string]bool) ([]AffectedCell, error) {
-	var affected []AffectedCell
+func (f *File) recalculateAffectedCells(calcChain *xlsxCalcChain, affectedFormulas map[string]bool) error {
 	currentSheetID := -1
 
 	for i := range calcChain.C {
@@ -1072,22 +1142,13 @@ func (f *File) recalculateAffectedCells(calcChain *xlsxCalcChain, affectedFormul
 			continue
 		}
 
-		// 重新计算
+		// 重新计算 - 结果已经直接更新到工作表缓存
 		if err := f.recalculateCell(sheetName, c.R); err != nil {
 			continue
 		}
-
-		// 读取格式化后的值用于返回
-		cachedValue, _ := f.GetCellValue(sheetName, c.R)
-
-		affected = append(affected, AffectedCell{
-			Sheet:       sheetName,
-			Cell:        c.R,
-			CachedValue: cachedValue,
-		})
 	}
 
-	return affected, nil
+	return nil
 }
 
 // RebuildCalcChain 扫描所有工作表的公式并重建 calcChain

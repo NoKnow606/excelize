@@ -32,7 +32,7 @@ func TestBatchSetFormulasAndRecalculate_CrossSheetReference(t *testing.T) {
 		{Sheet: "Sheet2", Cell: "C2", Formula: "=Sheet1!B2+10"},
 	}
 
-	_, err = f.BatchSetFormulasAndRecalculate(formulas)
+	err = f.BatchSetFormulasAndRecalculate(formulas)
 	assert.NoError(t, err)
 
 	// Verify initial calculations
@@ -68,12 +68,12 @@ func TestBatchSetFormulasAndRecalculate_CrossSheetChain(t *testing.T) {
 
 	// Create dependency chain: Sheet1 -> Sheet2 -> Sheet3
 	formulas := []FormulaUpdate{
-		{Sheet: "Sheet1", Cell: "B1", Formula: "=A1*2"},          // 20
-		{Sheet: "Sheet2", Cell: "C1", Formula: "=Sheet1!B1+5"},   // 25
-		{Sheet: "Sheet3", Cell: "D1", Formula: "=Sheet2!C1*3"},   // 75
+		{Sheet: "Sheet1", Cell: "B1", Formula: "=A1*2"},        // 20
+		{Sheet: "Sheet2", Cell: "C1", Formula: "=Sheet1!B1+5"}, // 25
+		{Sheet: "Sheet3", Cell: "D1", Formula: "=Sheet2!C1*3"}, // 75
 	}
 
-	_, err = f.BatchSetFormulasAndRecalculate(formulas)
+	err = f.BatchSetFormulasAndRecalculate(formulas)
 	assert.NoError(t, err)
 
 	// Verify chain: 10 -> 20 -> 25 -> 75
@@ -103,13 +103,13 @@ func TestBatchSetFormulasAndRecalculate_MixedSheetFormulas(t *testing.T) {
 
 	// Set formulas that reference each other
 	formulas := []FormulaUpdate{
-		{Sheet: "Sheet1", Cell: "B1", Formula: "=A1*2"},          // 100
-		{Sheet: "Sheet2", Cell: "B1", Formula: "=A1*3"},          // 300
-		{Sheet: "Sheet1", Cell: "C1", Formula: "=Sheet2!B1+B1"},  // 400 (300+100)
-		{Sheet: "Sheet2", Cell: "C1", Formula: "=Sheet1!B1+B1"},  // 400 (100+300)
+		{Sheet: "Sheet1", Cell: "B1", Formula: "=A1*2"},         // 100
+		{Sheet: "Sheet2", Cell: "B1", Formula: "=A1*3"},         // 300
+		{Sheet: "Sheet1", Cell: "C1", Formula: "=Sheet2!B1+B1"}, // 400 (300+100)
+		{Sheet: "Sheet2", Cell: "C1", Formula: "=Sheet1!B1+B1"}, // 400 (100+300)
 	}
 
-	_, err = f.BatchSetFormulasAndRecalculate(formulas)
+	err = f.BatchSetFormulasAndRecalculate(formulas)
 	assert.NoError(t, err)
 
 	// Verify all calculations
