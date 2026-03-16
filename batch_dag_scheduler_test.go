@@ -125,6 +125,8 @@ func TestInferFormulaAndXMLTypes(t *testing.T) {
 	check("42", ArgNumber)
 	check("TRUE", ArgNumber) // booleans are stored as number with Boolean flag
 	check("#N/A", ArgError)  // Error values should be ArgError, not ArgString
+	check("### Scene Requirements", ArgString)
+	check("# heading", ArgString)
 
 	if inferXMLCellType("") != "" {
 		t.Fatalf("empty string should keep default type")
@@ -137,6 +139,31 @@ func TestInferFormulaAndXMLTypes(t *testing.T) {
 	}
 	if inferXMLCellType("text") != "str" {
 		t.Fatalf("text should map to string XML type")
+	}
+}
+
+func TestRecalculateAllWithDependencyKeepsHashPrefixedStrings(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	if err := f.SetCellFormula("Sheet1", "A1", `="### Scene Requirements"`); err != nil {
+		t.Fatalf("set A1 formula: %v", err)
+	}
+	if err := f.SetCellFormula("Sheet1", "B1", `=A1&CHAR(10)&"Body"`); err != nil {
+		t.Fatalf("set B1 formula: %v", err)
+	}
+
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency failed: %v", err)
+	}
+
+	got, err := f.GetCellValue("Sheet1", "B1", Options{RawCellValue: true})
+	if err != nil {
+		t.Fatalf("get B1 value: %v", err)
+	}
+	want := "### Scene Requirements\nBody"
+	if got != want {
+		t.Fatalf("unexpected B1 value\nwant: %q\ngot:  %q", want, got)
 	}
 }
 

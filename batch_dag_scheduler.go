@@ -399,8 +399,9 @@ func inferFormulaResultType(value string) formulaArg {
 		return newStringFormulaArg("")
 	}
 
-	// 检查错误值（以 # 开头）
-	if strings.HasPrefix(value, "#") {
+	// 只将真实的 Excel 错误字面量识别为错误值。
+	// 普通文本也可能以 # 开头，例如 Markdown 标题。
+	if isExcelErrorLiteral(value) {
 		return newErrorFormulaArg(value, value)
 	}
 
@@ -417,6 +418,24 @@ func inferFormulaResultType(value string) formulaArg {
 
 	// 其他情况：字符串
 	return newStringFormulaArg(value)
+}
+
+func isExcelErrorLiteral(value string) bool {
+	switch value {
+	case formulaErrorDIV,
+		formulaErrorNAME,
+		formulaErrorNA,
+		formulaErrorNUM,
+		formulaErrorVALUE,
+		formulaErrorREF,
+		formulaErrorNULL,
+		formulaErrorSPILL,
+		formulaErrorCALC,
+		formulaErrorGETTINGDATA:
+		return true
+	default:
+		return false
+	}
 }
 
 func (f *File) setFormulaValue(sheet, cellName, value string) {
