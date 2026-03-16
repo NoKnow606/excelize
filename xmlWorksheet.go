@@ -995,6 +995,15 @@ type ConditionalFormatOptions struct {
 	ReverseIcons   bool
 	IconsOnly      bool
 	StopIfTrue     bool
+	IconCfvo       []ConditionalFormatIconCfvo
+}
+
+// ConditionalFormatIconCfvo describes a threshold value object for icon-set
+// conditional formatting rules.
+type ConditionalFormatIconCfvo struct {
+	Operator string
+	Type     string
+	Val      string
 }
 
 // SheetProtectionOptions directly maps the settings of worksheet protection.

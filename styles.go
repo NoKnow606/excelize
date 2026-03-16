@@ -3636,9 +3636,26 @@ func drawCondFmtNoBlanks(p int, ct, ref, GUID string, format *ConditionalFormatO
 // drawCondFmtIconSet provides a function to create conditional formatting rule
 // for icon set by given priority, criteria type and format settings.
 func drawCondFmtIconSet(p int, ct, ref, GUID string, format *ConditionalFormatOptions) (*xlsxCfRule, *xlsxX14CfRule) {
-	cfRule, ok := condFmtIconSetPresets[format.IconStyle]
+	preset, ok := condFmtIconSetPresets[format.IconStyle]
 	if !ok {
-		return nil, nil
+		// Unknown icon style (e.g. custom Univer styles like "_5Felling").
+		// Fall back to the template matching the number of thresholds so the
+		// rule can still be stored and round-tripped through Excel.
+		switch len(format.IconCfvo) {
+		case 3:
+			preset = cfvo3
+		case 4:
+			preset = cfvo4
+		default:
+			preset = cfvo5
+		}
+	}
+	// Deep copy to avoid mutating the shared preset pointer when multiple
+	// rules share the same icon style.
+	iconSetCopy := *preset.IconSet
+	cfRule := &xlsxCfRule{
+		Type:    preset.Type,
+		IconSet: &iconSetCopy,
 	}
 	cfRule.Priority = p + 1
 	cfRule.IconSet.IconSet = format.IconStyle
