@@ -38,6 +38,10 @@ type dependencyGraph struct {
 // buildDependencyGraph analyzes all formulas and builds a dependency graph
 // Optimized: Uses column metadata to avoid expanding column ranges to individual cells
 func (f *File) buildDependencyGraph() *dependencyGraph {
+	return f.loadOrBuildDependencyGraph(f.buildDependencyGraphFresh)
+}
+
+func (f *File) buildDependencyGraphFresh() *dependencyGraph {
 	startTime := time.Now()
 
 	graph := &dependencyGraph{
@@ -552,8 +556,7 @@ func extractDependencies(formula, currentSheet, currentCell string) []string {
 	deps := make(map[string]bool)
 
 	// Use the same parser that CalcCellValue uses
-	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := parseFormulaTokensCached(formula)
 	if tokens == nil {
 		return []string{}
 	}
@@ -669,8 +672,7 @@ func extractDependenciesOptimized(formula, currentSheet, currentCell string, col
 		}
 	}
 
-	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := parseFormulaTokensCached(formula)
 	if tokens == nil {
 		return []string{}
 	}
@@ -834,8 +836,7 @@ func extractDependenciesWithColumnIndex(formula, currentSheet, currentCell strin
 	deps := make(map[string]bool)
 
 	// Use the same parser that CalcCellValue uses
-	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := parseFormulaTokensCached(formula)
 	if tokens == nil {
 		return []string{}
 	}
@@ -1042,14 +1043,10 @@ func (f *File) calculateByDependencyLevels(graph *dependencyGraph) {
 			for cell := range individualResults {
 				// Check if this cell's formula could have used the cache
 				if node, exists := graph.nodes[cell]; exists {
-					if sumifsExpr := extractSUMIFSFromFormula(node.formula); sumifsExpr != "" {
-						cleanFormula := strings.TrimSpace(strings.TrimPrefix(node.formula, "="))
-						cleanExpr := strings.TrimSpace(sumifsExpr)
-						if cleanFormula != cleanExpr {
-							// This is a composite formula that could use cache
-							if _, cached := subExprCache.Load(sumifsExpr); cached {
-								usedCacheCount++
-							}
+					class := getFormulaOptimizationClass(node.formula)
+					if class.sumifsExpr != "" && !class.pureSumifs {
+						if _, cached := subExprCache.Load(class.sumifsExpr); cached {
+							usedCacheCount++
 						}
 					}
 				}
@@ -1102,29 +1099,18 @@ func (f *File) batchCalculateLevel(cells []string, graph *dependencyGraph) (map[
 		node := graph.nodes[cell]
 		formula := node.formula
 
-		// Check for SUMIFS/AVERAGEIFS
-		var sumifsExpr string
-		if expr := extractSUMIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
-		} else if expr := extractAVERAGEIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
-		}
-
-		if sumifsExpr != "" {
-			// Check if this is a pure SUMIFS or composite
-			cleanFormula := strings.TrimSpace(strings.TrimPrefix(formula, "="))
-			cleanExpr := strings.TrimSpace(sumifsExpr)
-
-			if cleanFormula == cleanExpr {
+		class := getFormulaOptimizationClass(formula)
+		if class.sumifsExpr != "" {
+			if class.pureSumifs {
 				// Pure SUMIFS - calculate and return result directly
-				pureSUMIFS[cell] = sumifsExpr
-				sumifsExpressions[cell] = sumifsExpr
+				pureSUMIFS[cell] = class.sumifsExpr
+				sumifsExpressions[cell] = class.sumifsExpr
 			} else {
 				// Composite SUMIFS - we'll cache the SUMIFS part
-				compositeSUMIFS[cell] = sumifsExpr
+				compositeSUMIFS[cell] = class.sumifsExpr
 				// Use a unique key for the expression itself
-				exprKey := "expr:" + sumifsExpr
-				sumifsExpressions[exprKey] = sumifsExpr
+				exprKey := "expr:" + class.sumifsExpr
+				sumifsExpressions[exprKey] = class.sumifsExpr
 			}
 		}
 	}
@@ -1166,8 +1152,7 @@ func (f *File) batchCalculateLevel(cells []string, graph *dependencyGraph) (map[
 		tempFormula := "=" + expr
 
 		// Parse and calculate the SUMIFS expression
-		ps := efp.ExcelParser()
-		tokens := ps.Parse(strings.TrimPrefix(tempFormula, "="))
+		tokens := f.parseFormulaTokensCached(strings.TrimPrefix(tempFormula, "="))
 		if tokens == nil {
 			continue
 		}
@@ -1186,9 +1171,8 @@ func (f *File) batchCalculateLevel(cells []string, graph *dependencyGraph) (map[
 			continue
 		}
 
-		// Cache the result
-		value := result.Value()
-		subExprCache.Store(expr, value)
+		// Cache the typed result so composite formulas preserve Excel semantics.
+		subExprCache.Store(expr, result)
 		cachedCount++
 	}
 
@@ -1240,8 +1224,8 @@ func (f *File) parallelCalculateCells(cells []string, subExprCache *SubExpressio
 
 				// Check if we might use cache (for stats)
 				if formula != "" {
-					if sumifsExpr := extractSUMIFSFromFormula(formula); sumifsExpr != "" {
-						if _, ok := subExprCache.Load(sumifsExpr); ok {
+					if class := getFormulaOptimizationClass(formula); class.sumifsExpr != "" {
+						if _, ok := subExprCache.Load(class.sumifsExpr); ok {
 							atomic.AddInt64(&cacheHits, 1)
 						} else {
 							atomic.AddInt64(&cacheMisses, 1)
@@ -1414,8 +1398,31 @@ func (f *File) RecalculateAllWithDependency() error {
 	// Acquire lock to prevent concurrent recalculation
 	f.recalcMu.Lock()
 	defer f.recalcMu.Unlock()
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if err := f.flushPGMirrorCalculationBatch(); err != nil {
+			log.Printf("excelize: postgres mirror batch sync failed after RecalculateAllWithDependency: %v", err)
+		}
+	}()
+	return f.recalculateAllWithDependencyLocked()
+}
+
+func (f *File) recalculateAllWithDependencyLocked() error {
 
 	log.Printf("📊 [RecalculateAll] Starting recalculation with DAG-based concurrent execution")
+
+	cachedGraph := f.getCachedDependencyGraph()
+	dirtyCells := f.snapshotDirtyValueCells()
+	hasVolatile := f.hasVolatileDependencies()
+
+	if cachedGraph != nil && len(dirtyCells) == 0 && !hasVolatile {
+		log.Printf("  ⏭️ [RecalculateAll] Skipping recalculation: no dependency or value changes")
+		return nil
+	}
+
+	if f.recalculateDirtyValueSubgraph(dirtyCells, "RecalculateAll") {
+		return nil
+	}
 
 	// ========================================
 	// 清理旧缓存,避免内存泄漏
@@ -1442,6 +1449,7 @@ func (f *File) RecalculateAllWithDependency() error {
 
 	// Calculate using true DAG concurrency
 	f.calculateByDAG(graph)
+	f.clearDirtyValueCells()
 
 	log.Printf("✅ [RecalculateAll] Completed")
 	return nil
@@ -1464,6 +1472,12 @@ func (f *File) RecalculateSheetWithDependency(sheet string) error {
 	// Acquire lock to prevent concurrent recalculation
 	f.recalcMu.Lock()
 	defer f.recalcMu.Unlock()
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if err := f.flushPGMirrorCalculationBatch(); err != nil {
+			log.Printf("excelize: postgres mirror batch sync failed after RecalculateSheetWithDependency: %v", err)
+		}
+	}()
 
 	// Validate sheet exists
 	ws, err := f.workSheetReader(sheet)
@@ -1869,12 +1883,13 @@ func (f *File) calculateByDAG(graph *dependencyGraph) {
 // OPTIMIZATION: Does NOT pre-load entire sheets - only tracks which sheets might be needed
 // Actual data loading happens on-demand through PreloadColumnRange or individual cell reads
 func (f *File) buildWorksheetCache(graph *dependencyGraph) *WorksheetCache {
-	worksheetCache := NewWorksheetCache()
+	worksheetCache := f.prepareWorksheetCacheForGraph(graph)
 	sheetsToTrack := make(map[string]bool)
 
 	// Collect all sheets that might be referenced (for tracking, not loading)
 	for _, node := range graph.nodes {
 		formula := node.formula
+		class := getFormulaOptimizationClass(formula)
 
 		// Add formula's own sheet
 		parts := strings.Split(node.cell, "!")
@@ -1882,45 +1897,12 @@ func (f *File) buildWorksheetCache(graph *dependencyGraph) *WorksheetCache {
 			sheetsToTrack[parts[0]] = true
 		}
 
-		// Check for SUMIFS/AVERAGEIFS
-		var sumifsExpr string
-		if expr := extractSUMIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
-		} else if expr := extractAVERAGEIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
+		if class.sumifsSource != "" {
+			sheetsToTrack[class.sumifsSource] = true
 		}
 
-		if sumifsExpr != "" {
-			parts := strings.Split(sumifsExpr, "!")
-			if len(parts) >= 2 {
-				sheetName := strings.Trim(parts[0], "'")
-				sheetName = strings.TrimPrefix(sheetName, "SUMIFS(")
-				sheetName = strings.TrimPrefix(sheetName, "AVERAGEIFS(")
-				sheetName = strings.Trim(sheetName, "'")
-				if sheetName != "" {
-					sheetsToTrack[sheetName] = true
-				}
-			}
-		}
-
-		// Check for INDEX-MATCH
-		if strings.Contains(formula, "INDEX(") {
-			if idx := strings.Index(formula, "INDEX("); idx != -1 {
-				remaining := formula[idx+6:]
-				if commaIdx := strings.Index(remaining, ","); commaIdx != -1 {
-					rangeRef := remaining[:commaIdx]
-					if strings.Contains(rangeRef, "!") {
-						parts := strings.Split(rangeRef, "!")
-						if len(parts) >= 2 {
-							sheetName := strings.Trim(parts[0], "'")
-							sheetName = strings.TrimSpace(sheetName)
-							if sheetName != "" {
-								sheetsToTrack[sheetName] = true
-							}
-						}
-					}
-				}
-			}
+		if class.indexSource != "" {
+			sheetsToTrack[class.indexSource] = true
 		}
 	}
 
@@ -1998,10 +1980,15 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 		levelCellsMap[cell] = true
 	}
 
-	pureSUMIFS := make(map[string]string)              // 纯 SUMIFS：整个公式就是 SUMIFS
-	uniqueSUMIFSExprs := make(map[string][]string)     // 唯一的 SUMIFS 表达式 -> 使用它的单元格列表
+	pureSUMIFS := make(map[string]string)          // 纯 SUMIFS：整个公式就是 SUMIFS
+	uniqueSUMIFSExprs := make(map[string][]string) // 唯一的 SUMIFS 表达式 -> 使用它的单元格列表
+	pgLookupFormulas := make(map[string]string)    // PostgreSQL 可批量加速的整公式 lookup
+	pgLookupExprTargets := make(map[string]pgLookupBatchTarget)
+	pgLookupExprCells := make(map[string]struct{})
 	indexMatchFormulas := make(map[string]string)      // INDEX-MATCH 公式
 	uniqueIndexMatchExprs := make(map[string][]string) // 唯一的 INDEX-MATCH 表达式 -> 使用它的单元格列表
+	_, _, pgLookupEnabled := f.getPostgresLookupRuntime()
+	avgOffsetCount := 0
 
 	// 遍历当前层的所有公式
 	for cell := range levelCellsMap {
@@ -2010,67 +1997,58 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 			continue
 		}
 		formula := node.formula
+		class := getFormulaOptimizationClass(formula)
 
 		// 先检查 AVERAGE(OFFSET) 模式 - 优先级最高
 		// 因为 AVERAGE(OFFSET(...MATCH...)) 包含 MATCH，会被 INDEX-MATCH 逻辑误捕获
-		if isAverageOffsetFormula(formula) {
+		if class.hasAverageOffset {
 			// 这是 AVERAGE(OFFSET) 公式，后面会单独处理
+			avgOffsetCount++
 			continue
 		}
 
-		// 检查是否包含 INDEX-MATCH
-		if strings.Contains(formula, "INDEX(") && strings.Contains(formula, "MATCH(") {
-			indexMatchExpr := extractINDEXMATCHFromFormula(formula)
-			if indexMatchExpr != "" {
-				indexMatchFormulas[cell] = formula
-				uniqueIndexMatchExprs[indexMatchExpr] = append(uniqueIndexMatchExprs[indexMatchExpr], cell)
+		if pgLookupEnabled {
+			parts := strings.SplitN(cell, "!", 2)
+			if len(parts) == 2 {
+				pgClass := getPGLookupOptimizationClass(parts[0], formula)
+				if pgClass.whole {
+					pgLookupFormulas[cell] = formula
+					continue
+				}
+				for idx, expr := range pgClass.exprs {
+					targetID := fmt.Sprintf("%s#pgexpr:%d", cell, idx)
+					pgLookupExprTargets[targetID] = pgLookupBatchTarget{
+						id:      targetID,
+						sheet:   parts[0],
+						formula: expr,
+					}
+					pgLookupExprCells[cell] = struct{}{}
+				}
 			}
 		}
 
-		// 检查是否包含 SUMIFS/AVERAGEIFS
-		var sumifsExpr string
-		if expr := extractSUMIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
-		} else if expr := extractAVERAGEIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
+		if class.indexMatchExpr != "" {
+			indexMatchFormulas[cell] = formula
+			uniqueIndexMatchExprs[class.indexMatchExpr] = append(uniqueIndexMatchExprs[class.indexMatchExpr], cell)
 		}
 
-		if sumifsExpr != "" {
-			// 检查是否是纯 SUMIFS（整个公式就是 SUMIFS）
-			cleanFormula := strings.TrimSpace(strings.TrimPrefix(formula, "="))
-			cleanExpr := strings.TrimSpace(sumifsExpr)
-
-			if cleanFormula == cleanExpr {
-				// 纯 SUMIFS - 可以批量计算
-				pureSUMIFS[cell] = sumifsExpr
+		if class.sumifsExpr != "" {
+			if class.pureSumifs {
+				pureSUMIFS[cell] = class.sumifsExpr
 			}
-
-			// 无论是纯的还是复合的，都记录这个唯一的表达式
-			uniqueSUMIFSExprs[sumifsExpr] = append(uniqueSUMIFSExprs[sumifsExpr], cell)
+			uniqueSUMIFSExprs[class.sumifsExpr] = append(uniqueSUMIFSExprs[class.sumifsExpr], cell)
 		}
 	}
 
 	collectDuration := time.Since(collectStart)
 
-	// 检查是否有 AVERAGE(OFFSET) 公式
-	avgOffsetCount := 0
-	for cell := range levelCellsMap {
-		node, exists := graph.nodes[cell]
-		if !exists {
-			continue
-		}
-		if isAverageOffsetFormula(node.formula) {
-			avgOffsetCount++
-		}
-	}
-
 	// 如果没有 SUMIFS、INDEX-MATCH 和 AVERAGE(OFFSET)，直接返回空缓存
-	if len(pureSUMIFS) == 0 && len(uniqueSUMIFSExprs) == 0 && len(indexMatchFormulas) == 0 && avgOffsetCount == 0 {
+	if len(pureSUMIFS) == 0 && len(uniqueSUMIFSExprs) == 0 && len(pgLookupFormulas) == 0 && len(pgLookupExprTargets) == 0 && len(indexMatchFormulas) == 0 && avgOffsetCount == 0 {
 		return subExprCache
 	}
 
-	log.Printf("  ⚡ [Level %d Batch] Found %d pure SUMIFS, %d unique SUMIFS expressions, %d INDEX-MATCH formulas (collect: %v)",
-		levelIdx, len(pureSUMIFS), len(uniqueSUMIFSExprs), len(indexMatchFormulas), collectDuration)
+	log.Printf("  ⚡ [Level %d Batch] Found %d pure SUMIFS, %d unique SUMIFS expressions, %d PG lookup formulas, %d PG lookup subexprs, %d INDEX-MATCH formulas (collect: %v)",
+		levelIdx, len(pureSUMIFS), len(uniqueSUMIFSExprs), len(pgLookupFormulas), len(pgLookupExprTargets), len(indexMatchFormulas), collectDuration)
 
 	batchStart := time.Now()
 
@@ -2250,7 +2228,7 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 				exprKey := fmt.Sprintf("SUMIFS(%s,%s,%s,%s,%s)",
 					group.sumRangeRef, group.criteriaRange1Ref, info.criteria1Cell,
 					group.criteriaRange2Ref, info.criteria2Cell)
-				subExprCache.Store(exprKey, fmt.Sprintf("%.0f", result))
+				subExprCache.Store(exprKey, newNumberFormulaArg(result))
 				calculatedCount++
 			}
 
@@ -2258,10 +2236,45 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 		}
 	}
 
+	if len(pgLookupFormulas) > 0 {
+		pgLookupStart := time.Now()
+		batchResults := f.batchCalculatePostgresLookupsWithCache(pgLookupFormulas, worksheetCache)
+		log.Printf("  ⚡ [Level %d Batch] Calculated %d PostgreSQL lookup formulas in %v",
+			levelIdx, len(batchResults), time.Since(pgLookupStart))
+
+		storedCount := 0
+		for cell, value := range batchResults {
+			parts := strings.Split(cell, "!")
+			if len(parts) != 2 {
+				continue
+			}
+			arg := inferFormulaResultType(value)
+			worksheetCache.Set(parts[0], parts[1], arg)
+			f.setFormulaValue(parts[0], parts[1], value)
+			f.calcCache.Store(cell+"!raw=true", value)
+			storedCount++
+		}
+		log.Printf("  📊 [Level %d Batch] Stored %d PostgreSQL lookup results", levelIdx, storedCount)
+	}
+
+	if len(pgLookupExprTargets) > 0 {
+		pgLookupExprStart := time.Now()
+		batchResults := f.batchCalculatePostgresLookupTargetsWithCache(pgLookupExprTargets, worksheetCache)
+		for targetID, value := range batchResults {
+			target, ok := pgLookupExprTargets[targetID]
+			if !ok {
+				continue
+			}
+			subExprCache.Store(subExprCacheScopedKey(target.sheet, target.formula), value)
+		}
+		log.Printf("  ⚡ [Level %d Batch] Cached %d PostgreSQL lookup subexpressions in %v",
+			levelIdx, len(batchResults), time.Since(pgLookupExprStart))
+	}
+
 	// 批量计算 INDEX-MATCH 公式（使用 worksheetCache）
 	if len(indexMatchFormulas) >= 10 {
 		indexMatchStart := time.Now()
-		batchResults := f.batchCalculateINDEXMATCHWithCache(indexMatchFormulas, worksheetCache)
+		batchResults := f.batchCalculateINDEXMATCHArgsWithCache(indexMatchFormulas, worksheetCache)
 		indexMatchCalcDuration := time.Since(indexMatchStart)
 		log.Printf("  ⚡ [Level %d Batch] Calculated %d INDEX-MATCH formulas in %v",
 			levelIdx, len(batchResults), indexMatchCalcDuration)
@@ -2275,9 +2288,9 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 			if !exists {
 				continue
 			}
+			class := getFormulaOptimizationClass(node.formula)
 
-			// 提取 INDEX-MATCH 表达式
-			indexMatchExpr := extractINDEXMATCHFromFormula(node.formula)
+			indexMatchExpr := class.indexMatchExpr
 			if indexMatchExpr == "" {
 				continue
 			}
@@ -2301,14 +2314,12 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 			if cleanFormula == cleanExpr || cleanFormula == "IFERROR("+cleanExpr {
 				// 纯 INDEX-MATCH - 存入 worksheetCache 和 calcCache，并写入 worksheet
 				if len(parts) == 2 {
-					cellType, _ := f.GetCellType(parts[0], parts[1])
-					arg := inferCellValueType(value, cellType)
-					worksheetCache.Set(parts[0], parts[1], arg)
+					worksheetCache.Set(parts[0], parts[1], value)
 					// 关键修复：写入实际的 worksheet 数据结构
-					f.setFormulaValue(parts[0], parts[1], value)
+					f.setFormulaValue(parts[0], parts[1], value.Value())
 				}
 				cacheKey := cell + "!raw=true"
-				f.calcCache.Store(cacheKey, value)
+				f.calcCache.Store(cacheKey, value.Value())
 				pureIndexMatchCount++
 			}
 			// 复合公式 - 不存入 worksheetCache 和 calcCache，只存入 subExprCache（后面处理）
@@ -2321,7 +2332,7 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 		exprToCellStart := time.Now()
 		exprToCell := make(map[string]string)
 		for cell := range indexMatchFormulas {
-			expr := extractINDEXMATCHFromFormula(graph.nodes[cell].formula)
+			expr := getFormulaOptimizationClass(graph.nodes[cell].formula).indexMatchExpr
 			if expr != "" {
 				if _, exists := exprToCell[expr]; !exists {
 					exprToCell[expr] = cell
@@ -2349,9 +2360,9 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 		if !exists {
 			continue
 		}
-		formula := node.formula
-		if isAverageOffsetFormula(formula) {
-			avgOffsetFormulas[cell] = formula
+		class := getFormulaOptimizationClass(node.formula)
+		if class.hasAverageOffset {
+			avgOffsetFormulas[cell] = node.formula
 		}
 	}
 
@@ -2382,7 +2393,23 @@ func (f *File) batchOptimizeLevelWithCache(levelIdx int, levelCells []string, gr
 	log.Printf("  ✅ [Level %d Batch] Completed in %v, cache size: %d", levelIdx, batchDuration, subExprCache.Len())
 
 	// 添加详细统计：哪些公式被批量优化了，哪些没有
-	optimizedCount := len(pureSUMIFS) + len(indexMatchFormulas) + len(avgOffsetFormulas)
+	optimizedCells := make(map[string]struct{}, len(levelCells))
+	for cell := range pureSUMIFS {
+		optimizedCells[cell] = struct{}{}
+	}
+	for cell := range indexMatchFormulas {
+		optimizedCells[cell] = struct{}{}
+	}
+	for cell := range avgOffsetFormulas {
+		optimizedCells[cell] = struct{}{}
+	}
+	for cell := range pgLookupFormulas {
+		optimizedCells[cell] = struct{}{}
+	}
+	for cell := range pgLookupExprCells {
+		optimizedCells[cell] = struct{}{}
+	}
+	optimizedCount := len(optimizedCells)
 	totalCount := len(levelCells)
 	unoptimizedCount := totalCount - optimizedCount
 
@@ -2412,28 +2439,12 @@ func (f *File) batchOptimizeLevel(levelIdx int, levelCells []string, graph *depe
 		if !exists {
 			continue
 		}
-		formula := node.formula
-
-		// 检查是否包含 SUMIFS/AVERAGEIFS
-		var sumifsExpr string
-		if expr := extractSUMIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
-		} else if expr := extractAVERAGEIFSFromFormula(formula); expr != "" {
-			sumifsExpr = expr
-		}
-
-		if sumifsExpr != "" {
-			// 检查是否是纯 SUMIFS（整个公式就是 SUMIFS）
-			cleanFormula := strings.TrimSpace(strings.TrimPrefix(formula, "="))
-			cleanExpr := strings.TrimSpace(sumifsExpr)
-
-			if cleanFormula == cleanExpr {
-				// 纯 SUMIFS - 可以批量计算
-				pureSUMIFS[cell] = sumifsExpr
+		class := getFormulaOptimizationClass(node.formula)
+		if class.sumifsExpr != "" {
+			if class.pureSumifs {
+				pureSUMIFS[cell] = class.sumifsExpr
 			}
-
-			// 无论是纯的还是复合的，都记录这个唯一的表达式
-			uniqueSUMIFSExprs[sumifsExpr] = append(uniqueSUMIFSExprs[sumifsExpr], cell)
+			uniqueSUMIFSExprs[class.sumifsExpr] = append(uniqueSUMIFSExprs[class.sumifsExpr], cell)
 		}
 	}
 
@@ -2486,7 +2497,7 @@ func (f *File) batchOptimizeLevel(levelIdx int, levelCells []string, graph *depe
 			for tempCell, value := range batchResults {
 				for expr, tc := range exprToTempCell {
 					if tc == tempCell {
-						subExprCache.Store(expr, value)
+						subExprCache.Store(expr, inferFormulaResultType(value))
 						break
 					}
 				}
@@ -2566,27 +2577,7 @@ func (f *File) preCalculateSimpleFormulas(levelCells []string, graph *dependency
 		if !exists {
 			continue
 		}
-		formula := node.formula
-
-		// 检查是否是批量优化类型
-		isBatchType := false
-
-		// SUMIFS/AVERAGEIFS
-		if extractSUMIFSFromFormula(formula) != "" || extractAVERAGEIFSFromFormula(formula) != "" {
-			isBatchType = true
-		}
-
-		// INDEX-MATCH
-		if strings.Contains(formula, "INDEX(") && strings.Contains(formula, "MATCH(") {
-			isBatchType = true
-		}
-
-		// AVERAGE(OFFSET)
-		if isAverageOffsetFormula(formula) {
-			isBatchType = true
-		}
-
-		if !isBatchType {
+		if !getFormulaOptimizationClass(node.formula).isBatchType {
 			simpleFormulas = append(simpleFormulas, cell)
 		}
 	}

@@ -50,6 +50,7 @@ func (f *File) SetCellValues(sheet string, values map[string]interface{}) (err e
 	if wsErr != nil {
 		return wsErr
 	}
+	f.beginPGMirrorCalculationBatch()
 
 	// Mark batch mode to suppress cache clearing in setCellValue
 	f.mu.Lock()
@@ -71,6 +72,9 @@ func (f *File) SetCellValues(sheet string, values map[string]interface{}) (err e
 		if r := recover(); r != nil {
 			err = fmt.Errorf("batch operation panicked: %v", r)
 		}
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
 	}()
 
 	// Set all values without clearing cache
@@ -80,6 +84,10 @@ func (f *File) SetCellValues(sheet string, values map[string]interface{}) (err e
 			if firstError == nil {
 				firstError = err
 			}
+			continue
+		}
+		if err := f.syncCellToPostgresAfterChange(sheet, cell); err != nil && firstError == nil {
+			firstError = err
 		}
 	}
 

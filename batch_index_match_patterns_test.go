@@ -300,6 +300,112 @@ func TestBatchCalculateINDEXMATCHWithCache(t *testing.T) {
 	}
 }
 
+func TestBatchCalculateINDEXMATCHArgsWithCachePreservesTypes(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	if _, err := f.NewSheet("Data"); err != nil {
+		t.Fatalf("NewSheet(): %v", err)
+	}
+
+	if err := f.SetCellStr("Data", "A2", "NUM"); err != nil {
+		t.Fatalf("SetCellStr Data!A2: %v", err)
+	}
+	if err := f.SetCellStr("Data", "A3", "STR"); err != nil {
+		t.Fatalf("SetCellStr Data!A3: %v", err)
+	}
+	if err := f.SetCellInt("Data", "B2", 200); err != nil {
+		t.Fatalf("SetCellInt Data!B2: %v", err)
+	}
+	if err := f.SetCellStr("Data", "B3", "200"); err != nil {
+		t.Fatalf("SetCellStr Data!B3: %v", err)
+	}
+	if err := f.SetCellStr("Sheet1", "A1", "NUM"); err != nil {
+		t.Fatalf("SetCellStr Sheet1!A1: %v", err)
+	}
+	if err := f.SetCellStr("Sheet1", "A2", "STR"); err != nil {
+		t.Fatalf("SetCellStr Sheet1!A2: %v", err)
+	}
+
+	cache := NewWorksheetCache()
+	for _, sheet := range []string{"Sheet1", "Data"} {
+		if err := cache.LoadSheet(f, sheet); err != nil {
+			t.Fatalf("LoadSheet %s: %v", sheet, err)
+		}
+	}
+
+	results := f.batchCalculateINDEXMATCHArgsWithCache(map[string]string{
+		"Sheet1!B1": `=INDEX(Data!$B:$B,MATCH($A1,Data!$A:$A,0))`,
+		"Sheet1!B2": `=INDEX(Data!$B:$B,MATCH($A2,Data!$A:$A,0))`,
+	}, cache)
+
+	if got := results["Sheet1!B1"]; got.Type != ArgNumber || got.Number != 200 {
+		t.Fatalf("expected numeric INDEX-MATCH result, got %#v", got)
+	}
+	if got := results["Sheet1!B2"]; got.Type != ArgString || got.String != "200" {
+		t.Fatalf("expected string INDEX-MATCH result, got %#v", got)
+	}
+}
+
+func TestBatchIndexMatchRecalculatePreservesTypes(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	if _, err := f.NewSheet("Data"); err != nil {
+		t.Fatalf("NewSheet(): %v", err)
+	}
+
+	for i := 1; i <= 5; i++ {
+		numRow := i*2 + 0
+		strRow := i*2 + 1
+		numKey := fmt.Sprintf("NUM%d", i)
+		strKey := fmt.Sprintf("STR%d", i)
+
+		if err := f.SetCellStr("Data", fmt.Sprintf("A%d", numRow), numKey); err != nil {
+			t.Fatalf("SetCellStr Data!A%d: %v", numRow, err)
+		}
+		if err := f.SetCellInt("Data", fmt.Sprintf("B%d", numRow), 200); err != nil {
+			t.Fatalf("SetCellInt Data!B%d: %v", numRow, err)
+		}
+		if err := f.SetCellStr("Data", fmt.Sprintf("A%d", strRow), strKey); err != nil {
+			t.Fatalf("SetCellStr Data!A%d: %v", strRow, err)
+		}
+		if err := f.SetCellStr("Data", fmt.Sprintf("B%d", strRow), "200"); err != nil {
+			t.Fatalf("SetCellStr Data!B%d: %v", strRow, err)
+		}
+
+		targetRow := i*2 - 1
+		if err := f.SetCellStr("Sheet1", fmt.Sprintf("A%d", targetRow), numKey); err != nil {
+			t.Fatalf("SetCellStr Sheet1!A%d: %v", targetRow, err)
+		}
+		if err := f.SetCellFormula("Sheet1", fmt.Sprintf("B%d", targetRow), fmt.Sprintf(`IF(TYPE(IFERROR(INDEX(Data!$B:$B,MATCH($A%d,Data!$A:$A,0)),""))=2,"string","number")`, targetRow)); err != nil {
+			t.Fatalf("SetCellFormula Sheet1!B%d: %v", targetRow, err)
+		}
+
+		targetRow++
+		if err := f.SetCellStr("Sheet1", fmt.Sprintf("A%d", targetRow), strKey); err != nil {
+			t.Fatalf("SetCellStr Sheet1!A%d: %v", targetRow, err)
+		}
+		if err := f.SetCellFormula("Sheet1", fmt.Sprintf("B%d", targetRow), fmt.Sprintf(`IF(TYPE(IFERROR(INDEX(Data!$B:$B,MATCH($A%d,Data!$A:$A,0)),""))=2,"string","number")`, targetRow)); err != nil {
+			t.Fatalf("SetCellFormula Sheet1!B%d: %v", targetRow, err)
+		}
+	}
+
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency(): %v", err)
+	}
+
+	for i := 1; i <= 10; i++ {
+		want := "number"
+		if i%2 == 0 {
+			want = "string"
+		}
+		if got, err := f.GetCellValue("Sheet1", fmt.Sprintf("B%d", i)); err != nil || got != want {
+			t.Fatalf("GetCellValue Sheet1!B%d: got %q err=%v want %q", i, got, err, want)
+		}
+	}
+}
+
 func TestDetectAndCalculateBatchINDEX(t *testing.T) {
 	f := NewFile()
 	t.Cleanup(func() { _ = f.Close() })

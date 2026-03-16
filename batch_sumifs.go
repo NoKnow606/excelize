@@ -9,30 +9,53 @@ import (
 	"sync"
 )
 
+func parseFormulaLiteralArg(expr string) (formulaArg, bool) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return newStringFormulaArg(""), true
+	}
+	if len(expr) >= 2 && expr[0] == '"' && expr[len(expr)-1] == '"' {
+		return newStringFormulaArg(strings.ReplaceAll(expr[1:len(expr)-1], `""`, `"`)), true
+	}
+	if strings.EqualFold(expr, "TRUE") || strings.EqualFold(expr, "FALSE") {
+		return newBoolFormulaArg(strings.EqualFold(expr, "TRUE")), true
+	}
+	if strings.HasPrefix(expr, "#") {
+		return newErrorFormulaArg(expr, expr), true
+	}
+	if num, err := strconv.ParseFloat(expr, 64); err == nil {
+		return newNumberFormulaArg(num), true
+	}
+	return formulaArg{}, false
+}
+
+// getCellArgOrCalcCache retrieves a typed cell value from worksheetCache or the worksheet.
+func (f *File) getCellArgOrCalcCache(sheet, cell string, worksheetCache *WorksheetCache) formulaArg {
+	if worksheetCache != nil {
+		if argValue, ok := worksheetCache.Get(sheet, cell); ok {
+			return argValue
+		}
+	}
+	value, _ := f.GetCellValue(sheet, cell, Options{RawCellValue: true})
+	cellType, _ := f.GetCellType(sheet, cell)
+	return inferCellValueType(value, cellType)
+}
+
 // getCellValueOrCalcCache retrieves cell value from the unified worksheetCache
 // This ensures all reads get the latest values (both original and calculated)
 func (f *File) getCellValueOrCalcCache(sheet, cell string, worksheetCache *WorksheetCache) string {
-	// Read from unified worksheetCache if available
-	// Phase 1: worksheetCache 现在返回 formulaArg，需要调用 Value() 转换为字符串
-	if worksheetCache != nil {
-		if argValue, ok := worksheetCache.Get(sheet, cell); ok {
-			val := argValue.Value()
-			// For ArgNumber, Value() uses %g which may produce scientific
-			// notation (e.g. "1.2677910539e+10") for large numbers. The
-			// batch result maps are keyed by GetRows raw text (e.g.
-			// "12677910539"). Use the full-precision decimal form so that
-			// map lookups match.
-			if argValue.Type == ArgNumber && !argValue.Boolean &&
-				strings.ContainsAny(val, "eE") {
-				val = strconv.FormatFloat(argValue.Number, 'f', -1, 64)
-			}
-			return val
-		}
+	argValue := f.getCellArgOrCalcCache(sheet, cell, worksheetCache)
+	val := argValue.Value()
+	// For ArgNumber, Value() uses %g which may produce scientific
+	// notation (e.g. "1.2677910539e+10") for large numbers. The
+	// batch result maps are keyed by GetRows raw text (e.g.
+	// "12677910539"). Use the full-precision decimal form so that
+	// map lookups match.
+	if argValue.Type == ArgNumber && !argValue.Boolean &&
+		strings.ContainsAny(val, "eE") {
+		val = strconv.FormatFloat(argValue.Number, 'f', -1, 64)
 	}
-
-	// If not in cache, read from worksheet (fallback for cells not pre-loaded)
-	value, _ := f.GetCellValue(sheet, cell, Options{RawCellValue: true})
-	return value
+	return val
 }
 
 // resolveCriteriaValue resolves a SUMIFS criteria argument to its string value.

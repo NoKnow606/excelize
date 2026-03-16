@@ -129,7 +129,16 @@ type FormulaUpdateWithValue struct {
 //	    {Sheet: "Sheet1", Cell: "A3", Value: 300},
 //	}
 //	err := f.BatchSetCellValue(updates)
-func (f *File) BatchSetCellValue(updates []CellUpdate) error {
+func (f *File) BatchSetCellValue(updates []CellUpdate) (err error) {
+	if len(updates) == 0 {
+		return nil
+	}
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
+	}()
 	for _, update := range updates {
 		if err := f.SetCellValue(update.Sheet, update.Cell, update.Value); err != nil {
 			return err
@@ -783,7 +792,7 @@ type AffectedCell struct {
 //	// 结果：Sheet1.A1 = 200, Sheet2.B1 = 400 (自动重新计算)
 //	// 读取计算后的值
 //	value, _ := f.GetCellValue("Sheet2", "B1")
-func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) error {
+func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) (err error) {
 	// 初始化调试统计
 	if enableBatchDebug {
 		batchStatsMu.Lock()
@@ -794,6 +803,12 @@ func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) error {
 	}
 
 	batchStart := time.Now()
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
+	}()
 
 	// 1. 批量更新所有单元格
 	if err := f.BatchSetCellValue(updates); err != nil {
@@ -884,13 +899,17 @@ func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) error {
 //	    {Sheet: "Sheet1", Cell: "B3", Formula: "=A3*2"},
 //	}
 //	err := f.BatchSetFormulas(formulas)
-func (f *File) BatchSetFormulas(formulas []FormulaUpdate) error {
-	for _, formula := range formulas {
-		if err := f.SetCellFormula(formula.Sheet, formula.Cell, formula.Formula); err != nil {
-			return err
-		}
+func (f *File) BatchSetFormulas(formulas []FormulaUpdate) (err error) {
+	if len(formulas) == 0 {
+		return nil
 	}
-	return nil
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
+	}()
+	return f.batchSetFormulas(formulas)
 }
 
 // BatchSetFormulasWithValue 批量设置公式及其预计算值，不触发重新计算
@@ -913,13 +932,17 @@ func (f *File) BatchSetFormulas(formulas []FormulaUpdate) error {
 //	    {Sheet: "Sheet1", Cell: "B2", Formula: "=A2*2", Value: "400"},
 //	}
 //	err := f.BatchSetFormulasWithValue(formulas)
-func (f *File) BatchSetFormulasWithValue(formulas []FormulaUpdateWithValue) error {
-	for _, formula := range formulas {
-		if err := f.SetCellFormulaWithValue(formula.Sheet, formula.Cell, formula.Formula, formula.Value); err != nil {
-			return err
-		}
+func (f *File) BatchSetFormulasWithValue(formulas []FormulaUpdateWithValue) (err error) {
+	if len(formulas) == 0 {
+		return nil
 	}
-	return nil
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
+	}()
+	return f.batchSetFormulasWithValue(formulas)
 }
 
 // BatchSetFormulasAndRecalculate 批量设置公式并重新计算
@@ -959,10 +982,16 @@ func (f *File) BatchSetFormulasWithValue(formulas []FormulaUpdateWithValue) erro
 //	// 现在所有公式都已设置、计算，并且 calcChain 已更新
 //	// 读取计算后的值
 //	value, _ := f.GetCellValue("Sheet1", "C1")
-func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) error {
+func (f *File) BatchSetFormulasAndRecalculate(formulas []FormulaUpdate) (err error) {
 	if len(formulas) == 0 {
 		return nil
 	}
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
+	}()
 
 	// 1. 批量设置公式
 	if err := f.BatchSetFormulas(formulas); err != nil {
@@ -1115,6 +1144,118 @@ func (f *File) updateCalcChainForFormulas(formulas []FormulaUpdate) error {
 	f.CalcChain = calcChain
 
 	return nil
+}
+
+func (f *File) batchSetFormulas(formulas []FormulaUpdate) error {
+	grouped := make(map[string][]FormulaUpdate, len(formulas))
+	for _, formula := range formulas {
+		grouped[formula.Sheet] = append(grouped[formula.Sheet], formula)
+	}
+
+	changedSheets := make(map[string]struct{}, len(grouped))
+	for sheet, items := range grouped {
+		ws, err := f.workSheetReader(sheet)
+		if err != nil {
+			return err
+		}
+		sheetChanged := false
+		for _, formula := range items {
+			if err := f.applyBatchFormulaUpdate(ws, sheet, formula.Cell, formula.Formula, "", false); err != nil {
+				return err
+			}
+			sheetChanged = true
+		}
+		if sheetChanged {
+			changedSheets[sheet] = struct{}{}
+		}
+	}
+
+	if len(changedSheets) > 0 {
+		f.markDependencyGraphDirty()
+		for sheet := range changedSheets {
+			f.bumpSheetVersion(sheet)
+		}
+	}
+	return nil
+}
+
+func (f *File) batchSetFormulasWithValue(formulas []FormulaUpdateWithValue) error {
+	grouped := make(map[string][]FormulaUpdateWithValue, len(formulas))
+	for _, formula := range formulas {
+		grouped[formula.Sheet] = append(grouped[formula.Sheet], formula)
+	}
+
+	changedSheets := make(map[string]struct{}, len(grouped))
+	for sheet, items := range grouped {
+		ws, err := f.workSheetReader(sheet)
+		if err != nil {
+			return err
+		}
+		sheetChanged := false
+		for _, formula := range items {
+			if err := f.applyBatchFormulaUpdate(ws, sheet, formula.Cell, formula.Formula, formula.Value, true); err != nil {
+				return err
+			}
+			sheetChanged = true
+		}
+		if sheetChanged {
+			changedSheets[sheet] = struct{}{}
+		}
+	}
+
+	if len(changedSheets) > 0 {
+		f.markDependencyGraphDirty()
+		for sheet := range changedSheets {
+			f.bumpSheetVersion(sheet)
+		}
+	}
+	return nil
+}
+
+func (f *File) applyBatchFormulaUpdate(ws *xlsxWorksheet, sheet, cell, formula, value string, withValue bool) error {
+	c, _, _, err := ws.prepareCell(cell)
+	if err != nil {
+		return err
+	}
+
+	f.clearCellCache(sheet, cell)
+	f.clearWorksheetCacheCell(sheet, cell)
+
+	if formula == "" {
+		ws.deleteSharedFormula(c)
+		c.F = nil
+		c.T, c.V, c.IS = "", "", nil
+		if err := f.deleteCalcChain(f.getSheetID(sheet), cell); err != nil {
+			return err
+		}
+		return f.syncCellToPostgresAfterChange(sheet, cell)
+	}
+
+	if c.F != nil {
+		c.F.Content = formula
+		c.F.T = ""
+		c.F.Ref = ""
+		c.F.Si = nil
+	} else {
+		c.F = &xlsxF{Content: formula}
+	}
+
+	if withValue {
+		c.V = value
+		c.T, c.IS = "", nil
+		if _, err := strconv.ParseFloat(value, 64); err != nil && value != "" {
+			c.T = "str"
+		}
+		cacheKey := sheet + "!" + cell
+		arg := inferFormulaResultType(value)
+		f.calcCache.Store(cacheKey, arg)
+		f.calcCache.Store(cacheKey+"!raw=false", value)
+		f.calcCache.Store(cacheKey+"!raw=true", value)
+	} else {
+		c.T, c.V, c.IS = "", "", nil
+	}
+
+	return f.syncCellToPostgresAfterChange(sheet, cell)
 }
 
 // recalculateAllSheets recalculates all formulas in all sheets according to calcChain order
@@ -1790,10 +1931,16 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalc(valueUpdates []CellUpdate,
 //	    {Sheet: "Sheet1", Cell: "C1", Formula: "=B1+10", Value: "210"},
 //	}
 //	err := f.BatchUpdateValuesAndFormulasWithRecalcV2(values, formulas)
-func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdate, formulaUpdates []FormulaUpdateWithValue) error {
+func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdate, formulaUpdates []FormulaUpdateWithValue) (err error) {
 	if len(valueUpdates) == 0 && len(formulaUpdates) == 0 {
 		return nil
 	}
+	f.beginPGMirrorCalculationBatch()
+	defer func() {
+		if flushErr := f.flushPGMirrorCalculationBatch(); err == nil {
+			err = flushErr
+		}
+	}()
 
 	// 1. 批量设置单元格值（不触发重算）
 	if len(valueUpdates) > 0 {
@@ -1918,7 +2065,7 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 	}
 
 	// 8. 增量重算：只计算依赖于更新单元格的公式，但排除已有预计算值的公式单元格
-	err := f.RecalculateAffectedByCellsWithExclusion(updatedCells, excludeCells)
+	err = f.RecalculateAffectedByCellsWithExclusion(updatedCells, excludeCells)
 
 	// 9. 恢复更新的值到缓存（增量重算可能清除了依赖于这些值的公式的缓存，但不会清除值本身）
 	for _, update := range valueUpdates {

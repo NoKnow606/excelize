@@ -77,6 +77,9 @@ func (f *File) adjustHelper(sheet string, dir adjustDirection, num, offset int) 
 	}
 	f.calcCache.Clear()
 	f.rangeCache.Clear()
+	f.markDependencyGraphDirty()
+	f.clearWorksheetCacheAll()
+	f.bumpAllSheetVersions()
 	sheetID := f.getSheetID(sheet)
 	if dir == rows {
 		err = f.adjustRowDimensions(sheet, ws, num, offset)
@@ -310,9 +313,7 @@ func (f *File) adjustFormula(sheet, sheetN string, cell *xlsxC, dir adjustDirect
 			oldValue := cell.V
 			cell.V = formulaErrorREF
 			cell.T = "e"
-			if f.OnCellCalculated != nil && cell.R != "" && oldValue != cell.V {
-				f.OnCellCalculated(sheetN, cell.R, oldValue, cell.V)
-			}
+			f.notifyCellCalculated(sheetN, cell.R, oldValue, cell.V)
 		}
 	}
 	if cell.F == nil {
@@ -338,9 +339,7 @@ func (f *File) adjustFormula(sheet, sheetN string, cell *xlsxC, dir adjustDirect
 			oldValue := cell.V
 			cell.V = formulaErrorREF
 			cell.T = "e"
-			if f.OnCellCalculated != nil && cell.R != "" && oldValue != cell.V {
-				f.OnCellCalculated(sheetN, cell.R, oldValue, cell.V)
-			}
+			f.notifyCellCalculated(sheetN, cell.R, oldValue, cell.V)
 		}
 	}
 	return nil

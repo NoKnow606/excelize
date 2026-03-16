@@ -159,6 +159,9 @@ func (f *File) WriteToBuffer() (*bytes.Buffer, error) {
 
 // writeToZip provides a function to write to ZipWriter.
 func (f *File) writeToZip(zw ZipWriter) error {
+	if err := f.prepareCalculationSnapshotForWrite(); err != nil {
+		return err
+	}
 	f.calcChainWriter()
 	f.commentsWriter()
 	f.contentTypesWriter()

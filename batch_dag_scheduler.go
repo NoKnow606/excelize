@@ -441,9 +441,7 @@ func (f *File) setFormulaValue(sheet, cellName, value string) {
 	c.T = inferXMLCellType(value)
 	ws.mu.Unlock()
 
-	if f.OnCellCalculated != nil && oldValue != value {
-		f.OnCellCalculated(sheet, cellName, oldValue, value)
-	}
+	f.notifyCellCalculated(sheet, cellName, oldValue, value)
 }
 
 // inferXMLCellType 推断 XML 单元格类型（不是 formulaArg）

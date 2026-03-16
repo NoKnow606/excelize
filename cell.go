@@ -169,7 +169,11 @@ func (f *File) SetCellValue(sheet, cell string, value interface{}) error {
 			err = f.SetCellStr(sheet, cell, fmt.Sprint(value))
 		}
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	return f.syncCellToPostgresAfterChange(sheet, cell)
 }
 
 // String extracts characters from a string item.
@@ -196,16 +200,13 @@ func (c *xlsxC) hasValue() bool {
 
 // removeFormula delete formula for the cell.
 func (f *File) removeFormula(c *xlsxC, ws *xlsxWorksheet, sheet string) error {
-	// When removing formula due to SetCellValue, clear entire calcCache and rangeCache
-	// to ensure all dependent formulas are recalculated
-	// Skip cache clearing if in batch mode (will be cleared once after batch completes)
+	// Skip cache clearing if in batch mode (will be cleared once after batch completes).
 	f.mu.Lock()
 	inBatch := f.inBatchMode
 	f.mu.Unlock()
 
 	if !inBatch {
-		f.calcCache.Clear()
-		f.rangeCache.Clear()
+		f.invalidateValueChangeCaches(sheet, c.R)
 	}
 	if c.F != nil && c.Vm == nil {
 		sheetID := f.getSheetID(sheet)
@@ -225,6 +226,7 @@ func (f *File) removeFormula(c *xlsxC, ws *xlsxWorksheet, sheet string) error {
 			}
 		}
 		c.F = nil
+		f.markDependencyGraphDirty()
 	}
 	return nil
 }
@@ -285,6 +287,8 @@ func (f *File) setCellTimeFunc(sheet, cell string, value time.Time) error {
 	if isNum {
 		_ = f.setDefaultTimeStyle(sheet, cell, getTimeNumFmt(value))
 	}
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, inferCellValueType(c.V, CellTypeUnset))
 	return err
 }
 
@@ -332,7 +336,13 @@ func (f *File) SetCellInt(sheet, cell string, value int64) error {
 	c.S = ws.prepareCellStyle(col, row, c.S)
 	c.T, c.V = setCellInt(value)
 	c.IS = nil
-	return f.removeFormula(c, ws, sheet)
+	if err := f.removeFormula(c, ws, sheet); err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, newNumberFormulaArg(float64(value)))
+	return nil
 }
 
 // setCellInt prepares cell type and string type cell value by a given integer.
@@ -360,7 +370,13 @@ func (f *File) SetCellUint(sheet, cell string, value uint64) error {
 	c.S = ws.prepareCellStyle(col, row, c.S)
 	c.T, c.V = setCellUint(value)
 	c.IS = nil
-	return f.removeFormula(c, ws, sheet)
+	if err := f.removeFormula(c, ws, sheet); err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, newNumberFormulaArg(float64(value)))
+	return nil
 }
 
 // setCellUint prepares cell type and string type cell value by a given unsigned
@@ -389,7 +405,13 @@ func (f *File) SetCellBool(sheet, cell string, value bool) error {
 	c.S = ws.prepareCellStyle(col, row, c.S)
 	c.T, c.V = setCellBool(value)
 	c.IS = nil
-	return f.removeFormula(c, ws, sheet)
+	if err := f.removeFormula(c, ws, sheet); err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, newBoolFormulaArg(value))
+	return nil
 }
 
 // setCellBool prepares cell type and string type cell value by a given boolean
@@ -431,7 +453,13 @@ func (f *File) SetCellFloat(sheet, cell string, value float64, precision, bitSiz
 	}
 	c.S = ws.prepareCellStyle(col, row, c.S)
 	c.setCellFloat(value, precision, bitSize)
-	return f.removeFormula(c, ws, sheet)
+	if err := f.removeFormula(c, ws, sheet); err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, newNumberFormulaArg(value))
+	return nil
 }
 
 // setCellFloat prepares cell type and string type cell value by a given float
@@ -466,7 +494,13 @@ func (f *File) SetCellStr(sheet, cell, value string) error {
 		return err
 	}
 	c.IS = nil
-	return f.removeFormula(c, ws, sheet)
+	if err := f.removeFormula(c, ws, sheet); err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, newStringFormulaArg(value))
+	return nil
 }
 
 // setCellString provides a function to set string type to shared string table.
@@ -689,7 +723,13 @@ func (f *File) SetCellDefault(sheet, cell, value string) error {
 	}
 	c.S = ws.prepareCellStyle(col, row, c.S)
 	c.setCellDefault(value)
-	return f.removeFormula(c, ws, sheet)
+	if err := f.removeFormula(c, ws, sheet); err != nil {
+		return err
+	}
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, inferCellValueType(value, CellTypeUnset))
+	return nil
 }
 
 // GetCellFormula provides a function to get formula from cell by given
@@ -849,7 +889,13 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 	if formula == "" {
 		ws.deleteSharedFormula(c)
 		c.F = nil
-		return f.deleteCalcChain(f.getSheetID(sheet), cell)
+		if err = f.deleteCalcChain(f.getSheetID(sheet), cell); err != nil {
+			return err
+		}
+		f.markDependencyGraphDirty()
+		f.clearWorksheetCacheCell(sheet, cell)
+		f.bumpSheetVersion(sheet)
+		return f.syncCellToPostgresAfterChange(sheet, cell)
 	}
 
 	if c.F != nil {
@@ -883,7 +929,13 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 	// Clear cell value and type when setting formula
 	// The actual type will be determined by the formula calculation result
 	c.T, c.V, c.IS = "", "", nil
-	return err
+	if err != nil {
+		return err
+	}
+	f.markDependencyGraphDirty()
+	f.clearWorksheetCacheCell(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	return f.syncCellToPostgresAfterChange(sheet, cell)
 }
 
 // SetCellFormulaWithValue 设置单元格公式并同时设置其缓存值，不触发重新计算。
@@ -920,7 +972,13 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 	if formula == "" {
 		ws.deleteSharedFormula(c)
 		c.F = nil
-		return f.deleteCalcChain(f.getSheetID(sheet), cell)
+		if err = f.deleteCalcChain(f.getSheetID(sheet), cell); err != nil {
+			return err
+		}
+		f.markDependencyGraphDirty()
+		f.clearWorksheetCacheCell(sheet, cell)
+		f.bumpSheetVersion(sheet)
+		return f.syncCellToPostgresAfterChange(sheet, cell)
 	}
 
 	if c.F != nil {
@@ -944,8 +1002,10 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 	f.calcCache.Store(cacheKey, arg)
 	f.calcCache.Store(cacheKey+"!raw=false", value)
 	f.calcCache.Store(cacheKey+"!raw=true", value)
-
-	return nil
+	f.markDependencyGraphDirty()
+	f.clearWorksheetCacheCell(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	return f.syncCellToPostgresAfterChange(sheet, cell)
 }
 
 // setArrayFormula transform the array formula in an array formula range to the
@@ -1490,6 +1550,9 @@ func (f *File) SetCellRichText(sheet, cell string, runs []RichTextRun) error {
 	for idx, strItem := range sst.SI {
 		if reflect.DeepEqual(strItem, si) {
 			c.T, c.V = "s", strconv.Itoa(idx)
+			f.markCellValueDirty(sheet, cell)
+			f.bumpSheetVersion(sheet)
+			f.setWorksheetCacheCell(sheet, cell, newStringFormulaArg(si.String()))
 			return err
 		}
 	}
@@ -1497,6 +1560,9 @@ func (f *File) SetCellRichText(sheet, cell string, runs []RichTextRun) error {
 	sst.Count++
 	sst.UniqueCount++
 	c.T, c.V = "s", strconv.Itoa(len(sst.SI)-1)
+	f.markCellValueDirty(sheet, cell)
+	f.bumpSheetVersion(sheet)
+	f.setWorksheetCacheCell(sheet, cell, newStringFormulaArg(si.String()))
 	return err
 }
 

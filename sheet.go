@@ -76,6 +76,9 @@ func (f *File) NewSheet(sheet string) (int, error) {
 	rID := f.addRels(f.getWorkbookRelsPath(), SourceRelationshipWorkSheet, fmt.Sprintf("worksheets/sheet%d.xml", sheetID), "")
 	// Update workbook.xml
 	f.setWorkbook(sheet, sheetID, rID)
+	f.markDependencyGraphDirty()
+	f.clearWorksheetCacheAll()
+	f.bumpSheetVersion(sheet)
 	return f.GetSheetIndex(sheet)
 }
 
@@ -407,12 +410,15 @@ func (f *File) SetSheetName(source, target string) error {
 
 	// Update formulas in all worksheets
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	for sheetName := range f.sheetMap {
 		if ws, err := f.workSheetReader(sheetName); err == nil {
 			f.updateFormulasInWorksheet(ws, sheetName, source, target)
 		}
 	}
+	f.mu.Unlock()
+	f.markDependencyGraphDirty()
+	f.clearWorksheetCacheAll()
+	f.renameSheetVersion(source, target)
 
 	return err
 }
@@ -500,9 +506,7 @@ func (f *File) invalidateDeletedSheetFormulas(deletedSheet string) {
 				oldValue := cell.V
 				cell.V = formulaErrorREF
 				cell.T = "e"
-				if f.OnCellCalculated != nil && cell.R != "" && oldValue != cell.V {
-					f.OnCellCalculated(sheetName, cell.R, oldValue, cell.V)
-				}
+				f.notifyCellCalculated(sheetName, cell.R, oldValue, cell.V)
 			}
 		}
 		ws.mu.Unlock()
@@ -729,6 +733,9 @@ func (f *File) DeleteSheet(sheet string) error {
 	}
 	index, err := f.GetSheetIndex(activeSheetName)
 	f.SetActiveSheet(index)
+	f.markDependencyGraphDirty()
+	f.clearWorksheetCacheAll()
+	f.deleteSheetVersion(sheet)
 	return err
 }
 

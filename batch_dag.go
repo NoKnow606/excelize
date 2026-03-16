@@ -46,8 +46,7 @@ func (f *File) CalcCellValueLockFree(sheet, cell string, opts ...Options) (resul
 	}
 
 	// Parse and evaluate formula without context locks
-	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := f.parseFormulaTokensCached(formula)
 	if tokens == nil {
 		return f.getCellValueLockFree(sheet, cell, rawCellValue)
 	}

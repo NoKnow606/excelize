@@ -15,6 +15,8 @@ package excelize
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/xml"
 	"io"
 	"io/fs"
@@ -29,43 +31,56 @@ import (
 
 // File define a populated spreadsheet file struct.
 type File struct {
-	mu               sync.Mutex
-	recalcMu         sync.Mutex // Mutex for RecalculateAllWithDependency to prevent concurrent recalculation
-	checked          sync.Map
-	formulaChecked   bool
-	inBatchMode      bool
-	zip64Entries     []string
-	options          *Options
-	sharedStringItem [][]uint
-	sharedStringsMap map[string]int
-	sharedStringTemp *os.File
-	sheetMap         map[string]string
-	streams          map[string]*StreamWriter
-	tempFiles        sync.Map
-	xmlAttr          sync.Map
-	calcCache        sync.Map
-	rangeCache       *lruCache // LRU cache for range matrices to limit memory usage
-	matchIndexCache  sync.Map  // Cache for MATCH hash indexes: key -> map[string]int
-	ifsMatchCache    sync.Map  // Cache for SUMIFS/COUNTIFS criteria matching: key -> []cellRef
-	rangeIndexCache  sync.Map  // Cache for range value indexes: rangeKey -> map[value][]cellRef
-	CalcChain        *xlsxCalcChain
-	CharsetReader    func(charset string, input io.Reader) (rdr io.Reader, err error)
-	Comments         map[string]*xlsxComments
-	ContentTypes     *xlsxTypes
-	DecodeVMLDrawing map[string]*decodeVmlDrawing
-	DecodeCellImages *decodeCellImages
-	Drawings         sync.Map
-	Path             string
-	Pkg              sync.Map
-	Relationships    sync.Map
-	SharedStrings    *xlsxSST
-	Sheet            sync.Map
-	SheetCount       int
-	Styles           *xlsxStyleSheet
-	Theme            *decodeTheme
-	VMLDrawing       map[string]*vmlDrawing
-	VolatileDeps     *xlsxVolTypes
-	WorkBook         *xlsxWorkbook
+	mu                   sync.Mutex
+	recalcMu             sync.Mutex // Mutex for RecalculateAllWithDependency to prevent concurrent recalculation
+	pgMirrorSyncMu       sync.Mutex // Serialize mirror writes to avoid PostgreSQL deadlocks during concurrent recalculation
+	checked              sync.Map
+	formulaChecked       bool
+	inBatchMode          bool
+	zip64Entries         []string
+	options              *Options
+	sharedStringItem     [][]uint
+	sharedStringsMap     map[string]int
+	sharedStringTemp     *os.File
+	sheetMap             map[string]string
+	streams              map[string]*StreamWriter
+	tempFiles            sync.Map
+	xmlAttr              sync.Map
+	calcCache            sync.Map
+	formulaParseCache    sync.Map
+	rangeCache           *lruCache // LRU cache for range matrices to limit memory usage
+	matchIndexCache      sync.Map  // Cache for MATCH hash indexes: key -> map[string]int
+	ifsMatchCache        sync.Map  // Cache for SUMIFS/COUNTIFS criteria matching: key -> []cellRef
+	rangeIndexCache      sync.Map  // Cache for range value indexes: rangeKey -> map[value][]cellRef
+	dependencyGraphCache *dependencyGraph
+	dependencyGraphDirty bool
+	dirtyValueCells      map[string]struct{}
+	worksheetCache       *WorksheetCache
+	calcSnapshotAuto     bool
+	calcSnapshotDirty    bool
+	calcSnapshotData     []byte
+	pgLookupResultCache  sync.Map
+	pgCalcCache          sync.Map
+	pgWholeCellCache     sync.Map
+	sheetVersion         map[string]uint64
+	CalcChain            *xlsxCalcChain
+	CharsetReader        func(charset string, input io.Reader) (rdr io.Reader, err error)
+	Comments             map[string]*xlsxComments
+	ContentTypes         *xlsxTypes
+	DecodeVMLDrawing     map[string]*decodeVmlDrawing
+	DecodeCellImages     *decodeCellImages
+	Drawings             sync.Map
+	Path                 string
+	Pkg                  sync.Map
+	Relationships        sync.Map
+	SharedStrings        *xlsxSST
+	Sheet                sync.Map
+	SheetCount           int
+	Styles               *xlsxStyleSheet
+	Theme                *decodeTheme
+	VMLDrawing           map[string]*vmlDrawing
+	VolatileDeps         *xlsxVolTypes
+	WorkBook             *xlsxWorkbook
 	// OnCellCalculated is an optional callback invoked when a formula
 	// calculation writes a new value to a cell. It is only triggered when
 	// the value actually changes. Callers must ensure concurrency safety
@@ -77,8 +92,21 @@ type File struct {
 	// reference to change. sheet is the worksheet containing the cell,
 	// cell is the cell reference (e.g. "B5"), oldFormula and newFormula
 	// are the formula text before and after adjustment.
-	OnFormulaAdjusted func(sheet, cell, oldFormula, newFormula string)
-	ZipWriter         func(io.Writer) ZipWriter
+	OnFormulaAdjusted  func(sheet, cell, oldFormula, newFormula string)
+	ZipWriter          func(io.Writer) ZipWriter
+	pgMirrorEnabled    bool
+	pgMirrorBestEffort bool
+	pgMirrorDB         *sql.DB
+	pgMirrorOpts       *PGSyncOptions
+	pgWarmupStatus     PGWarmupStatus
+	pgWarmupDone       chan struct{}
+	pgWarmupCancel     context.CancelFunc
+	pgWarmupSeq        uint64
+	pgMirrorReady      bool
+	pgLookupBypass     int
+	pgMirrorSheetMeta  map[string]pgMirrorSheetMeta
+	pgMirrorBatchDepth int
+	pgMirrorPending    map[string]map[string]pgMirrorPendingCell
 }
 
 // ZipWriter defines an interface for writing files to a ZIP archive. It
@@ -167,21 +195,28 @@ func OpenFile(filename string, opts ...Options) (*File, error) {
 // newFile is object builder
 func newFile() *File {
 	return &File{
-		options:          &Options{MaxCalcIterations: 100, UnzipSizeLimit: UnzipSizeLimit, UnzipXMLSizeLimit: StreamChunkSize},
-		xmlAttr:          sync.Map{},
-		checked:          sync.Map{},
-		sheetMap:         make(map[string]string),
-		tempFiles:        sync.Map{},
-		Comments:         make(map[string]*xlsxComments),
-		Drawings:         sync.Map{},
-		sharedStringsMap: make(map[string]int),
-		Sheet:            sync.Map{},
-		DecodeVMLDrawing: make(map[string]*decodeVmlDrawing),
-		VMLDrawing:       make(map[string]*vmlDrawing),
-		Relationships:    sync.Map{},
-		CharsetReader:    charset.NewReaderLabel,
-		ZipWriter:        func(w io.Writer) ZipWriter { return zip.NewWriter(w) },
-		rangeCache:       newLRUCache(100000), // Increased capacity to 100k to support large-scale preloaded ranges
+		options:              &Options{MaxCalcIterations: 100, UnzipSizeLimit: UnzipSizeLimit, UnzipXMLSizeLimit: StreamChunkSize},
+		xmlAttr:              sync.Map{},
+		checked:              sync.Map{},
+		sheetMap:             make(map[string]string),
+		tempFiles:            sync.Map{},
+		Comments:             make(map[string]*xlsxComments),
+		Drawings:             sync.Map{},
+		sharedStringsMap:     make(map[string]int),
+		Sheet:                sync.Map{},
+		DecodeVMLDrawing:     make(map[string]*decodeVmlDrawing),
+		VMLDrawing:           make(map[string]*vmlDrawing),
+		Relationships:        sync.Map{},
+		CharsetReader:        charset.NewReaderLabel,
+		ZipWriter:            func(w io.Writer) ZipWriter { return zip.NewWriter(w) },
+		rangeCache:           newLRUCache(100000), // Increased capacity to 100k to support large-scale preloaded ranges
+		dependencyGraphDirty: true,
+		calcSnapshotDirty:    true,
+		dirtyValueCells:      make(map[string]struct{}),
+		worksheetCache:       NewWorksheetCache(),
+		sheetVersion:         make(map[string]uint64),
+		pgMirrorSheetMeta:    make(map[string]pgMirrorSheetMeta),
+		pgMirrorPending:      make(map[string]map[string]pgMirrorPendingCell),
 	}
 }
 
@@ -244,6 +279,7 @@ func OpenReader(r io.Reader, opts ...Options) (*File, error) {
 	if f.sheetMap, err = f.getSheetMap(); err != nil {
 		return f, err
 	}
+	f.tryLoadEmbeddedCalculationSnapshot()
 	if f.Styles, err = f.stylesReader(); err != nil {
 		return f, err
 	}

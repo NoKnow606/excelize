@@ -4,35 +4,33 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-
-	"github.com/xuri/efp"
 )
 
 // SubExpressionCache stores pre-calculated sub-expression results
 // Key format: "SUMIFS_expression" -> value
 type SubExpressionCache struct {
 	mu    sync.RWMutex
-	cache map[string]string
+	cache map[string]formulaArg
 }
 
 // NewSubExpressionCache creates a new sub-expression cache
 func NewSubExpressionCache() *SubExpressionCache {
 	return &SubExpressionCache{
-		cache: make(map[string]string),
+		cache: make(map[string]formulaArg),
 	}
 }
 
 // Store saves a sub-expression result
-func (c *SubExpressionCache) Store(expr, value string) {
+func (c *SubExpressionCache) Store(expr string, value formulaArg) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cache[expr] = value
 }
 
 // Load retrieves a sub-expression result
-func (c *SubExpressionCache) Load(expr string) (string, bool) {
+func (c *SubExpressionCache) Load(expr string) (formulaArg, bool) {
 	if c == nil {
-		return "", false
+		return formulaArg{}, false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -44,7 +42,7 @@ func (c *SubExpressionCache) Load(expr string) (string, bool) {
 func (c *SubExpressionCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cache = make(map[string]string)
+	c.cache = make(map[string]formulaArg)
 }
 
 // Len returns the number of cached expressions
@@ -52,6 +50,36 @@ func (c *SubExpressionCache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.cache)
+}
+
+func subExprCacheScopedKey(sheet, expr string) string {
+	return sheet + "\x00" + expr
+}
+
+func loadSubExprCacheValue(cache *SubExpressionCache, sheet, expr string) (formulaArg, bool) {
+	if cache == nil {
+		return formulaArg{}, false
+	}
+	if value, ok := cache.Load(subExprCacheScopedKey(sheet, expr)); ok {
+		return value, true
+	}
+	return cache.Load(expr)
+}
+
+func formulaArgToFormulaLiteral(arg formulaArg) string {
+	switch arg.Type {
+	case ArgNumber:
+		if arg.Boolean {
+			return arg.Value()
+		}
+		return pgFormulaArgValue(arg)
+	case ArgError:
+		return arg.Value()
+	case ArgEmpty:
+		return `""`
+	default:
+		return `"` + strings.ReplaceAll(arg.Value(), `"`, `""`) + `"`
+	}
 }
 
 // CalcCellValueWithSubExprCache calculates a cell value with sub-expression cache support
@@ -75,25 +103,38 @@ func (f *File) CalcCellValueWithSubExprCache(sheet, cell, formula string, subExp
 	replacements := 0
 	missedCount := 0
 
-	// Extract and replace ALL INDEX-MATCH expressions (do this first as they may be nested in IFERROR)
 	remainingFormula := modifiedFormula
+	for {
+		pgLookupExpr := extractFirstPGSupportedLookupExpr(sheet, remainingFormula)
+		if pgLookupExpr == "" {
+			break
+		}
+
+		if cachedValue, ok := loadSubExprCacheValue(subExprCache, sheet, pgLookupExpr); ok {
+			modifiedFormula = strings.Replace(modifiedFormula, pgLookupExpr, formulaArgToFormulaLiteral(cachedValue), 1)
+			replacements++
+		} else {
+			missedCount++
+		}
+
+		idx := strings.Index(remainingFormula, pgLookupExpr)
+		if idx >= 0 {
+			remainingFormula = remainingFormula[idx+len(pgLookupExpr):]
+		} else {
+			break
+		}
+	}
+
+	// Extract and replace ALL INDEX-MATCH expressions (do this first as they may be nested in IFERROR)
+	remainingFormula = modifiedFormula
 	for {
 		indexMatchExpr := extractINDEXMATCHFromFormula(remainingFormula)
 		if indexMatchExpr == "" {
 			break
 		}
 
-		if cachedValue, ok := subExprCache.Load(indexMatchExpr); ok {
-			// Replace INDEX-MATCH expression with its cached value
-			// IMPORTANT: Preserve string type by adding quotes
-			// Excel formulas treat "0" (string) differently from 0 (number)
-			// in comparisons like IFERROR("0",0)=0 which returns FALSE
-
-			// Always quote the value to preserve string type from cell data
-			// This ensures Excel's type coercion works correctly
-			replacementValue := `"` + strings.ReplaceAll(cachedValue, `"`, `""`) + `"`
-
-			modifiedFormula = strings.Replace(modifiedFormula, indexMatchExpr, replacementValue, 1)
+		if cachedValue, ok := loadSubExprCacheValue(subExprCache, sheet, indexMatchExpr); ok {
+			modifiedFormula = strings.Replace(modifiedFormula, indexMatchExpr, formulaArgToFormulaLiteral(cachedValue), 1)
 			replacements++
 		} else {
 			missedCount++
@@ -116,12 +157,8 @@ func (f *File) CalcCellValueWithSubExprCache(sheet, cell, formula string, subExp
 			break
 		}
 
-		if cachedValue, ok := subExprCache.Load(sumifsExpr); ok {
-			// Replace SUMIFS expression with its cached numeric value
-			// Always quote to preserve string type
-			replacementValue := `"` + strings.ReplaceAll(cachedValue, `"`, `""`) + `"`
-
-			modifiedFormula = strings.Replace(modifiedFormula, sumifsExpr, replacementValue, 1)
+		if cachedValue, ok := loadSubExprCacheValue(subExprCache, sheet, sumifsExpr); ok {
+			modifiedFormula = strings.Replace(modifiedFormula, sumifsExpr, formulaArgToFormulaLiteral(cachedValue), 1)
 			replacements++
 		} else {
 			missedCount++
@@ -144,8 +181,8 @@ func (f *File) CalcCellValueWithSubExprCache(sheet, cell, formula string, subExp
 			break
 		}
 
-		if cachedValue, ok := subExprCache.Load(averageifsExpr); ok {
-			modifiedFormula = strings.Replace(modifiedFormula, averageifsExpr, cachedValue, 1)
+		if cachedValue, ok := loadSubExprCacheValue(subExprCache, sheet, averageifsExpr); ok {
+			modifiedFormula = strings.Replace(modifiedFormula, averageifsExpr, formulaArgToFormulaLiteral(cachedValue), 1)
 			replacements++
 		} else {
 			missedCount++
@@ -181,6 +218,10 @@ func (f *File) CalcCellValueWithSubExprCache(sheet, cell, formula string, subExp
 // evalFormulaString evaluates a formula string directly (without reading from cell)
 // This is used when the formula has been modified (e.g., SUMIFS replaced with value)
 func (f *File) evalFormulaString(sheet, cell, formula string, worksheetCache *WorksheetCache, opts Options) (string, error) {
+	if token, ok, err := f.tryCalcPostgresLookupFormula(sheet, cell, "="+formula, worksheetCache); ok {
+		return token.Value(), err
+	}
+
 	// Remove leading =
 	formula = strings.TrimPrefix(formula, "=")
 
@@ -194,8 +235,7 @@ func (f *File) evalFormulaString(sheet, cell, formula string, worksheetCache *Wo
 		return value.(string), nil
 	}
 
-	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := f.parseFormulaTokensCached(formula)
 	if tokens == nil {
 		return "", fmt.Errorf("failed to parse formula: %s", formula)
 	}

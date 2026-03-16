@@ -99,6 +99,9 @@ func (f *File) WriteToBufferNonDestructive() (*bytes.Buffer, error) {
 // writeToZipNonDestructive writes file content to zip WITHOUT modifying
 // internal worksheet state.
 func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
+	if err := f.prepareCalculationSnapshotForWrite(); err != nil {
+		return err
+	}
 	// These writers don't modify worksheet state, safe to call directly
 	f.calcChainWriter()
 	f.commentsWriter()

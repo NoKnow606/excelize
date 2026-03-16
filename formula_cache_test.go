@@ -191,6 +191,20 @@ func TestUpdateFormulaCache(t *testing.T) {
 	})
 }
 
+func TestParseFormulaTokensCached(t *testing.T) {
+	f := NewFile()
+	defer func() { assert.NoError(t, f.Close()) }()
+
+	tokens1 := f.parseFormulaTokensCached("SUM(A1:A3)+1")
+	tokens2 := f.parseFormulaTokensCached("SUM(A1:A3)+1")
+	assert.NotNil(t, tokens1)
+	assert.NotNil(t, tokens2)
+	assert.NotZero(t, len(tokens1))
+	assert.Same(t, &tokens1[0], &tokens2[0])
+
+	assert.Nil(t, f.parseFormulaTokensCached(""))
+}
+
 func TestUpdateSheetFormulaCache(t *testing.T) {
 	t.Run("single sheet update", func(t *testing.T) {
 		f := NewFile()

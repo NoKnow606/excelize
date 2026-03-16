@@ -86,6 +86,42 @@ func TestWorksheetCacheLoadSheet(t *testing.T) {
 	}
 }
 
+func TestWorksheetCacheLoadSheetIdempotentAfterClear(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	const sheet = "Sheet1"
+	if err := f.SetCellValue(sheet, "A1", 1); err != nil {
+		t.Fatalf("SetCellValue A1: %v", err)
+	}
+
+	wc := NewWorksheetCache()
+	if err := wc.LoadSheet(f, sheet); err != nil {
+		t.Fatalf("LoadSheet first: %v", err)
+	}
+	if got := wc.SheetLen(sheet); got != 1 {
+		t.Fatalf("expected 1 cached cell after first load, got %d", got)
+	}
+
+	if err := f.SetCellValue(sheet, "A2", 2); err != nil {
+		t.Fatalf("SetCellValue A2: %v", err)
+	}
+	if err := wc.LoadSheet(f, sheet); err != nil {
+		t.Fatalf("LoadSheet second: %v", err)
+	}
+	if got := wc.SheetLen(sheet); got != 1 {
+		t.Fatalf("second load should be a no-op while sheet is marked loaded, got %d cells", got)
+	}
+
+	wc.ClearSheet(sheet)
+	if err := wc.LoadSheet(f, sheet); err != nil {
+		t.Fatalf("LoadSheet after clear: %v", err)
+	}
+	if got := wc.SheetLen(sheet); got != 2 {
+		t.Fatalf("expected 2 cached cells after reloading cleared sheet, got %d", got)
+	}
+}
+
 func TestInferCellValueType(t *testing.T) {
 	tests := []struct {
 		name     string

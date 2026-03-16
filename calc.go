@@ -880,7 +880,6 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 	options := f.getOptions(opts...)
 	var (
 		rawCellValue = options.RawCellValue
-		styleIdx     int
 		token        formulaArg
 	)
 	// Include rawCellValue in cache key to ensure different formatting options
@@ -892,6 +891,17 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 
 	// Check if this is a multi-condition INDEX-MATCH formula that needs special handling
 	formula, _ := f.GetCellFormula(sheet, cell)
+	if formula != "" {
+		if token, ok, fastErr := f.tryCalcPostgresLookupFormula(sheet, cell, formula, nil); ok {
+			simpleRef := fmt.Sprintf("%s!%s", sheet, cell)
+			f.calcCache.Store(simpleRef, token)
+			if fastErr != nil {
+				result = token.String
+				return result, fastErr
+			}
+			return f.renderCalcToken(sheet, cell, token, rawCellValue)
+		}
+	}
 	if isMultiCondIndexMatchFormula(formula) {
 		// Use the optimized batch calculation for this single formula
 		formulas := map[string]string{sheet + "!" + cell: formula}
@@ -926,6 +936,12 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 	// This allows rangeResolver functions to find cached values
 	simpleRef := fmt.Sprintf("%s!%s", sheet, cell)
 	f.calcCache.Store(simpleRef, token)
+	return f.renderCalcToken(sheet, cell, token, rawCellValue)
+}
+
+func (f *File) renderCalcToken(sheet, cell string, token formulaArg, rawCellValue bool) (result string, err error) {
+	styleIdx := 0
+	cacheKey := fmt.Sprintf("%s!%s!raw=%t", sheet, cell, rawCellValue)
 
 	if !rawCellValue {
 		// OPTIMIZATION: Use GetCellStyleReadOnly to avoid creating rows/cols
@@ -937,7 +953,6 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 			result, err = f.formattedValue(&xlsxC{S: styleIdx, V: strings.ToUpper(strconv.FormatFloat(decimal, 'G', 15, 64))}, rawCellValue, CellTypeNumber)
 			if err == nil {
 				f.calcCache.Store(cacheKey, result)
-				// NOTE: CalcCellValue is read-only - write-back happens in RecalculateAll/RecalculateAllWithDependency
 			}
 			return
 		}
@@ -946,14 +961,12 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 		}
 		if err == nil {
 			f.calcCache.Store(cacheKey, result)
-			// NOTE: CalcCellValue is read-only - write-back happens in RecalculateAll/RecalculateAllWithDependency
 		}
 		return
 	}
 	result, err = f.formattedValue(&xlsxC{S: styleIdx, V: token.Value()}, rawCellValue, CellTypeInlineString)
 	if err == nil {
 		f.calcCache.Store(cacheKey, result)
-		// NOTE: CalcCellValue is read-only - write-back happens in RecalculateAll/RecalculateAllWithDependency
 	}
 	return
 }
@@ -1016,8 +1029,7 @@ func (f *File) calcCellValue(ctx *calcContext, sheet, cell string) (result formu
 	if formula, err = f.getCellFormulaReadOnly(sheet, cell, true); err != nil {
 		return
 	}
-	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := f.parseFormulaTokensCached(formula)
 	if tokens == nil {
 		return f.cellResolver(ctx, sheet, cell)
 	}

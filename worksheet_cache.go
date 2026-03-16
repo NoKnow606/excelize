@@ -9,14 +9,16 @@ import (
 // 用于存储所有单元格的值（包括原始值和计算结果）
 // Phase 1 重构：改为存储 formulaArg 以保留类型信息
 type WorksheetCache struct {
-	mu    sync.RWMutex
-	cache map[string]map[string]formulaArg // map[sheetName]map[cellRef]formulaArg
+	mu           sync.RWMutex
+	cache        map[string]map[string]formulaArg // map[sheetName]map[cellRef]formulaArg
+	loadedSheets map[string]bool
 }
 
 // NewWorksheetCache 创建新的工作表缓存
 func NewWorksheetCache() *WorksheetCache {
 	return &WorksheetCache{
-		cache: make(map[string]map[string]formulaArg),
+		cache:        make(map[string]map[string]formulaArg),
+		loadedSheets: make(map[string]bool),
 	}
 }
 
@@ -42,6 +44,20 @@ func (wc *WorksheetCache) Set(sheet, cell string, value formulaArg) {
 		wc.cache[sheet] = make(map[string]formulaArg)
 	}
 	wc.cache[sheet][cell] = value
+}
+
+// Delete removes a cached cell value.
+func (wc *WorksheetCache) Delete(sheet, cell string) {
+	wc.mu.Lock()
+	defer wc.mu.Unlock()
+
+	if sheetCache, ok := wc.cache[sheet]; ok {
+		delete(sheetCache, cell)
+		if len(sheetCache) == 0 {
+			delete(wc.cache, sheet)
+			delete(wc.loadedSheets, sheet)
+		}
+	}
 }
 
 // GetSheet 获取整个 sheet 的数据（用于批量操作）
@@ -109,8 +125,11 @@ func inferCellValueType(val string, cellType CellType) formulaArg {
 // LoadSheet 加载整个 sheet 的数据到缓存
 // Phase 1 改进：读取时立即转换为 formulaArg，保留类型信息
 func (wc *WorksheetCache) LoadSheet(f *File, sheet string) error {
-	// 先确保 map 初始化
 	wc.mu.Lock()
+	if wc.loadedSheets[sheet] {
+		wc.mu.Unlock()
+		return nil
+	}
 	if _, ok := wc.cache[sheet]; !ok {
 		wc.cache[sheet] = make(map[string]formulaArg)
 	}
@@ -146,6 +165,10 @@ func (wc *WorksheetCache) LoadSheet(f *File, sheet string) error {
 			wc.Set(sheet, cell.R, arg)
 		}
 	}
+
+	wc.mu.Lock()
+	wc.loadedSheets[sheet] = true
+	wc.mu.Unlock()
 	return nil
 }
 
@@ -154,6 +177,7 @@ func (wc *WorksheetCache) Clear() {
 	wc.mu.Lock()
 	defer wc.mu.Unlock()
 	wc.cache = make(map[string]map[string]formulaArg)
+	wc.loadedSheets = make(map[string]bool)
 }
 
 // ClearSheet 清空指定 sheet 的缓存
@@ -161,6 +185,7 @@ func (wc *WorksheetCache) ClearSheet(sheet string) {
 	wc.mu.Lock()
 	defer wc.mu.Unlock()
 	delete(wc.cache, sheet)
+	delete(wc.loadedSheets, sheet)
 }
 
 // Len 返回总的缓存单元格数量
