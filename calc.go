@@ -307,6 +307,11 @@ func (fa formulaArg) Value() (value string) {
 			}
 			return "TRUE"
 		}
+		// FIX: Use %.0f for integers to avoid scientific notation
+		// This fixes the bug where "12677910539" becomes "1.2677910539e+10"
+		if fa.Number == float64(int64(fa.Number)) {
+			return fmt.Sprintf("%.0f", fa.Number)
+		}
 		return fmt.Sprintf("%g", fa.Number)
 	case ArgString:
 		return fa.String
@@ -3013,6 +3018,8 @@ func formulaCriteriaParser(exp formulaArg) *formulaCriteria {
 		val = strings.ReplaceAll(val, "*", ".*")
 	}
 	fc.Type, fc.Condition = criteriaRegexp, newStringFormulaArg(val)
+	// Auto-convert to number if possible - but now Value() formats integers correctly
+	// so "12677910539" will match "12677910539" instead of "1.2677910539e+10"
 	if num := fc.Condition.ToNumber(); num.Type == ArgNumber {
 		fc.Condition = num
 	}

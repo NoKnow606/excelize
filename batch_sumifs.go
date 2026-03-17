@@ -374,8 +374,17 @@ func (f *File) calculateSUMIFS1DPatternWithCache(pattern *sumifs1DPattern, works
 	for fullCell, info := range pattern.formulas {
 		criteria1Cell := strings.ReplaceAll(info.criteria1Cell, "$", "")
 
-		// Get criteria value from worksheetCache or cell
-		c1 := f.getCellValueOrCalcCache(info.sheet, criteria1Cell, worksheetCache)
+		// Get criteria value - handle both cell references and string literals
+		var c1 string
+
+		// Check if criteria1 is a string literal (starts and ends with quotes)
+		if strings.HasPrefix(criteria1Cell, "\"") && strings.HasSuffix(criteria1Cell, "\"") {
+			// It's a string literal, strip quotes
+			c1 = criteria1Cell[1 : len(criteria1Cell)-1]
+		} else {
+			// It's a cell reference, get value from worksheetCache or cell
+			c1 = f.getCellValueOrCalcCache(info.sheet, criteria1Cell, worksheetCache)
+		}
 
 		if val, ok := resultMap[c1]; ok {
 			results[fullCell] = val
@@ -418,9 +427,26 @@ func (f *File) calculateSUMIFS2DPatternWithCache(pattern *sumifs2DPattern, works
 		criteria1Cell := strings.ReplaceAll(info.criteria1Cell, "$", "")
 		criteria2Cell := strings.ReplaceAll(info.criteria2Cell, "$", "")
 
-		// 优先从 worksheetCache 读取计算结果（处理公式单元格依赖）
-		c1 := f.getCellValueOrCalcCache(info.sheet, criteria1Cell, worksheetCache)
-		c2 := f.getCellValueOrCalcCache(info.sheet, criteria2Cell, worksheetCache)
+		// Get criteria values - handle both cell references and string literals
+		var c1, c2 string
+
+		// Check if criteria1 is a string literal (starts and ends with quotes)
+		if strings.HasPrefix(criteria1Cell, "\"") && strings.HasSuffix(criteria1Cell, "\"") {
+			// It's a string literal, strip quotes
+			c1 = criteria1Cell[1 : len(criteria1Cell)-1]
+		} else {
+			// It's a cell reference, get value from worksheetCache or cell
+			c1 = f.getCellValueOrCalcCache(info.sheet, criteria1Cell, worksheetCache)
+		}
+
+		// Check if criteria2 is a string literal (starts and ends with quotes)
+		if strings.HasPrefix(criteria2Cell, "\"") && strings.HasSuffix(criteria2Cell, "\"") {
+			// It's a string literal, strip quotes
+			c2 = criteria2Cell[1 : len(criteria2Cell)-1]
+		} else {
+			// It's a cell reference, get value from worksheetCache or cell
+			c2 = f.getCellValueOrCalcCache(info.sheet, criteria2Cell, worksheetCache)
+		}
 
 		if resultMap[c1] != nil {
 			if val, ok := resultMap[c1][c2]; ok {
@@ -574,8 +600,17 @@ func (f *File) calculateSUMIFS1DPattern(pattern *sumifs1DPattern) map[string]flo
 		// Remove $ from cell references before calling GetCellValue
 		criteria1Cell := strings.ReplaceAll(info.criteria1Cell, "$", "")
 
-		// Note: This function doesn't have worksheetCache, so use direct GetCellValue as fallback
-		c1, _ := f.GetCellValue(info.sheet, criteria1Cell)
+		// Get criteria value - handle both cell references and string literals
+		var c1 string
+
+		// Check if criteria1 is a string literal (starts and ends with quotes)
+		if strings.HasPrefix(criteria1Cell, "\"") && strings.HasSuffix(criteria1Cell, "\"") {
+			// It's a string literal, strip quotes
+			c1 = criteria1Cell[1 : len(criteria1Cell)-1]
+		} else {
+			// It's a cell reference, get the value
+			c1, _ = f.GetCellValue(info.sheet, criteria1Cell)
+		}
 
 		if val, ok := resultMap[c1]; ok {
 			results[fullCell] = val
@@ -860,9 +895,26 @@ func (f *File) calculateSUMIFS2DPattern(pattern *sumifs2DPattern) map[string]flo
 		criteria1Cell := strings.ReplaceAll(info.criteria1Cell, "$", "")
 		criteria2Cell := strings.ReplaceAll(info.criteria2Cell, "$", "")
 
-		// Note: This function doesn't have worksheetCache, so use direct GetCellValue as fallback
-		c1, _ := f.GetCellValue(info.sheet, criteria1Cell)
-		c2, _ := f.GetCellValue(info.sheet, criteria2Cell)
+		// Get criteria values - handle both cell references and string literals
+		var c1, c2 string
+
+		// Check if criteria1 is a string literal (starts and ends with quotes)
+		if strings.HasPrefix(criteria1Cell, "\"") && strings.HasSuffix(criteria1Cell, "\"") {
+			// It's a string literal, strip quotes
+			c1 = criteria1Cell[1 : len(criteria1Cell)-1]
+		} else {
+			// It's a cell reference, get the value
+			c1, _ = f.GetCellValue(info.sheet, criteria1Cell)
+		}
+
+		// Check if criteria2 is a string literal (starts and ends with quotes)
+		if strings.HasPrefix(criteria2Cell, "\"") && strings.HasSuffix(criteria2Cell, "\"") {
+			// It's a string literal, strip quotes
+			c2 = criteria2Cell[1 : len(criteria2Cell)-1]
+		} else {
+			// It's a cell reference, get the value
+			c2, _ = f.GetCellValue(info.sheet, criteria2Cell)
+		}
 
 		if resultMap[c1] != nil {
 			if val, ok := resultMap[c1][c2]; ok {
