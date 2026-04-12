@@ -1301,6 +1301,7 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 	// columnDependents[sheetColumn] = 依赖于该列的公式列表
 	dependents := make(map[string][]string)
 	columnDependents := make(map[string][]string)
+	sheetDependents := make(map[string][]string)
 
 	currentSheetID := -1
 	sheetMap := f.GetSheetMap()
@@ -1347,8 +1348,13 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 		cellKey := sheetName + "!" + c.R
 
 		// 提取公式依赖并构建反向索引
-		deps := extractDependencies(formula, sheetName, "")
+		deps := f.extractDependenciesWithSQL(formula, sheetName, "")
 		for _, dep := range deps {
+			if strings.HasPrefix(dep, "SHEET:") {
+				refSheet := strings.TrimPrefix(dep, "SHEET:")
+				sheetDependents[refSheet] = append(sheetDependents[refSheet], cellKey)
+				continue
+			}
 			parts := strings.SplitN(dep, "!", 2)
 			if len(parts) != 2 {
 				continue
@@ -1382,6 +1388,12 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 
 	// 添加直接受影响的公式
 	for sheet, cells := range updatedCells {
+		for _, dep := range sheetDependents[sheet] {
+			if !affected[dep] {
+				affected[dep] = true
+				queue = append(queue, dep)
+			}
+		}
 		for cell := range cells {
 			cellKey := sheet + "!" + cell
 			// 添加直接依赖于该单元格的公式
@@ -1396,6 +1408,12 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 
 	// 添加依赖于更新列的公式
 	for sheet, cols := range updatedColumns {
+		for _, dep := range sheetDependents[sheet] {
+			if !affected[dep] {
+				affected[dep] = true
+				queue = append(queue, dep)
+			}
+		}
 		for col := range cols {
 			colKey := sheet + "!" + col
 			for _, dep := range columnDependents[colKey] {
@@ -1444,9 +1462,16 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 // 使用 extractDependencies 函数解析公式依赖
 func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updatedCells map[string]map[string]bool, updatedColumns map[string]map[string]bool) bool {
 	// 使用公式解析器提取依赖
-	deps := extractDependencies(formula, currentSheet, "")
+	deps := f.extractDependenciesWithSQL(formula, currentSheet, "")
 
 	for _, dep := range deps {
+		if strings.HasPrefix(dep, "SHEET:") {
+			refSheet := strings.TrimPrefix(dep, "SHEET:")
+			if len(updatedCells[refSheet]) > 0 || len(updatedColumns[refSheet]) > 0 {
+				return true
+			}
+			continue
+		}
 		// dep 格式: "Sheet!Cell" 或 "Sheet!Col:COLUMN_RANGE"
 		parts := strings.SplitN(dep, "!", 2)
 		if len(parts) != 2 {
@@ -1495,9 +1520,18 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 // 使用 extractDependencies 函数解析公式依赖
 func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affectedCells map[string]bool) bool {
 	// 使用公式解析器提取依赖
-	deps := extractDependencies(formula, currentSheet, "")
+	deps := f.extractDependenciesWithSQL(formula, currentSheet, "")
 
 	for _, dep := range deps {
+		if strings.HasPrefix(dep, "SHEET:") {
+			refSheet := strings.TrimPrefix(dep, "SHEET:")
+			for affectedCell := range affectedCells {
+				if strings.HasPrefix(affectedCell, refSheet+"!") {
+					return true
+				}
+			}
+			continue
+		}
 		// dep 格式: "Sheet!Cell" 或 "Sheet!Col:COLUMN_RANGE"
 		parts := strings.SplitN(dep, "!", 2)
 		if len(parts) != 2 {
