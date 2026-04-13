@@ -15,7 +15,6 @@ import (
 	"bytes"
 	"encoding/xml"
 	"io"
-	"strconv"
 	"time"
 )
 
@@ -400,7 +399,7 @@ func (f *File) recalculateCell(sheet, cell string) error {
 	}
 
 	// Check if the cell has a formula
-	col, row, err := CellNameToCoordinates(cell)
+	_, row, err := CellNameToCoordinates(cell)
 	if err != nil {
 		return err
 	}
@@ -442,44 +441,19 @@ func (f *File) recalculateCell(sheet, cell string) error {
 	recordCellCalc(sheet, cell, formula, result, calcDuration, cacheHit)
 
 	if err != nil {
+		// SQL formulas may have spilled values that need to be cleared even when
+		// recalculation falls back to an error or empty result.
+		if IsSQLFormula(formula) {
+			f.persistFormulaResult(sheet, cell, result, nil, false, false)
+			return nil
+		}
 		// If calculation fails, clear the cache instead of returning error
 		cellRef.V = ""
 		cellRef.T = ""
 		return nil
 	}
 
-	// Update the cache with the calculated value
-	return f.updateCellCache(ws, col, row, cell, result)
-}
-
-// updateCellCache updates the cached value for a cell in the worksheet.
-func (f *File) updateCellCache(ws *xlsxWorksheet, col, row int, cell, value string) error {
-	// Find the cell in the worksheet
-	for i := range ws.SheetData.Row {
-		if ws.SheetData.Row[i].R == row {
-			for j := range ws.SheetData.Row[i].C {
-				if ws.SheetData.Row[i].C[j].R == cell {
-					// Update cache value
-					ws.SheetData.Row[i].C[j].V = value
-					// Determine type based on value
-					if value == "" {
-						ws.SheetData.Row[i].C[j].T = ""
-					} else if value == "TRUE" || value == "FALSE" {
-						ws.SheetData.Row[i].C[j].T = "b"
-					} else {
-						// Try to parse as number
-						if _, err := strconv.ParseFloat(value, 64); err == nil {
-							ws.SheetData.Row[i].C[j].T = "n"
-						} else {
-							ws.SheetData.Row[i].C[j].T = "str"
-						}
-					}
-					return nil
-				}
-			}
-		}
-	}
-
-	// Cell not found - should not happen if CalcCellValue succeeded
+	// Persist the calculated value back to the worksheet.
+	f.persistFormulaResult(sheet, cell, result, nil, false, false)
 	return nil
 }

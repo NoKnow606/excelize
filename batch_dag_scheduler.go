@@ -374,21 +374,7 @@ func (scheduler *DAGScheduler) closeReadyQueue() {
 // storeCalculatedValue persists the computed formula result to caches and worksheet
 // Phase 1: 改为接收 formulaArg 并存储类型信息
 func (f *File) storeCalculatedValue(sheet, cellName, value string, worksheetCache *WorksheetCache) {
-	// Phase 1: 对于公式计算结果，应该根据返回值本身推断类型，而不是根据单元格类型
-	// 因为公式单元格的 cellType 始终是 CellTypeUnset
-	arg := inferFormulaResultType(value)
-
-	// Phase 1: 存储 formulaArg 而不是字符串
-	if worksheetCache != nil {
-		worksheetCache.Set(sheet, cellName, arg)
-	}
-
-	// 保持与旧缓存的兼容性（暂时）
-	cacheKey := sheet + "!" + cellName
-	f.calcCache.Store(cacheKey, arg)
-	f.calcCache.Store(cacheKey+"!raw=true", value)
-
-	f.setFormulaValue(sheet, cellName, value)
+	f.persistFormulaResult(sheet, cellName, value, worksheetCache, true, true)
 }
 
 // inferFormulaResultType 根据公式返回值推断类型
@@ -439,11 +425,27 @@ func isExcelErrorLiteral(value string) bool {
 }
 
 func (f *File) setFormulaValue(sheet, cellName, value string) {
+	f.persistFormulaResult(sheet, cellName, value, nil, false, true)
+}
+
+func (f *File) persistFormulaResult(sheet, cellName, value string, worksheetCache *WorksheetCache, updateCaches, notify bool) {
+	if handled := f.persistSQLFormulaResult(sheet, cellName, value, worksheetCache, updateCaches, notify); handled {
+		return
+	}
+	f.persistScalarFormulaResult(sheet, cellName, value, worksheetCache, updateCaches, notify)
+}
+
+func (f *File) persistScalarFormulaResult(sheet, cellName, value string, worksheetCache *WorksheetCache, updateCaches, notify bool) {
+	arg := inferFormulaResultType(value)
+	if updateCaches {
+		f.storeFormulaResultCache(sheet, cellName, value, arg, worksheetCache)
+	}
+
 	f.mu.Lock()
 	ws, err := f.workSheetReader(sheet)
 	f.mu.Unlock()
 	if err != nil {
-		log.Printf("  ⚠️  [setFormulaValue] workSheetReader failed for %s!%s: %v", sheet, cellName, err)
+		log.Printf("  ⚠️  [persistScalarFormulaResult] workSheetReader failed for %s!%s: %v", sheet, cellName, err)
 		return
 	}
 
@@ -451,7 +453,7 @@ func (f *File) setFormulaValue(sheet, cellName, value string) {
 	c, _, _, err := ws.prepareCell(cellName)
 	if err != nil {
 		ws.mu.Unlock()
-		log.Printf("  ⚠️  [setFormulaValue] prepareCell failed for %s!%s: %v", sheet, cellName, err)
+		log.Printf("  ⚠️  [persistScalarFormulaResult] prepareCell failed for %s!%s: %v", sheet, cellName, err)
 		return
 	}
 
@@ -460,9 +462,193 @@ func (f *File) setFormulaValue(sheet, cellName, value string) {
 	c.T = inferXMLCellType(value)
 	ws.mu.Unlock()
 
-	if f.OnCellCalculated != nil && oldValue != value {
+	if notify && f.OnCellCalculated != nil && oldValue != value {
 		f.OnCellCalculated(sheet, cellName, oldValue, value)
 	}
+}
+
+func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, worksheetCache *WorksheetCache, updateCaches, notify bool) bool {
+	formula, err := f.GetCellFormula(sheet, cellName)
+	if err != nil || !IsSQLFormula(formula) {
+		return false
+	}
+
+	result, err := f.CalcCellValueWithMatrix(sheet, cellName, Options{RawCellValue: true})
+	f.mu.Lock()
+	ws, err := f.workSheetReader(sheet)
+	f.mu.Unlock()
+	if err != nil {
+		log.Printf("  ⚠️  [persistSQLFormulaResult] workSheetReader failed for %s!%s: %v", sheet, cellName, err)
+		return true
+	}
+
+	ws.mu.Lock()
+	c, _, _, err := ws.prepareCell(cellName)
+	if err != nil {
+		ws.mu.Unlock()
+		log.Printf("  ⚠️  [persistSQLFormulaResult] prepareCell failed for %s!%s: %v", sheet, cellName, err)
+		return true
+	}
+
+	oldValue := c.V
+	oldRef := ""
+	if c.F != nil {
+		oldRef = c.F.Ref
+	}
+
+	if err != nil || len(result.Matrix) == 0 || len(result.Matrix[0]) == 0 {
+		if oldRef != "" {
+			clearWorksheetRangeValues(ws, oldRef, cellName)
+		}
+		if c.F != nil {
+			c.F.Ref = ""
+		}
+		c.V = fallbackValue
+		c.T = inferXMLCellType(fallbackValue)
+		ws.mu.Unlock()
+
+		if oldRef != "" {
+			clearSpillRangeCache(f, worksheetCache, sheet, oldRef, cellName)
+		}
+		if updateCaches {
+			f.storeFormulaResultCache(sheet, cellName, fallbackValue, inferFormulaResultType(fallbackValue), worksheetCache)
+		}
+		if notify && f.OnCellCalculated != nil && oldValue != fallbackValue {
+			f.OnCellCalculated(sheet, cellName, oldValue, fallbackValue)
+		}
+		return true
+	}
+
+	startCol, startRow, err := CellNameToCoordinates(cellName)
+	if err != nil {
+		ws.mu.Unlock()
+		return false
+	}
+
+	endCol := startCol + len(result.Matrix[0]) - 1
+	endRow := startRow + len(result.Matrix) - 1
+	ref, err := CoordinatesToCellName(endCol, endRow)
+	if err != nil {
+		ws.mu.Unlock()
+		return false
+	}
+	newRef := cellName + ":" + ref
+
+	type spillValue struct {
+		cell  string
+		value string
+		arg   formulaArg
+	}
+	values := make([]spillValue, 0, len(result.Matrix)*len(result.Matrix[0]))
+	topLeftValue := fallbackValue
+	for r := range result.Matrix {
+		for c := range result.Matrix[r] {
+			cellRef, err := CoordinatesToCellName(startCol+c, startRow+r)
+			if err != nil {
+				ws.mu.Unlock()
+				return false
+			}
+			arg := interfaceToFormulaArg(result.Matrix[r][c])
+			value := arg.Value()
+			if r == 0 && c == 0 {
+				topLeftValue = value
+			}
+			values = append(values, spillValue{
+				cell:  cellRef,
+				value: value,
+				arg:   arg,
+			})
+		}
+	}
+
+	if oldRef != "" {
+		clearWorksheetRangeValues(ws, oldRef, cellName)
+	}
+	if c.F != nil {
+		c.F.Ref = newRef
+	}
+	for _, item := range values {
+		target, _, _, err := ws.prepareCell(item.cell)
+		if err != nil {
+			continue
+		}
+		if item.cell != cellName {
+			target.F = nil
+		}
+		target.V = item.value
+		target.T = inferXMLCellType(item.value)
+	}
+	ws.mu.Unlock()
+
+	if oldRef != "" {
+		clearSpillRangeCache(f, worksheetCache, sheet, oldRef, cellName)
+	}
+	if updateCaches {
+		for _, item := range values {
+			f.storeFormulaResultCache(sheet, item.cell, item.value, item.arg, worksheetCache)
+		}
+	}
+
+	if notify && f.OnCellCalculated != nil && oldValue != topLeftValue {
+		f.OnCellCalculated(sheet, cellName, oldValue, topLeftValue)
+	}
+	return true
+}
+
+func clearWorksheetRangeValues(ws *xlsxWorksheet, ref, anchor string) {
+	coordinates, err := rangeRefToCoordinates(ref)
+	if err != nil {
+		return
+	}
+	_ = sortCoordinates(coordinates)
+	for col := coordinates[0]; col <= coordinates[2]; col++ {
+		for row := coordinates[1]; row <= coordinates[3]; row++ {
+			cellRef, err := CoordinatesToCellName(col, row)
+			if err != nil || cellRef == anchor {
+				continue
+			}
+			c, _, _, err := ws.prepareCell(cellRef)
+			if err != nil {
+				continue
+			}
+			c.F = nil
+			c.V = ""
+			c.T = ""
+		}
+	}
+}
+
+func clearSpillRangeCache(f *File, worksheetCache *WorksheetCache, sheet, ref, anchor string) {
+	coordinates, err := rangeRefToCoordinates(ref)
+	if err != nil {
+		return
+	}
+	_ = sortCoordinates(coordinates)
+	for col := coordinates[0]; col <= coordinates[2]; col++ {
+		for row := coordinates[1]; row <= coordinates[3]; row++ {
+			cellRef, err := CoordinatesToCellName(col, row)
+			if err != nil || cellRef == anchor {
+				continue
+			}
+			cacheKey := sheet + "!" + cellRef
+			f.calcCache.Delete(cacheKey)
+			f.calcCache.Delete(cacheKey + "!raw=false")
+			f.calcCache.Delete(cacheKey + "!raw=true")
+			if worksheetCache != nil {
+				worksheetCache.Delete(sheet, cellRef)
+			}
+		}
+	}
+}
+
+func (f *File) storeFormulaResultCache(sheet, cellName, value string, arg formulaArg, worksheetCache *WorksheetCache) {
+	if worksheetCache != nil {
+		worksheetCache.Set(sheet, cellName, arg)
+	}
+	cacheKey := sheet + "!" + cellName
+	f.calcCache.Store(cacheKey, arg)
+	f.calcCache.Store(cacheKey+"!raw=false", value)
+	f.calcCache.Store(cacheKey+"!raw=true", value)
 }
 
 // inferXMLCellType 推断 XML 单元格类型（不是 formulaArg）

@@ -44,6 +44,19 @@ func (wc *WorksheetCache) Set(sheet, cell string, value formulaArg) {
 	wc.cache[sheet][cell] = value
 }
 
+// Delete removes a single cached cell value.
+func (wc *WorksheetCache) Delete(sheet, cell string) {
+	wc.mu.Lock()
+	defer wc.mu.Unlock()
+
+	if sheetCache, ok := wc.cache[sheet]; ok {
+		delete(sheetCache, cell)
+		if len(sheetCache) == 0 {
+			delete(wc.cache, sheet)
+		}
+	}
+}
+
 // GetSheet 获取整个 sheet 的数据（用于批量操作）
 // 返回 map[cellRef]formulaArg
 func (wc *WorksheetCache) GetSheet(sheet string) map[string]formulaArg {

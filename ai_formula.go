@@ -16,6 +16,9 @@ import (
 //
 //	AI(param1, ...)
 func (fn *formulaFuncs) AI(argsList *list.List) formulaArg {
+	if argsList.Len() != 2 {
+		return newErrorFormulaArg(formulaErrorVALUE, "AI requires 2 arguments")
+	}
 	return cachedCellValue(fn)
 }
 

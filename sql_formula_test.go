@@ -2,6 +2,7 @@ package excelize
 
 import (
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -96,6 +97,191 @@ func TestSQLFormulaFindAffectedCellsByCellsTracksWholeSourceSheet(t *testing.T) 
 	affected := f.findAffectedCellsByCells(graph, map[string]bool{"Data!B2": true})
 	if !affected["Summary!A1"] {
 		t.Fatalf("expected Summary!A1 to be affected by Data!B2 update, got %#v", affected)
+	}
+}
+
+func TestSQLFormulaUpdateFormulaCachePersistsSpillRange(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	formula := `SQL("select ""Category"", sum(""Amount"") as ""Total"" from ""Data"" group by ""Category"" order by ""Category""")`
+	if err := f.SetCellFormula("Report", "A1", formula); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	if err := f.UpdateFormulaCache(); err != nil {
+		t.Fatalf("UpdateFormulaCache: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "A1:B3" {
+		t.Fatalf("expected spill ref A1:B3, got %q", got)
+	}
+
+	if got, err := f.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "20" {
+		t.Fatalf("expected in-memory spill value 20 at B3, got %q err=%v", got, err)
+	}
+
+	fileName := "test_sql_formula_cache.xlsx"
+	if err := f.SaveAs(fileName); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	defer os.Remove(fileName)
+
+	reopened, err := OpenFile(fileName)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer reopened.Close()
+
+	if got, err := reopened.GetCellValue("Report", "A1", Options{RawCellValue: true}); err != nil || got != "Category" {
+		t.Fatalf("expected reopened A1 header Category, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B2", Options{RawCellValue: true}); err != nil || got != "10" {
+		t.Fatalf("expected reopened B2 value 10, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "20" {
+		t.Fatalf("expected reopened B3 value 20, got %q err=%v", got, err)
+	}
+}
+
+func TestSQLFormulaStoreCalculatedValuePersistsSpillRangeAndCaches(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	formula := `SQL("select ""Category"", sum(""Amount"") as ""Total"" from ""Data"" group by ""Category"" order by ""Category""")`
+	if err := f.SetCellFormula("Report", "A1", formula); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	worksheetCache := NewWorksheetCache()
+	f.storeCalculatedValue("Report", "A1", "Category", worksheetCache)
+
+	if cached, ok := worksheetCache.Get("Report", "B2"); !ok || cached.Type != ArgNumber || cached.Number != 10 {
+		t.Fatalf("expected worksheet cache numeric B2=10, got ok=%v arg=%+v", ok, cached)
+	}
+	if cached, ok := f.calcCache.Load("Report!B3!raw=true"); !ok || cached.(string) != "20" {
+		t.Fatalf("expected calc cache B3 raw value 20, got ok=%v value=%v", ok, cached)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "A1:B3" {
+		t.Fatalf("expected spill ref A1:B3, got %q", got)
+	}
+
+	if got, err := f.GetCellValue("Report", "B2", Options{RawCellValue: true}); err != nil || got != "10" {
+		t.Fatalf("expected in-memory B2 value 10, got %q err=%v", got, err)
+	}
+
+	fileName := "test_sql_formula_trigger.xlsx"
+	if err := f.SaveAs(fileName); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	defer os.Remove(fileName)
+
+	reopened, err := OpenFile(fileName)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer reopened.Close()
+
+	if got, err := reopened.GetCellValue("Report", "A1", Options{RawCellValue: true}); err != nil || got != "Category" {
+		t.Fatalf("expected reopened A1 header Category, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "20" {
+		t.Fatalf("expected reopened B3 value 20, got %q err=%v", got, err)
+	}
+}
+
+func TestSQLFormulaClearsPreviousSpillOnError(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	validFormula := `SQL("select ""Category"", sum(""Amount"") as ""Total"" from ""Data"" group by ""Category"" order by ""Category""")`
+	if err := f.SetCellFormula("Report", "A1", validFormula); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	worksheetCache := NewWorksheetCache()
+	f.storeCalculatedValue("Report", "A1", "Category", worksheetCache)
+
+	if _, ok := f.calcCache.Load("Report!B3!raw=true"); !ok {
+		t.Fatal("expected spill cache for Report!B3 before error")
+	}
+
+	invalidFormula := `SQL("delete from ""Data""")`
+	if err := f.SetCellFormula("Report", "A1", invalidFormula); err != nil {
+		t.Fatalf("SetCellFormula invalid SQL: %v", err)
+	}
+	f.setFormulaValue("Report", "A1", formulaErrorVALUE)
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "" {
+		t.Fatalf("expected spill ref cleared after error, got %q", got)
+	}
+
+	if got, err := f.GetCellValue("Report", "A1", Options{RawCellValue: true}); err != nil || got != formulaErrorVALUE {
+		t.Fatalf("expected A1 error value %s, got %q err=%v", formulaErrorVALUE, got, err)
+	}
+	if got, err := f.GetCellValue("Report", "B2", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected cleared spill cell B2, got %q err=%v", got, err)
+	}
+	if got, err := f.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected cleared spill cell B3, got %q err=%v", got, err)
+	}
+	if _, ok := f.calcCache.Load("Report!B3!raw=true"); ok {
+		t.Fatal("expected spill cache for Report!B3 to be cleared after error")
 	}
 }
 

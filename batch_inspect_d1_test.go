@@ -2,12 +2,17 @@ package excelize
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 )
 
 // TestInspectD1 检查 D1 的详细信息
 func TestInspectD1(t *testing.T) {
-	f, _ := OpenFile("/Users/zhoujielun/Downloads/跨境电商-补货计划demo-8.xlsx")
+	path := filepath.Join("test", "real-ecomm", "跨境电商-补货计划demo-8.xlsx")
+	f, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("open file %s: %v", path, err)
+	}
 	defer f.Close()
 
 	sheet := "日库存"
@@ -17,7 +22,10 @@ func TestInspectD1(t *testing.T) {
 	fmt.Printf("D1 公式: '%s'\n", formula)
 
 	// 读取工作表
-	ws, _ := f.workSheetReader(sheet)
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		t.Fatalf("workSheetReader(%s): %v", sheet, err)
+	}
 
 	// 查找 D1
 	col, row, _ := CellNameToCoordinates("D1")
