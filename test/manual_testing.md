@@ -139,7 +139,7 @@ Add new files per release to track regression over time.
 
 ## Examples
 
-### Recalculation Example (`examples/recalc.go`)
+### Recalculation Example (`examples/recalc/main.go`)
 
 Demonstrates how to use the dependency-aware recalculation API:
 
@@ -169,7 +169,7 @@ func main() {
 
 Run it:
 ```bash
-go run test/examples/recalc.go
+go run ./test/examples/recalc
 ```
 
 ## Naming Rules

@@ -1,9 +1,9 @@
-Main Script: test/generate-sku-example.go
+Main Script: test/cmd/generate-sku-example
   - Unified generation with -size flag
   - Automatically calculates unique SKUs (~10% of size)
   - Outputs to step3-template-{size}-formulas.xlsx
 
-  Verification Script: test/compare_templates.go
+  Verification Script: test/cmd/compare-templates
   - Compares headers and formulas between generated and reference files
   - Verified 100% match with step3-template-5k-formulas.xlsx
 
@@ -31,12 +31,12 @@ Main Script: test/generate-sku-example.go
 
   # Generate any size template
 ```bash
-  go run test/generate-sku-example.go -size=2000   # 2k rows
-  go run test/generate-sku-example.go -size=5000   # 5k rows
-  go run test/generate-sku-example.go -size=10000  # 10k rows
+  go run ./test/cmd/generate-sku-example -- -size=2000   # 2k rows
+  go run ./test/cmd/generate-sku-example -- -size=5000   # 5k rows
+  go run ./test/cmd/generate-sku-example -- -size=10000  # 10k rows
 
   # Verify output
-  go run test/compare_templates.go
+  go run ./test/cmd/compare-templates
 ```
 
 ---
@@ -216,11 +216,11 @@ mu.Unlock()
 ### Real-World Results
 ```bash
 # OLD VERSION (sequential, individual SetCellValue)
-$ time go run test/generate-sku-example.go --size=20000
+$ time go run ./test/cmd/generate-sku-example -- --size=20000
 real    17m12s
 
 # NEW VERSION (concurrent, batch operations)
-$ time go run test/generate-sku-example.go --size=20000
+$ time go run ./test/cmd/generate-sku-example -- --size=20000
 real    2m18s
 
 # SPEEDUP: 7.5x faster! ✓
@@ -268,19 +268,19 @@ for err := range errChan {
 ### Verify Correctness
 ```bash
 # Run with race detector
-go run -race test/generate-sku-example.go --size=5000
+go run -race ./test/cmd/generate-sku-example -- --size=5000
 
 # Compare outputs
-go run test/compare_templates.go
+go run ./test/cmd/compare-templates
 ```
 
 ### Benchmark Performance
 ```bash
 # Measure total time
-time go run test/generate-sku-example.go --size=20000
+time go run ./test/cmd/generate-sku-example -- --size=20000
 
 # Profile CPU
-go run -cpuprofile=cpu.prof test/generate-sku-example.go --size=10000
+go run -cpuprofile=cpu.prof ./test/cmd/generate-sku-example -- --size=10000
 go tool pprof cpu.prof
 ```
 
@@ -376,7 +376,7 @@ for _, cd := range allCellData {
 
 ### Before All Fixes (Original Code)
 ```bash
-$ time go run test/generate-sku-example.go --size=40000
+$ time go run ./test/cmd/generate-sku-example -- --size=40000
 
 Step 1: ~25 minutes
 Step 2: ~15 minutes
@@ -385,7 +385,7 @@ Total: ~40 minutes
 
 ### After First Optimization (Batch + Concurrency, but with RemoveRow bug)
 ```bash
-$ time go run test/generate-sku-example.go --size=40000
+$ time go run ./test/cmd/generate-sku-example -- --size=40000
 
 Step 1: ~12 minutes (still slow due to RemoveRow loop)
 Step 2: ~8 minutes (still slow due to lock contention)
@@ -394,7 +394,7 @@ Total: ~20 minutes
 
 ### After All Fixes (Delete/Recreate + Single Lock)
 ```bash
-$ time go run test/generate-sku-example.go --size=40000
+$ time go run ./test/cmd/generate-sku-example -- --size=40000
 
 Step 1: ~30 seconds (400x faster!)
 Step 2: ~45 seconds (10x faster!)

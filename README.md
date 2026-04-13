@@ -426,7 +426,7 @@ Sample Excel files for automated tests:
 Sample programs demonstrating library usage:
 - **recalc.go** - Complete dependency-aware recalculation example
   ```bash
-  go run test/examples/recalc.go
+  go run ./test/examples/recalc
   ```
 
 ### Test Best Practices
@@ -528,5 +528,5 @@ For questions about the core Excelize library, refer to the [official documentat
 
 # test for real case perf
 ```bash
-go run test/examples/recalc_perf.go test/real-ecomm/step3-template-10k-formulas.xlsx  > perf-10k.log 2>&1
+go run ./test/examples/recalc-perf -- test/real-ecomm/step3-template-10k-formulas.xlsx  > perf-10k.log 2>&1
 ```
