@@ -968,6 +968,7 @@ func (f *File) clearSQLSpillRangeIfNeeded(sheet string, ws *xlsxWorksheet, c *xl
 	clearWorksheetRangeValues(ws, oldRef, cell)
 	clearSpillRangeCache(f, nil, sheet, oldRef, cell)
 	c.F.Ref = ""
+	refreshWorksheetDimension(ws)
 }
 
 // setArrayFormula transform the array formula in an array formula range to the
