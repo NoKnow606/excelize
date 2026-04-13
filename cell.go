@@ -846,6 +846,7 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 	}
 	// Use fine-grained cache clearing for single cell formula changes
 	f.clearCellCache(sheet, cell)
+	f.clearSQLSpillRangeIfNeeded(sheet, ws, c, cell, formula)
 	if formula == "" {
 		ws.deleteSharedFormula(c)
 		c.F = nil
@@ -916,6 +917,8 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 		return err
 	}
 
+	f.clearSQLSpillRangeIfNeeded(sheet, ws, c, cell, formula)
+
 	// 设置公式（不清除缓存）
 	if formula == "" {
 		ws.deleteSharedFormula(c)
@@ -946,6 +949,25 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 	f.calcCache.Store(cacheKey+"!raw=true", value)
 
 	return nil
+}
+
+func (f *File) clearSQLSpillRangeIfNeeded(sheet string, ws *xlsxWorksheet, c *xlsxC, cell, nextFormula string) {
+	if c == nil || c.F == nil || c.F.Ref == "" {
+		return
+	}
+
+	currentFormula := c.F.Content
+	if !IsSQLFormula(currentFormula) {
+		return
+	}
+	if currentFormula == nextFormula {
+		return
+	}
+
+	oldRef := c.F.Ref
+	clearWorksheetRangeValues(ws, oldRef, cell)
+	clearSpillRangeCache(f, nil, sheet, oldRef, cell)
+	c.F.Ref = ""
 }
 
 // setArrayFormula transform the array formula in an array formula range to the
