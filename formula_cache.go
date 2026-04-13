@@ -66,9 +66,7 @@ func (f *File) UpdateFormulaCache() error {
 func (f *File) UpdateSheetFormulaCache(sheet string) error {
 	// Phase 1: Collect all formula cells (with locks)
 	type formulaCell struct {
-		rowIdx int
-		colIdx int
-		cell   string
+		cell string
 	}
 
 	var formulas []formulaCell
@@ -86,9 +84,7 @@ func (f *File) UpdateSheetFormulaCache(sheet string) error {
 			cell := &ws.SheetData.Row[rowIdx].C[colIdx]
 			if cell.F != nil && cell.F.Content != "" {
 				formulas = append(formulas, formulaCell{
-					rowIdx: rowIdx,
-					colIdx: colIdx,
-					cell:   cell.R,
+					cell: cell.R,
 				})
 			}
 		}
@@ -116,21 +112,18 @@ func (f *File) UpdateSheetFormulaCache(sheet string) error {
 		// but return the error at the end
 	}
 
-	// Phase 3: Update cached values (with locks)
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	for rowIdx := range ws.SheetData.Row {
-		for colIdx := range ws.SheetData.Row[rowIdx].C {
-			cell := &ws.SheetData.Row[rowIdx].C[colIdx]
-			if value, ok := results[cell.R]; ok {
-				cell.V = value
-				// Clear the cell type attribute so it will be determined by the value
-				// This allows formatting to be applied correctly when reading
-				// (SetCellFormula sets c.T="str", but after caching we want normal type handling)
-				cell.T = ""
-			}
+	// Phase 3: Update cached values.
+	for _, fc := range formulas {
+		if value, ok := results[fc.cell]; ok {
+			f.persistFormulaResult(sheet, fc.cell, value, nil, false, false)
+			continue
 		}
+		formula, ferr := f.GetCellFormula(sheet, fc.cell)
+		if ferr != nil || !IsSQLFormula(formula) {
+			continue
+		}
+		value, _ := f.CalcCellValue(sheet, fc.cell, Options{RawCellValue: true})
+		f.persistFormulaResult(sheet, fc.cell, value, nil, false, false)
 	}
 
 	// Return error if any calculation failed

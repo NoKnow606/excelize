@@ -15,7 +15,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatal("Usage: go run recalc_perf.go <xlsx_file>")
+		log.Fatal("Usage: go run ./test/examples/recalc-perf -- <xlsx_file>")
 	}
 
 	path := os.Args[1]

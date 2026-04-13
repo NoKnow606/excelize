@@ -1301,6 +1301,7 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 	// columnDependents[sheetColumn] = 依赖于该列的公式列表
 	dependents := make(map[string][]string)
 	columnDependents := make(map[string][]string)
+	sheetDependents := make(map[string][]string)
 
 	currentSheetID := -1
 	sheetMap := f.GetSheetMap()
@@ -1347,8 +1348,13 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 		cellKey := sheetName + "!" + c.R
 
 		// 提取公式依赖并构建反向索引
-		deps := extractDependencies(formula, sheetName, "")
+		deps := f.extractDependenciesWithSQL(formula, sheetName, "")
 		for _, dep := range deps {
+			if strings.HasPrefix(dep, "SHEET:") {
+				refSheet := strings.TrimPrefix(dep, "SHEET:")
+				sheetDependents[refSheet] = append(sheetDependents[refSheet], cellKey)
+				continue
+			}
 			parts := strings.SplitN(dep, "!", 2)
 			if len(parts) != 2 {
 				continue
@@ -1382,6 +1388,12 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 
 	// 添加直接受影响的公式
 	for sheet, cells := range updatedCells {
+		for _, dep := range sheetDependents[sheet] {
+			if !affected[dep] {
+				affected[dep] = true
+				queue = append(queue, dep)
+			}
+		}
 		for cell := range cells {
 			cellKey := sheet + "!" + cell
 			// 添加直接依赖于该单元格的公式
@@ -1396,6 +1408,12 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 
 	// 添加依赖于更新列的公式
 	for sheet, cols := range updatedColumns {
+		for _, dep := range sheetDependents[sheet] {
+			if !affected[dep] {
+				affected[dep] = true
+				queue = append(queue, dep)
+			}
+		}
 		for col := range cols {
 			colKey := sheet + "!" + col
 			for _, dep := range columnDependents[colKey] {
@@ -1444,9 +1462,16 @@ func (f *File) findAffectedFormulasOptimized(calcChain *xlsxCalcChain, updatedCe
 // 使用 extractDependencies 函数解析公式依赖
 func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updatedCells map[string]map[string]bool, updatedColumns map[string]map[string]bool) bool {
 	// 使用公式解析器提取依赖
-	deps := extractDependencies(formula, currentSheet, "")
+	deps := f.extractDependenciesWithSQL(formula, currentSheet, "")
 
 	for _, dep := range deps {
+		if strings.HasPrefix(dep, "SHEET:") {
+			refSheet := strings.TrimPrefix(dep, "SHEET:")
+			if len(updatedCells[refSheet]) > 0 || len(updatedColumns[refSheet]) > 0 {
+				return true
+			}
+			continue
+		}
 		// dep 格式: "Sheet!Cell" 或 "Sheet!Col:COLUMN_RANGE"
 		parts := strings.SplitN(dep, "!", 2)
 		if len(parts) != 2 {
@@ -1495,9 +1520,18 @@ func (f *File) formulaReferencesUpdatedCells(formula, currentSheet string, updat
 // 使用 extractDependencies 函数解析公式依赖
 func (f *File) formulaReferencesAffectedCells(formula, currentSheet string, affectedCells map[string]bool) bool {
 	// 使用公式解析器提取依赖
-	deps := extractDependencies(formula, currentSheet, "")
+	deps := f.extractDependenciesWithSQL(formula, currentSheet, "")
 
 	for _, dep := range deps {
+		if strings.HasPrefix(dep, "SHEET:") {
+			refSheet := strings.TrimPrefix(dep, "SHEET:")
+			for affectedCell := range affectedCells {
+				if strings.HasPrefix(affectedCell, refSheet+"!") {
+					return true
+				}
+			}
+			continue
+		}
 		// dep 格式: "Sheet!Cell" 或 "Sheet!Col:COLUMN_RANGE"
 		parts := strings.SplitN(dep, "!", 2)
 		if len(parts) != 2 {
@@ -1817,9 +1851,19 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 
 	// 3. 分离有预计算值和没有预计算值的公式
 	formulasWithPreCalc := make([]FormulaUpdateWithValue, 0)
+	sqlFormulas := make([]FormulaUpdateWithValue, 0)
 	formulasNeedCalc := make([]FormulaUpdate, 0)
 	for _, formula := range formulaUpdates {
 		cellKey := formula.Sheet + "!" + formula.Cell
+		if IsSQLFormula(formula.Formula) {
+			sqlFormulas = append(sqlFormulas, FormulaUpdateWithValue{
+				Sheet:   formula.Sheet,
+				Cell:    formula.Cell,
+				Formula: formula.Formula,
+				Value:   valueMap[cellKey],
+			})
+			continue
+		}
 		if v, ok := valueMap[cellKey]; ok {
 			// 有预计算值
 			formulasWithPreCalc = append(formulasWithPreCalc, FormulaUpdateWithValue{
@@ -1845,7 +1889,17 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 		}
 	}
 
-	// 5. 设置没有预计算值的公式，然后批量计算
+	// 5. SQL 公式需要通过 spill-aware 持久化路径写回整块结果，而不是只写锚点缓存
+	sqlUpdatedCells := make(map[string]bool)
+	if len(sqlFormulas) > 0 {
+		var err error
+		sqlUpdatedCells, err = f.batchPersistSQLFormulas(sqlFormulas)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 6. 设置没有预计算值的普通公式，然后批量计算
 	if len(formulasNeedCalc) > 0 {
 		// 按 sheet 分组
 		sheetFormulas := make(map[string][]FormulaUpdate) // sheet -> []FormulaUpdate
@@ -1894,7 +1948,7 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 		}
 	}
 
-	// 6. 收集被更新的单元格（精确到单元格级别）
+	// 7. 收集被更新的单元格（精确到单元格级别）
 	updatedCells := make(map[string]bool)
 	valueCells := make(map[string]bool) // 记录 valueUpdates 中的单元格
 	for _, update := range valueUpdates {
@@ -1905,22 +1959,25 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 	for _, formula := range formulaUpdates {
 		updatedCells[formula.Sheet+"!"+formula.Cell] = true
 	}
+	for cellKey := range sqlUpdatedCells {
+		updatedCells[cellKey] = true
+	}
 
-	// 7. 收集带预计算值的公式单元格（这些单元格不需要重算）
+	// 8. 收集已经写入最终结果的公式单元格（这些锚点不需要再次重算）
 	//    判断条件：单元格同时在 valueUpdates 和 formulaUpdates 中
 	excludeCells := make(map[string]bool)
 	for _, formula := range formulaUpdates {
 		cellKey := formula.Sheet + "!" + formula.Cell
-		if valueCells[cellKey] {
+		if valueCells[cellKey] || IsSQLFormula(formula.Formula) {
 			// 该公式单元格有预计算值，排除重算
 			excludeCells[cellKey] = true
 		}
 	}
 
-	// 8. 增量重算：只计算依赖于更新单元格的公式，但排除已有预计算值的公式单元格
+	// 9. 增量重算：只计算依赖于更新单元格的公式，但排除已有最终结果的公式单元格
 	err := f.RecalculateAffectedByCellsWithExclusion(updatedCells, excludeCells)
 
-	// 9. 恢复更新的值到缓存（增量重算可能清除了依赖于这些值的公式的缓存，但不会清除值本身）
+	// 10. 恢复更新的值到缓存（增量重算可能清除了依赖于这些值的公式的缓存，但不会清除值本身）
 	for _, update := range valueUpdates {
 		cacheKey := update.Sheet + "!" + update.Cell
 		valueStr := fmt.Sprintf("%v", update.Value)
@@ -1931,6 +1988,79 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 	}
 
 	return err
+}
+
+func (f *File) batchPersistSQLFormulas(formulas []FormulaUpdateWithValue) (map[string]bool, error) {
+	updatedCells := make(map[string]bool)
+	if len(formulas) == 0 {
+		return updatedCells, nil
+	}
+
+	plainFormulas := make([]FormulaUpdate, 0, len(formulas))
+	for _, formula := range formulas {
+		cellKey := formula.Sheet + "!" + formula.Cell
+		f.calcCache.Delete(cellKey)
+		f.calcCache.Delete(cellKey + "!raw=false")
+		f.calcCache.Delete(cellKey + "!raw=true")
+		plainFormulas = append(plainFormulas, FormulaUpdate{
+			Sheet:   formula.Sheet,
+			Cell:    formula.Cell,
+			Formula: formula.Formula,
+		})
+	}
+
+	if err := f.BatchSetFormulas(plainFormulas); err != nil {
+		return nil, err
+	}
+
+	for _, formula := range formulas {
+		f.persistFormulaResult(formula.Sheet, formula.Cell, formula.Value, nil, true, false)
+		f.collectFormulaResultCells(updatedCells, formula.Sheet, formula.Cell)
+	}
+
+	return updatedCells, nil
+}
+
+func (f *File) collectFormulaResultCells(updatedCells map[string]bool, sheet, cell string) {
+	updatedCells[sheet+"!"+cell] = true
+
+	f.mu.Lock()
+	ws, err := f.workSheetReader(sheet)
+	f.mu.Unlock()
+	if err != nil {
+		return
+	}
+
+	col, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return
+	}
+
+	ws.mu.Lock()
+	ref := ""
+	if cellData := f.getCellFromWorksheet(ws, col, row); cellData != nil && cellData.F != nil {
+		ref = cellData.F.Ref
+	}
+	ws.mu.Unlock()
+
+	if ref == "" {
+		return
+	}
+
+	coordinates, err := rangeRefToCoordinates(ref)
+	if err != nil {
+		return
+	}
+	_ = sortCoordinates(coordinates)
+	for currentCol := coordinates[0]; currentCol <= coordinates[2]; currentCol++ {
+		for currentRow := coordinates[1]; currentRow <= coordinates[3]; currentRow++ {
+			cellRef, err := CoordinatesToCellName(currentCol, currentRow)
+			if err != nil {
+				continue
+			}
+			updatedCells[sheet+"!"+cellRef] = true
+		}
+	}
 }
 
 // findAffectedFormulasByScanning 通过扫描所有工作表来找出受影响的公式

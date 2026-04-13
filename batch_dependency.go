@@ -194,7 +194,7 @@ func (f *File) buildDependencyGraph() *dependencyGraph {
 		go func() {
 			defer wg.Done()
 			for info := range workChan {
-				deps := extractDependenciesOptimized(info.formula, info.sheet, info.cellRef, columnIndex, graph.columnMetadata)
+				deps := f.extractDependenciesOptimizedWithSQL(info.formula, info.sheet, info.cellRef, columnIndex, graph.columnMetadata)
 				resultChan <- depResult{fullCell: info.fullCell, deps: deps}
 			}
 		}()
@@ -1666,7 +1666,7 @@ func (f *File) buildDependencyGraphForSheet(targetSheet string) *dependencyGraph
 		go func() {
 			defer wg.Done()
 			for info := range workChan {
-				deps := extractDependenciesOptimized(info.formula, info.sheet, info.cellRef, columnIndex, graph.columnMetadata)
+				deps := f.extractDependenciesOptimizedWithSQL(info.formula, info.sheet, info.cellRef, columnIndex, graph.columnMetadata)
 				resultChan <- depResult{fullCell: info.fullCell, deps: deps}
 			}
 		}()
@@ -2765,7 +2765,7 @@ func (f *File) findAffectedCellsByColumns(graph *dependencyGraph, updatedColumns
 			reverseDeps[dep] = append(reverseDeps[dep], cell)
 
 			// 也建立列级别的反向依赖
-			if !strings.HasPrefix(dep, "COLUMN:") {
+			if !strings.HasPrefix(dep, "COLUMN:") && !strings.HasPrefix(dep, "SHEET:") {
 				parts := strings.SplitN(dep, "!", 2)
 				if len(parts) == 2 {
 					col, _, err := CellNameToCoordinates(parts[1])
@@ -2781,9 +2781,14 @@ func (f *File) findAffectedCellsByColumns(graph *dependencyGraph, updatedColumns
 
 	// BFS: 从更新的列开始，找出所有受影响的公式
 	queue := make([]string, 0, 1000)
+	updatedSheets := make(map[string]bool)
 
 	// 初始化队列：添加直接依赖于更新列的公式
 	for updatedCol := range updatedColumns {
+		parts := strings.SplitN(updatedCol, "!", 2)
+		if len(parts) == 2 {
+			updatedSheets[parts[0]] = true
+		}
 		colKey := "COLUMN:" + updatedCol
 		for _, cell := range reverseDeps[colKey] {
 			if !affected[cell] {
@@ -2794,7 +2799,6 @@ func (f *File) findAffectedCellsByColumns(graph *dependencyGraph, updatedColumns
 
 		// 也检查直接单元格依赖（如果有公式直接引用该列的某个单元格）
 		// 遍历该列所有行
-		parts := strings.SplitN(updatedCol, "!", 2)
 		if len(parts) == 2 {
 			sheet, colName := parts[0], parts[1]
 			// 找出该列所有被引用的单元格
@@ -2807,6 +2811,15 @@ func (f *File) findAffectedCellsByColumns(graph *dependencyGraph, updatedColumns
 						}
 					}
 				}
+			}
+		}
+	}
+
+	for sheet := range updatedSheets {
+		for _, cell := range reverseDeps["SHEET:"+sheet] {
+			if !affected[cell] {
+				affected[cell] = true
+				queue = append(queue, cell)
 			}
 		}
 	}
@@ -3002,7 +3015,7 @@ func (f *File) RecalculateAffectedByCellsWithExclusion(updatedCells map[string]b
 				meta.formulaRows[rowNum] = true
 
 				// 提取依赖并构建反向索引
-				deps := extractDependenciesOptimized(formula, sheet, cell.R, nil, columnMetadata)
+				deps := f.extractDependenciesOptimizedWithSQL(formula, sheet, cell.R, nil, columnMetadata)
 				for _, dep := range deps {
 					if strings.HasPrefix(dep, "COLUMN:") {
 						reverseColDeps[dep] = append(reverseColDeps[dep], fullCell)
@@ -3050,9 +3063,14 @@ func (f *File) RecalculateAffectedByCellsWithExclusion(updatedCells map[string]b
 	// 使用双缓冲区 BFS：避免在迭代过程中修改队列
 	currentQueue := make([]string, 0, 1000)
 	nextQueue := make([]string, 0, 1000)
+	updatedSheets := make(map[string]bool)
 
 	// 第一轮：找出直接受影响的公式
 	for cell := range updatedCells {
+		parts := strings.SplitN(cell, "!", 2)
+		if len(parts) == 2 {
+			updatedSheets[parts[0]] = true
+		}
 		for _, formula := range reverseDeps[cell] {
 			if !affected[formula] {
 				affected[formula] = true
@@ -3063,8 +3081,21 @@ func (f *File) RecalculateAffectedByCellsWithExclusion(updatedCells map[string]b
 
 	// 检查列范围依赖
 	for colKey := range updatedCellsByCol {
+		parts := strings.SplitN(colKey, "!", 2)
+		if len(parts) == 2 {
+			updatedSheets[parts[0]] = true
+		}
 		colDepKey := "COLUMN:" + colKey
 		for _, formula := range reverseColDeps[colDepKey] {
+			if !affected[formula] {
+				affected[formula] = true
+				currentQueue = append(currentQueue, formula)
+			}
+		}
+	}
+
+	for sheet := range updatedSheets {
+		for _, formula := range reverseDeps["SHEET:"+sheet] {
 			if !affected[formula] {
 				affected[formula] = true
 				currentQueue = append(currentQueue, formula)
@@ -3188,7 +3219,7 @@ func (f *File) RecalculateAffectedByCellsWithExclusion(updatedCells map[string]b
 			continue
 		}
 
-		deps := extractDependenciesOptimized(formula, parts[0], parts[1], columnIndex, columnMetadata)
+		deps := f.extractDependenciesOptimizedWithSQL(formula, parts[0], parts[1], columnIndex, columnMetadata)
 		graph.nodes[cell] = &formulaNode{
 			cell:         cell,
 			formula:      formula,
@@ -3286,7 +3317,12 @@ func (f *File) findAffectedCellsByCells(graph *dependencyGraph, updatedCells map
 	}
 
 	// 第一轮：找出直接受影响的公式
+	updatedSheets := make(map[string]bool)
 	for cell := range updatedCells {
+		parts := strings.SplitN(cell, "!", 2)
+		if len(parts) == 2 {
+			updatedSheets[parts[0]] = true
+		}
 		// 直接引用该单元格的公式
 		for _, formula := range reverseDeps[cell] {
 			affected[formula] = true
@@ -3295,12 +3331,22 @@ func (f *File) findAffectedCellsByCells(graph *dependencyGraph, updatedCells map
 
 	// 检查列范围依赖
 	for colKey, rows := range updatedCellsByCol {
+		parts := strings.SplitN(colKey, "!", 2)
+		if len(parts) == 2 {
+			updatedSheets[parts[0]] = true
+		}
 		colDepKey := "COLUMN:" + colKey
 		for _, formula := range reverseColDeps[colDepKey] {
 			// 只有当列范围依赖确实可能受影响时才添加
 			// （列范围公式如 INDEX($B:$B, ...) 会受到任何 B 列单元格更新的影响）
 			affected[formula] = true
 			_ = rows // 列范围总是包含所有行
+		}
+	}
+
+	for sheet := range updatedSheets {
+		for _, formula := range reverseDeps["SHEET:"+sheet] {
+			affected[formula] = true
 		}
 	}
 

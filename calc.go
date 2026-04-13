@@ -249,6 +249,7 @@ type calcContext struct {
 	iterationsCache   map[string]formulaArg
 	rangeCache        sync.Map        // Cache for range references like "$K2:$AAC2" (thread-safe)
 	worksheetCache    *WorksheetCache // Batch calculation cache for recently calculated values
+	allowMatrixResult bool
 }
 
 // cellRef defines the structure of a cell reference.
@@ -958,6 +959,71 @@ func (f *File) CalcCellValue(sheet, cell string, opts ...Options) (result string
 	return
 }
 
+// CalcCellValueWithMatrixResult represents the result of a matrix-capable formula calculation.
+// When Matrix is non-empty, the formula returned a spill array and Value is the top-left cell.
+type CalcCellValueWithMatrixResult struct {
+	Value  string
+	Matrix [][]interface{}
+}
+
+// CalcCellValueWithMatrix returns matrix results without collapsing to the top-left cell.
+func (f *File) CalcCellValueWithMatrix(sheet, cell string, opts ...Options) (CalcCellValueWithMatrixResult, error) {
+	options := f.getOptions(opts...)
+	token, err := f.calcCellValue(&calcContext{
+		entry:             fmt.Sprintf("%s!%s", sheet, cell),
+		maxCalcIterations: options.MaxCalcIterations,
+		iterations:        make(map[string]uint),
+		iterationsCache:   make(map[string]formulaArg),
+		allowMatrixResult: true,
+		// rangeCache is sync.Map, no initialization needed
+	}, sheet, cell)
+	if err != nil {
+		return CalcCellValueWithMatrixResult{Value: token.String}, err
+	}
+
+	if token.Type == ArgMatrix {
+		matrix := make([][]interface{}, len(token.Matrix))
+		for r := range token.Matrix {
+			row := token.Matrix[r]
+			out := make([]interface{}, len(row))
+			for c := range row {
+				out[c] = formulaArgToInterface(row[c])
+			}
+			matrix[r] = out
+		}
+		value := ""
+		if len(token.Matrix) > 0 && len(token.Matrix[0]) > 0 {
+			value = token.Matrix[0][0].Value()
+		}
+		return CalcCellValueWithMatrixResult{Value: value, Matrix: matrix}, nil
+	}
+
+	return CalcCellValueWithMatrixResult{Value: token.Value()}, nil
+}
+
+func formulaArgToInterface(arg formulaArg) interface{} {
+	switch arg.Type {
+	case ArgNumber:
+		if arg.Boolean {
+			return arg.Number != 0
+		}
+		return arg.Number
+	case ArgString:
+		return arg.String
+	case ArgError:
+		return arg.String
+	case ArgEmpty:
+		return ""
+	case ArgMatrix:
+		if len(arg.Matrix) > 0 && len(arg.Matrix[0]) > 0 {
+			return formulaArgToInterface(arg.Matrix[0][0])
+		}
+		return ""
+	default:
+		return arg.Value()
+	}
+}
+
 // CalcCellValues calculates multiple cell values efficiently by leveraging cache.
 // This function is optimized for batch calculation scenarios where multiple cells
 // need to be calculated. It provides better performance than calling CalcCellValue
@@ -1105,6 +1171,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 		formulaArrayRow                 []formulaArg
 		opdStack, optStack, opfStack    = NewStack(), NewStack(), NewStack()
 		opfdStack, opftStack, argsStack = NewStack(), NewStack(), NewStack()
+		argBaseStack                    = NewStack()
 	)
 	for i := 0; i < len(tokens); i++ {
 		token := tokens[i]
@@ -1136,6 +1203,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 			}
 			opfStack.Push(token)
 			argsStack.Push(list.New().Init())
+			argBaseStack.Push(opfdStack.Len())
 			opftStack.Push(token) // to know which operators belong to a function use the function as a separator
 			continue
 		}
@@ -1225,7 +1293,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 				inArray = false
 				continue
 			}
-			if errArg := f.evalInfixExpFunc(ctx, sheet, cell, token, nextToken, opfStack, opdStack, opftStack, opfdStack, argsStack); errArg.Type == ArgError {
+			if errArg := f.evalInfixExpFunc(ctx, sheet, cell, token, nextToken, opfStack, opdStack, opftStack, opfdStack, argsStack, argBaseStack); errArg.Type == ArgError {
 				return errArg, errors.New(errArg.Error)
 			}
 		}
@@ -1251,11 +1319,11 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 }
 
 // evalInfixExpFunc evaluate formula function in the infix expression.
-func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nextToken efp.Token, opfStack, opdStack, opftStack, opfdStack, argsStack *Stack) formulaArg {
+func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nextToken efp.Token, opfStack, opdStack, opftStack, opfdStack, argsStack, argBaseStack *Stack) formulaArg {
 	if !isFunctionStopToken(token) {
 		return newEmptyFormulaArg()
 	}
-	prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack)
+	prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack, argBaseStack.Peek().(int))
 	// call formula function to evaluate
 	funcName := opfStack.Peek().(efp.Token).TValue
 	funcName = strings.ToUpper(funcName)
@@ -1266,6 +1334,7 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 		return arg
 	}
 	argsStack.Pop()
+	argBaseStack.Pop()
 	opftStack.Pop() // remove current function separator
 	opfStack.Pop()
 	if opfStack.Len() > 0 { // still in function stack
@@ -1278,7 +1347,11 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 		return newEmptyFormulaArg()
 	}
 	if arg.Type == ArgMatrix && len(arg.Matrix) > 0 && len(arg.Matrix[0]) > 0 {
-		opdStack.Push(arg.Matrix[0][0])
+		if ctx != nil && ctx.allowMatrixResult {
+			opdStack.Push(arg)
+		} else {
+			opdStack.Push(arg.Matrix[0][0])
+		}
 		return newEmptyFormulaArg()
 	}
 	opdStack.Push(arg)
@@ -1287,7 +1360,7 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 
 // prepareEvalInfixExp check the token and stack state for formula function
 // evaluate.
-func prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack *Stack) {
+func prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack *Stack, argBase int) {
 	// current token is function stop
 	for opftStack.Peek().(efp.Token) != opfStack.Peek().(efp.Token) {
 		// calculate trigger
@@ -1299,16 +1372,10 @@ func prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack *Stack) {
 		}
 		opftStack.Pop()
 	}
-	argument := true
-	if opftStack.Len() > 2 && opfdStack.Len() == 1 {
-		topOpt := opftStack.Pop()
-		if opftStack.Peek().(efp.Token).TType == efp.TokenTypeOperatorInfix {
-			argument = false
-		}
-		opftStack.Push(topOpt)
-	}
-	// push opfd to args
-	if argument && opfdStack.Len() > 0 {
+	// Only consume operands produced after this function started. This prevents
+	// inner functions from stealing outer-expression operands while still
+	// allowing the current function's trailing argument to be collected.
+	if opfdStack.Len() > argBase {
 		argsStack.Peek().(*list.List).PushBack(opfdStack.Pop().(formulaArg))
 	}
 }
@@ -16932,6 +16999,39 @@ func (fn *formulaFuncs) ANCHORARRAY(argsList *list.List) formulaArg {
 			row = append(row, arg)
 		}
 		mtx = append(mtx, row)
+	}
+	return newMatrixFormulaArg(mtx)
+}
+
+// TESTWRITERANGE returns a numeric matrix for spill testing.
+// Syntax: TEST_WRITE_RANGE(rows, cols)
+func (fn *formulaFuncs) TESTWRITERANGE(argsList *list.List) formulaArg {
+	if argsList.Len() != 2 {
+		return newErrorFormulaArg(formulaErrorVALUE, "TEST_WRITE_RANGE requires 2 arguments")
+	}
+	rowsArg := argsList.Front().Value.(formulaArg).ToNumber()
+	if rowsArg.Type != ArgNumber {
+		return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
+	}
+	colsArg := argsList.Front().Next().Value.(formulaArg).ToNumber()
+	if colsArg.Type != ArgNumber {
+		return newErrorFormulaArg(formulaErrorVALUE, formulaErrorVALUE)
+	}
+	rows := int(rowsArg.Number)
+	cols := int(colsArg.Number)
+	if rows <= 0 || cols <= 0 {
+		return newErrorFormulaArg(formulaErrorVALUE, "rows and cols must be >= 1")
+	}
+
+	mtx := make([][]formulaArg, rows)
+	value := 1.0
+	for r := 0; r < rows; r++ {
+		row := make([]formulaArg, cols)
+		for c := 0; c < cols; c++ {
+			row[c] = newNumberFormulaArg(value)
+			value++
+		}
+		mtx[r] = row
 	}
 	return newMatrixFormulaArg(mtx)
 }

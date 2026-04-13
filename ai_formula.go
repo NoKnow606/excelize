@@ -10,21 +10,16 @@ import (
 	"container/list"
 )
 
-// AI function accepts two parameters and returns the current cell's cached value.
-// This is a placeholder implementation that preserves the existing cell value.
+// AI function returns the current cell's cached value, preserving any
+// externally-computed result. This prevents recalculation from overwriting
+// values set by the MCP server.
 //
-//	AI(param1, param2)
+//	AI(param1, ...)
 func (fn *formulaFuncs) AI(argsList *list.List) formulaArg {
 	if argsList.Len() != 2 {
 		return newErrorFormulaArg(formulaErrorVALUE, "AI requires 2 arguments")
 	}
-
-	// Get the current cell's cached value
-	cachedValue, err := fn.f.GetCellValue(fn.sheet, fn.cell)
-	if err != nil {
-		return newStringFormulaArg("")
-	}
-	return newStringFormulaArg(cachedValue)
+	return cachedCellValue(fn)
 }
 
 /*
