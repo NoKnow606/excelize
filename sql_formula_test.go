@@ -227,6 +227,69 @@ func TestSQLFormulaStoreCalculatedValuePersistsSpillRangeAndCaches(t *testing.T)
 	}
 }
 
+func TestSQLFormulaBatchUpdatePersistsSpillRangeAndCaches(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	formula := `SQL("select ""Category"", sum(""Amount"") as ""Total"" from ""Data"" group by ""Category"" order by ""Category""")`
+	if err := f.BatchUpdateValuesAndFormulasWithRecalcV2(
+		[]CellUpdate{{Sheet: "Report", Cell: "A1", Value: "Category"}},
+		[]FormulaUpdateWithValue{{Sheet: "Report", Cell: "A1", Formula: formula}},
+	); err != nil {
+		t.Fatalf("BatchUpdateValuesAndFormulasWithRecalcV2: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "A1:B3" {
+		t.Fatalf("expected spill ref A1:B3, got %q", got)
+	}
+	if got, err := f.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "20" {
+		t.Fatalf("expected in-memory spill value 20 at B3, got %q err=%v", got, err)
+	}
+	if cached, ok := f.calcCache.Load("Report!B2!raw=true"); !ok || cached.(string) != "10" {
+		t.Fatalf("expected calc cache B2 raw value 10, got ok=%v value=%v", ok, cached)
+	}
+
+	fileName := "test_sql_formula_batch_update.xlsx"
+	if err := f.SaveAs(fileName); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	defer os.Remove(fileName)
+
+	reopened, err := OpenFile(fileName)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer reopened.Close()
+
+	if got, err := reopened.GetCellValue("Report", "A1", Options{RawCellValue: true}); err != nil || got != "Category" {
+		t.Fatalf("expected reopened A1 header Category, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B2", Options{RawCellValue: true}); err != nil || got != "10" {
+		t.Fatalf("expected reopened B2 value 10, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "20" {
+		t.Fatalf("expected reopened B3 value 20, got %q err=%v", got, err)
+	}
+}
+
 func TestSQLFormulaClearsPreviousSpillOnError(t *testing.T) {
 	f := NewFile()
 	defer f.Close()
