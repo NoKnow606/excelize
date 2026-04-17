@@ -1772,6 +1772,7 @@ func (f *File) extractCharts(cs *xlsxChartSpace, rawXML []byte) []*Chart {
 			Series: extractChartSeries(info.charts),
 		}
 		f.extractChartTitle(rawXML, chart)
+		extractChartAxisTitles(rawXML, info.charts, chart)
 		extractChartLegend(cs.Chart.Legend, chart)
 		extractChartPlotArea(info.charts, chart)
 		if info.charts.VaryColors != nil {
@@ -1800,6 +1801,117 @@ func (f *File) extractCharts(cs *xlsxChartSpace, rawXML []byte) []*Chart {
 		}
 	}
 	return charts
+}
+
+// extractChartAxisTitles populates the chart axis titles from the raw chart
+// XML. The cCharts AxID order is horizontal axis first and vertical axis
+// second, which also covers scatter charts that use valAx for both axes.
+func extractChartAxisTitles(chartXML []byte, charts *cCharts, chart *Chart) {
+	if len(chartXML) == 0 || charts == nil || chart == nil {
+		return
+	}
+	titlesByID := extractChartAxisTitlesByID(chartXML)
+	if len(titlesByID) == 0 {
+		return
+	}
+	if len(charts.AxID) > 0 && charts.AxID[0] != nil && charts.AxID[0].Val != nil {
+		chart.XAxis.Title = titlesByID[*charts.AxID[0].Val]
+	}
+	if len(charts.AxID) > 1 && charts.AxID[1] != nil && charts.AxID[1].Val != nil {
+		chart.YAxis.Title = titlesByID[*charts.AxID[1].Val]
+	}
+}
+
+func extractChartAxisTitlesByID(chartXML []byte) map[int][]RichTextRun {
+	decoder := xml.NewDecoder(bytes.NewReader(chartXML))
+	titles := make(map[int][]RichTextRun)
+	axisTags := map[string]bool{
+		"catAx":  true,
+		"dateAx": true,
+		"serAx":  true,
+		"valAx":  true,
+	}
+	type axisState struct {
+		tag     string
+		id      int
+		hasID   bool
+		inTitle bool
+		inTx    bool
+		inRich  bool
+		inR     bool
+		runs    []RichTextRun
+	}
+	var current *axisState
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if current == nil && axisTags[t.Name.Local] {
+				current = &axisState{tag: t.Name.Local}
+				continue
+			}
+			if current == nil {
+				continue
+			}
+			switch t.Name.Local {
+			case "axId":
+				for _, attr := range t.Attr {
+					if attr.Name.Local != "val" {
+						continue
+					}
+					if axisID, err := strconv.Atoi(attr.Value); err == nil {
+						current.id = axisID
+						current.hasID = true
+					}
+					break
+				}
+			case "title":
+				current.inTitle = true
+			case "tx":
+				if current.inTitle {
+					current.inTx = true
+				}
+			case "rich":
+				if current.inTx {
+					current.inRich = true
+				}
+			case "r":
+				if current.inRich {
+					current.inR = true
+				}
+			case "t":
+				if current.inR {
+					var text string
+					if err := decoder.DecodeElement(&text, &t); err == nil && text != "" {
+						current.runs = append(current.runs, RichTextRun{Text: text})
+					}
+				}
+			}
+		case xml.EndElement:
+			if current == nil {
+				continue
+			}
+			switch t.Name.Local {
+			case current.tag:
+				if current.hasID && len(current.runs) > 0 {
+					titles[current.id] = append([]RichTextRun(nil), current.runs...)
+				}
+				current = nil
+			case "title":
+				current.inTitle = false
+			case "tx":
+				current.inTx = false
+			case "rich":
+				current.inRich = false
+			case "r":
+				current.inR = false
+			}
+		}
+	}
+	return titles
 }
 
 // chartTypeInfo holds the chart type and associated chart data for a single

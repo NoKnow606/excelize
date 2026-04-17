@@ -1451,3 +1451,53 @@ func TestGetCharts(t *testing.T) {
 
 	assert.NoError(t, f.Close())
 }
+
+func TestGetChartsAxisTitles(t *testing.T) {
+	f := NewFile()
+	sheet := f.GetSheetName(0)
+
+	for cell, v := range map[string]interface{}{
+		"A1": nil, "B1": "Sales",
+		"A2": "Q1", "B2": 10,
+		"A3": "Q2", "B3": 20,
+	} {
+		assert.NoError(t, f.SetCellValue(sheet, cell, v))
+	}
+
+	assert.NoError(t, f.AddChart(sheet, "E1", &Chart{
+		Type: Col,
+		Series: []ChartSeries{
+			{Name: "Sheet1!$B$1", Categories: "Sheet1!$A$2:$A$3", Values: "Sheet1!$B$2:$B$3"},
+		},
+		Title: []RichTextRun{{Text: "Quarterly Sales"}},
+		XAxis: ChartAxis{Title: []RichTextRun{{Text: "Quarter"}}},
+		YAxis: ChartAxis{Title: []RichTextRun{{Text: "Amount"}}},
+	}))
+
+	path := filepath.Join("test", "TestGetChartsAxisTitles.xlsx")
+	assert.NoError(t, f.SaveAs(path))
+
+	reopened, err := OpenFile(path)
+	assert.NoError(t, err)
+	if err != nil {
+		assert.NoError(t, f.Close())
+		return
+	}
+
+	charts, err := reopened.GetCharts(sheet)
+	assert.NoError(t, err)
+	if !assert.Len(t, charts, 1) {
+		_ = reopened.Close()
+		assert.NoError(t, f.Close())
+		return
+	}
+	if assert.Len(t, charts[0].XAxis.Title, 1) {
+		assert.Equal(t, "Quarter", charts[0].XAxis.Title[0].Text)
+	}
+	if assert.Len(t, charts[0].YAxis.Title, 1) {
+		assert.Equal(t, "Amount", charts[0].YAxis.Title[0].Text)
+	}
+
+	assert.NoError(t, reopened.Close())
+	assert.NoError(t, f.Close())
+}
