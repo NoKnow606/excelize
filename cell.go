@@ -881,6 +881,10 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 			c.F.Ref = *opt.Ref
 		}
 	}
+	if isExternalCachedFormula(formula) {
+		return f.deleteCalcChain(f.getSheetID(sheet), cell)
+	}
+
 	// Clear cell value and type when setting formula
 	// The actual type will be determined by the formula calculation result
 	c.T, c.V, c.IS = "", "", nil
@@ -947,6 +951,10 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 	f.calcCache.Store(cacheKey, arg)
 	f.calcCache.Store(cacheKey+"!raw=false", value)
 	f.calcCache.Store(cacheKey+"!raw=true", value)
+
+	if isExternalCachedFormula(formula) {
+		return f.deleteCalcChain(f.getSheetID(sheet), cell)
+	}
 
 	return nil
 }

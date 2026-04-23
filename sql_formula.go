@@ -281,6 +281,9 @@ func (f *File) sqlFormulaSourceSheets(formula string) []string {
 }
 
 func (f *File) extractDependenciesWithSQL(formula, currentSheet, currentCell string) []string {
+	if isExternalCachedFormula(formula) {
+		return nil
+	}
 	deps := make(map[string]bool)
 	for _, dep := range extractDependencies(formula, currentSheet, currentCell) {
 		deps[dep] = true
@@ -290,6 +293,9 @@ func (f *File) extractDependenciesWithSQL(formula, currentSheet, currentCell str
 }
 
 func (f *File) extractDependenciesOptimizedWithSQL(formula, currentSheet, currentCell string, columnIndex map[string][]string, columnMetadata map[string]*columnMeta) []string {
+	if isExternalCachedFormula(formula) {
+		return nil
+	}
 	deps := make(map[string]bool)
 	for _, dep := range extractDependenciesOptimized(formula, currentSheet, currentCell, columnIndex, columnMetadata) {
 		deps[dep] = true

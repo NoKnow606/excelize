@@ -430,6 +430,12 @@ func (f *File) setFormulaValue(sheet, cellName, value string) {
 }
 
 func (f *File) persistFormulaResult(sheet, cellName, value string, worksheetCache *WorksheetCache, updateCaches, notify bool) {
+	if notify {
+		formula, err := f.GetCellFormula(sheet, cellName)
+		if err == nil && isExternalCachedFormula(formula) {
+			notify = false
+		}
+	}
 	if handled := f.persistSQLFormulaResult(sheet, cellName, value, worksheetCache, updateCaches, notify); handled {
 		return
 	}

@@ -1085,6 +1085,9 @@ func (f *File) updateCalcChainForFormulas(formulas []FormulaUpdate) error {
 
 	// 添加新的公式到 calcChain
 	for _, formula := range formulas {
+		if isExternalCachedFormula(formula.Formula) {
+			continue
+		}
 		// 检查是否已存在
 		if existingEntries[formula.Sheet] != nil && existingEntries[formula.Sheet][formula.Cell] {
 			continue // 已存在，跳过
@@ -2377,6 +2380,9 @@ func (f *File) RebuildCalcChain() error {
 						formula, _ = getSharedFormula(ws, *cell.F.Si, cell.R)
 					}
 					if formula != "" {
+						if isExternalCachedFormula(formula) {
+							continue
+						}
 						calcChain.C = append(calcChain.C, xlsxCalcChainC{
 							R: cell.R,
 							I: sheetID,
