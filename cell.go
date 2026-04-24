@@ -26,6 +26,20 @@ import (
 	"github.com/xuri/efp"
 )
 
+func stringifyInterfaceValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if rv.IsNil() {
+			return ""
+		}
+	}
+	return fmt.Sprint(value)
+}
+
 // CellType is the type of cell value type.
 type CellType byte
 
@@ -159,14 +173,21 @@ func (f *File) SetCellValue(sheet, cell string, value interface{}) error {
 		// loses quoting (e.g. []interface{}{"aaaa"} → "[aaaa]" vs `["aaaa"]`).
 		rv := reflect.ValueOf(value)
 		switch rv.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if rv.IsNil() {
+				err = f.SetCellDefault(sheet, cell, "")
+				break
+			}
+		}
+		switch rv.Kind() {
 		case reflect.Slice, reflect.Array, reflect.Map:
 			if b, jsonErr := json.Marshal(value); jsonErr == nil {
 				err = f.SetCellStr(sheet, cell, string(b))
 			} else {
-				err = f.SetCellStr(sheet, cell, fmt.Sprint(value))
+				err = f.SetCellStr(sheet, cell, stringifyInterfaceValue(value))
 			}
 		default:
-			err = f.SetCellStr(sheet, cell, fmt.Sprint(value))
+			err = f.SetCellStr(sheet, cell, stringifyInterfaceValue(value))
 		}
 	}
 	return err

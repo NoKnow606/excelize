@@ -1734,3 +1734,64 @@ func itoa(i int) string {
 	}
 	return result
 }
+
+func TestBatchUpdateAndRecalculateNilValueDoesNotBecomeNilString(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	if err := f.SetCellValue("Sheet1", "A1", "seed"); err != nil {
+		t.Fatalf("SetCellValue: %v", err)
+	}
+	if err := f.SetCellFormula("Sheet1", "B1", `=A1&""`); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	f.CalcChain = &xlsxCalcChain{
+		C: []xlsxCalcChainC{{R: "B1", I: 1}},
+	}
+
+	if err := f.BatchUpdateAndRecalculate([]CellUpdate{{Sheet: "Sheet1", Cell: "A1", Value: nil}}); err != nil {
+		t.Fatalf("BatchUpdateAndRecalculate: %v", err)
+	}
+
+	got, err := f.GetCellValue("Sheet1", "B1", Options{RawCellValue: true})
+	if err != nil {
+		t.Fatalf("GetCellValue: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected empty string, got %q", got)
+	}
+}
+
+func TestStringifyCellUpdateValueNilSafe(t *testing.T) {
+	if got := stringifyCellUpdateValue(nil); got != "" {
+		t.Fatalf("expected empty string for nil, got %q", got)
+	}
+
+	var ptr *string
+	if got := stringifyCellUpdateValue(ptr); got != "" {
+		t.Fatalf("expected empty string for typed nil, got %q", got)
+	}
+
+	if got := stringifyCellUpdateValue(123); got != "123" {
+		t.Fatalf("expected numeric string, got %q", got)
+	}
+}
+
+func TestSetCellValueTypedNilDoesNotBecomeNilString(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	var ptr *string
+	if err := f.SetCellValue("Sheet1", "A1", ptr); err != nil {
+		t.Fatalf("SetCellValue: %v", err)
+	}
+
+	got, err := f.GetCellValue("Sheet1", "A1", Options{RawCellValue: true})
+	if err != nil {
+		t.Fatalf("GetCellValue: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected empty string, got %q", got)
+	}
+}
