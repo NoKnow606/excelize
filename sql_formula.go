@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode"
 
+	_ "github.com/marcboeker/go-duckdb"
 	_ "modernc.org/sqlite"
 )
 
@@ -242,9 +243,18 @@ func (f *File) prepareSQL(sqlInput string) (*preparedSQL, error) {
 		sourceSheet = sources[0].SheetName
 	}
 
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		return nil, fmt.Errorf("open in-memory sqlite: %w", err)
+	var db *sql.DB
+	var openErr error
+	if f.duckDBEnabled {
+		db, openErr = sql.Open("duckdb", f.duckDBPath)
+		if openErr != nil {
+			return nil, fmt.Errorf("open duckdb: %w", openErr)
+		}
+	} else {
+		db, openErr = sql.Open("sqlite", ":memory:")
+		if openErr != nil {
+			return nil, fmt.Errorf("open in-memory sqlite: %w", openErr)
+		}
 	}
 
 	headersByTable, err := materializeSheets(db, f, sources)
