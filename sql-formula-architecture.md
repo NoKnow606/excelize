@@ -44,18 +44,18 @@ At a high level:
 
 ```mermaid
 flowchart TD
-    A[Cell formula: SQL('select ...')] --> B[Parse SQL string argument]
-    B --> C[Validate: only single SELECT or WITH query]
-    C --> D[Find FROM and JOIN source tokens]
-    D --> E[Resolve worksheet names or gid_* tokens]
-    E --> F[Rewrite sources to internal SQLite table names]
-    F --> G[Open temporary SQLite database in memory]
-    G --> H[Read worksheet rows via GetRows]
-    H --> I[Build SQLite tables from sheet headers and rows]
-    I --> J[Execute rewritten SQL]
-    J --> K[Convert result rows to formula matrix]
-    K --> L[Spill matrix into worksheet cells]
-    L --> M[Persist spill ref and cached values]
+    A["Cell formula with SQL query"] --> B["Parse SQL string argument"]
+    B --> C["Validate single SELECT or WITH query"]
+    C --> D["Find FROM and JOIN source tokens"]
+    D --> E["Resolve worksheet names or gid_* tokens"]
+    E --> F["Rewrite sources to internal SQLite table names"]
+    F --> G["Open temporary in-memory SQLite database"]
+    G --> H["Read worksheet rows via GetRows"]
+    H --> I["Build SQLite tables from sheet headers and rows"]
+    I --> J["Execute rewritten SQL"]
+    J --> K["Convert result rows to formula matrix"]
+    K --> L["Spill matrix into worksheet cells"]
+    L --> M["Persist spill ref and cached values"]
 ```
 
 ### Sequence Diagram
@@ -69,10 +69,10 @@ sequenceDiagram
     participant Sheet as Source Worksheet
     participant Target as Target Worksheet
 
-    User->>Engine: Evaluate SQL("select ... from Data")
+    User->>Engine: Evaluate SQL query
     Engine->>Engine: Extract and validate query
     Engine->>Resolver: Resolve source token
-    Resolver-->>Engine: Data or gid_* -> Data
+    Resolver-->>Engine: Resolve source token to worksheet name
     Engine->>SQLite: Open :memory: database
     Engine->>Sheet: Read rows from source worksheet
     Sheet-->>Engine: Header row + data rows
