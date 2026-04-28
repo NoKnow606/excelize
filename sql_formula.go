@@ -14,9 +14,8 @@ import (
 )
 
 var (
-	errSQLFormulaEmptyQuery           = errors.New("SQL formula query cannot be empty")
-	errSQLFormulaOnlySelectSupported  = errors.New("only single SELECT statements are supported")
-	errSQLFormulaSubqueryNotSupported = errors.New("subqueries are not supported in SQL formulas yet")
+	errSQLFormulaEmptyQuery          = errors.New("SQL formula query cannot be empty")
+	errSQLFormulaOnlySelectSupported = errors.New("only single SELECT statements are supported")
 )
 
 // SQLSourceResolver resolves SQL source tokens such as worksheet names or gid_*
@@ -517,13 +516,24 @@ func rewriteQuerySources(
 }
 
 func findSourceTokens(query string) ([]sqlQuerySource, error) {
+	tokens, foundFrom, err := findSourceTokensInRange(query, 0, len(query))
+	if err != nil {
+		return nil, err
+	}
+	if !foundFrom {
+		return nil, fmt.Errorf("missing FROM clause")
+	}
+	return tokens, nil
+}
+
+func findSourceTokensInRange(query string, start, end int) ([]sqlQuerySource, bool, error) {
 	inSingle := false
 	inDouble := false
 	inBacktick := false
 	foundFrom := false
 	tokens := make([]sqlQuerySource, 0, 4)
 
-	for i := 0; i < len(query); i++ {
+	for i := start; i < end; i++ {
 		ch := query[i]
 
 		switch ch {
@@ -544,6 +554,20 @@ func findSourceTokens(query string) ([]sqlQuerySource, error) {
 		if inSingle || inDouble || inBacktick {
 			continue
 		}
+		if ch == '(' {
+			matchIdx, err := findMatchingParenInRange(query, i, end)
+			if err != nil {
+				return nil, false, err
+			}
+			nestedTokens, nestedFoundFrom, err := findSourceTokensInRange(query, i+1, matchIdx)
+			if err != nil {
+				return nil, false, err
+			}
+			tokens = append(tokens, nestedTokens...)
+			foundFrom = foundFrom || nestedFoundFrom
+			i = matchIdx
+			continue
+		}
 
 		keyword := ""
 		switch {
@@ -557,21 +581,32 @@ func findSourceTokens(query string) ([]sqlQuerySource, error) {
 		}
 
 		j := i + len(keyword)
-		for j < len(query) && unicode.IsSpace(rune(query[j])) {
+		for j < end && unicode.IsSpace(rune(query[j])) {
 			j++
 		}
-		if j >= len(query) {
-			return nil, fmt.Errorf("missing source after %s", strings.ToUpper(keyword))
+		if j >= end {
+			return nil, false, fmt.Errorf("missing source after %s", strings.ToUpper(keyword))
 		}
 		if query[j] == '(' {
-			return nil, errSQLFormulaSubqueryNotSupported
+			matchIdx, err := findMatchingParenInRange(query, j, end)
+			if err != nil {
+				return nil, false, err
+			}
+			nestedTokens, nestedFoundFrom, err := findSourceTokensInRange(query, j+1, matchIdx)
+			if err != nil {
+				return nil, false, err
+			}
+			tokens = append(tokens, nestedTokens...)
+			foundFrom = foundFrom || nestedFoundFrom
+			i = matchIdx
+			continue
 		}
 
 		start := j
 		if isIdentifierQuote(query[j]) {
 			quote := query[j]
 			j++
-			for j < len(query) {
+			for j < end {
 				if query[j] == quote {
 					if j+1 < len(query) && query[j+1] == quote {
 						j += 2
@@ -587,10 +622,10 @@ func findSourceTokens(query string) ([]sqlQuerySource, error) {
 				}
 				j++
 			}
-			return nil, fmt.Errorf("unterminated quoted source after %s", strings.ToUpper(keyword))
+			return nil, false, fmt.Errorf("unterminated quoted source after %s", strings.ToUpper(keyword))
 		}
 
-		for j < len(query) {
+		for j < end {
 			if unicode.IsSpace(rune(query[j])) || query[j] == ',' || query[j] == ')' {
 				break
 			}
@@ -607,9 +642,9 @@ func findSourceTokens(query string) ([]sqlQuerySource, error) {
 	}
 
 	if !foundFrom {
-		return nil, fmt.Errorf("missing FROM clause")
+		return tokens, false, nil
 	}
-	return tokens, nil
+	return tokens, true, nil
 }
 
 func resolveSQLSourceName(token string, sheetList []string, resolver SQLSourceResolver) (string, error) {
@@ -1118,12 +1153,16 @@ func skipSQLWhitespace(input string, pos int) int {
 }
 
 func findMatchingParen(input string, start int) (int, error) {
+	return findMatchingParenInRange(input, start, len(input))
+}
+
+func findMatchingParenInRange(input string, start, end int) (int, error) {
 	depth := 0
 	inSingle := false
 	inDouble := false
 	inBacktick := false
 
-	for i := start; i < len(input); i++ {
+	for i := start; i < end; i++ {
 		ch := input[i]
 		switch ch {
 		case '\'':
@@ -1154,7 +1193,7 @@ func findMatchingParen(input string, start int) (int, error) {
 			}
 		}
 	}
-	return 0, fmt.Errorf("unterminated parenthesis in WITH clause")
+	return 0, fmt.Errorf("unterminated parenthesis in SQL query")
 }
 
 func isIdentifierQuote(ch byte) bool {
