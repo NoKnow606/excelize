@@ -485,6 +485,104 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 
 这样可以真正满足场景 2。
 
+### 7.2.1 这里说的 block cache 到底是什么
+
+这里讨论的 block cache，本质上就是：
+
+- 面向大 sheet 源数据的 `SheetSourceStore`
+- 不是现有代码里某个已经完整落地的 cache type 名称
+- 也不是简单把整张 sheet 变成一个新的 `map[cellRef]value`
+
+更准确地说，它应该是：
+
+- 把 sheet 按 row block 或 row+column block 分块
+- 每个 block 保存一段可复用的源数据视图
+- 数据表示尽量使用数字坐标、稀疏结构或紧凑数组
+- 优先服务于 `lookup` / `range` / `recalculate` 的读路径
+
+它要解决的问题不是“让每次访问都重新回 XML”，而是：
+
+- 第一次访问某个热点区域时最多构建一次 block
+- 后续同一轮重算复用同一批 source blocks
+- 文档未变时，多个请求 / 多个用户也复用同一批 source blocks
+- 文档变化时，只失效受影响 block，而不是整 sheet 重建
+
+### 7.2.2 block cache 与现有缓存的区别
+
+与现有缓存相比，block cache 的关键区别在于职责和粒度。
+
+#### 对比 `Pkg` / `Sheet`
+
+现有：
+
+- 缓存 worksheet XML 字节和 `xlsxWorksheet` 完整对象
+- 属于对象缓存
+
+block cache：
+
+- 缓存的是面向读优化的源数据块
+- 不是完整 worksheet 编辑模型
+
+#### 对比 `WorksheetCache`
+
+现有：
+
+- `map[sheet]map[cellRef]formulaArg`
+- 更适合重算期间最新值 overlay
+- `LoadSheet()` 时会把整张 sheet 按单元格复制进内存
+
+block cache：
+
+- 以 block 为单位，不以 `A1` 这种字符串 key 为基本存储单元
+- 更适合承载大 sheet 原始源数据
+- 目标是替代 `WorksheetCache` 承担“大 sheet 全量 source cache”这部分职责
+
+#### 对比 `calcCache`
+
+现有：
+
+- 缓存公式结果
+
+block cache：
+
+- 缓存公式读取时依赖的源数据
+
+#### 对比 `rangeCache`
+
+现有：
+
+- 缓存已经解析出来的范围矩阵
+
+block cache：
+
+- 缓存更底层的源数据块
+- 范围矩阵可以建立在这些 block 之上
+
+#### 对比 lookup / index caches
+
+现有：
+
+- `matchIndexCache`
+- `ifsMatchCache`
+- `rangeIndexCache`
+
+这些缓存：
+
+- 是对源数据的二次加工索引
+- 仍然应该保留
+
+block cache：
+
+- 是这些索引更稳定、更低内存的底层数据来源
+
+### 7.2.3 block cache 的主要优势
+
+- 比整表 `WorksheetCache.LoadSheet()` 更省内存
+- 比复用完整 worksheet object 更适合热点大 sheet
+- 能同时服务单次重算复用和跨请求 / 跨用户复用
+- 更容易做 block 级 dirty、懒重建和冷热淘汰
+- 为 `rangeCache` 和各种 lookup index cache 提供统一的源数据底座
+
 ## 7.3 让 `FileCache` 复用的是“文件 + source store 元数据”
 
 结合 `excelize-mcp` 最自然的落点是：
@@ -516,6 +614,95 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 - 若文档变更，则只失效相关 sheet 或 block
 - 若文档整体被替换，则整个 workbook source store 失效
 
+### 7.4.1 不同 session 的增量更新模型
+
+如果要支持不同 session 对同一文档做增量更新，关键不是让所有 session 直接共同修改同一份 block，而是把：
+
+- 共享基线 source store
+- session 独立 overlay
+
+明确分层。
+
+推荐模型：
+
+- `SharedSourceStore`：挂在 `FileCache` / `CachedFile` 上，表示当前文档已提交版本的 block 基线
+- `SessionOverlay`：每个 session 独有，仅保存该 session 未提交的 cell / range / block 修改
+- `DocumentVersion`：文档级版本号
+- `SheetVersion`：可选的 sheet 级版本号
+- `BlockVersion`：每个 block 的局部版本号
+
+读路径：
+
+- 先查 `SessionOverlay`
+- 未命中再查 `SharedSourceStore`
+- block 不存在时再懒构建
+
+写路径：
+
+- session 写入时先更新自己的 overlay
+- 不直接污染共享 block
+- 提交 / 保存成功后，再把 overlay 合并进共享 source store
+
+这样才能避免：
+
+- session A 未提交的中间态被 session B 读到
+- 不同 session 彼此覆盖尚未提交的修改
+
+### 7.4.2 增量更新的两种策略
+
+#### 策略 A：dirty + lazy rebuild
+
+- 根据修改范围定位受影响 block
+- 先把当前 session 的修改写入 overlay
+- 共享 source store 中对应 block 仅标记 dirty
+- 下次有人访问该 block 时再懒重建
+
+优点：
+
+- 实现简单
+- 一致性风险低
+
+不足：
+
+- 第一次命中 dirty block 的请求要承担一次重建成本
+
+#### 策略 B：patch in place
+
+- 对简单 `update_range` / `SetCellValue` 场景
+- 在共享 block 内直接 patch 对应 cell 值
+- 同时清理相关 `rangeCache` / lookup index caches
+
+优点：
+
+- 后续读取延迟更低
+
+不足：
+
+- 结构调整、公式引用变化、坐标位移场景复杂度高
+
+建议落地顺序：
+
+- 第一阶段优先使用 dirty + lazy rebuild
+- 第二阶段仅对简单值更新增加 patch in place
+
+### 7.4.3 哪些场景适合 patch，哪些更适合 dirty
+
+更适合 patch 的场景：
+
+- `SetCellValue`
+- 小范围 `update_range`
+- 不涉及行列位移的普通值更新
+
+更适合 dirty 重建的场景：
+
+- `insert rows` / `delete rows`
+- `insert columns` / `delete columns`
+- `move` / `rename sheet`
+- 大范围搬移
+- 会导致公式引用整体改写的结构变更
+
+原因是这些操作不仅改值，还会改变 block 的坐标边界和依赖关系。
+
 ## 7.5 增量失效，而不是整表清空
 
 未来应支持：
@@ -535,6 +722,43 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 
 - 整个文档 clear cache
 - 整个 sheet 重新全量 load
+
+### 7.5.1 版本与冲突控制
+
+若要在多 session 下安全共享 block，必须把共享 source store 与文档版本绑定。
+
+推荐做法：
+
+- session 打开文档时记录 `baseDocumentVersion`
+- session 提交时检查当前全局 `DocumentVersion`
+- 若一致，则允许合并 overlay
+- 若不一致，则按 block 级或 cell 级检测冲突
+
+推荐先实现：
+
+- block 级冲突检测
+
+原因：
+
+- 比整文档冲突更细
+- 又比 cell 级冲突简单得多
+
+### 7.5.2 block 更新后需要联动失效的缓存
+
+当某个 block 更新后，不仅 source store 本身要更新或标记 dirty，还需要同步处理依赖该 block 的派生缓存。
+
+至少包括：
+
+- `rangeCache`
+- `matchIndexCache`
+- `ifsMatchCache`
+- `rangeIndexCache`
+- 当前重算会话里的 `WorksheetCache` overlay
+
+否则会出现：
+
+- block 已更新
+- 但范围矩阵、lookup 索引或公式可见值仍然是旧数据
 
 ## 8. 推荐的缓存分层方案
 
@@ -591,6 +815,12 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 - 大 sheet 重算时不再频繁打 XML
 - 为场景 1 和场景 2 提供共同底座
 
+注意：
+
+- 这一层是共享的源数据基线
+- 不是 session 正在编辑中的未提交状态
+- session 的临时改动仍应由 overlay 层承载
+
 ### Layer D: Recalc Overlay And Result Cache
 
 载体：
@@ -614,6 +844,12 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 
 - 重算期间结果复用
 - 大量 lookup / range / criteria 快速命中
+
+这里需要特别强调：
+
+- `WorksheetCache` 最适合保留为 overlay cache
+- 即当前重算会话中“这个单元格现在最新值是什么”的覆盖层
+- 不再鼓励它继续承担大 sheet 全量 source cache 的职责
 
 ## 9. 方案优先级建议
 
@@ -665,6 +901,32 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 - 写操作、导出、结构调整仍需要 `xlsxWorksheet`
 - source store 应是“读优化层”，不是写模型替代层
 
+### 10.3.1 不能只保留 block cache，把其他缓存都删掉
+
+block cache 很重要，但它不能单独替代整个现有缓存体系。
+
+它只能解决：
+
+- 大 sheet 源数据如何低内存、可复用地保存
+
+它不能完整替代：
+
+- worksheet object cache：写路径、结构调整、导出仍需要完整模型
+- `calcCache`：公式结果缓存仍然必要
+- `rangeCache`：高频范围矩阵复用仍然有价值
+- lookup / index caches：哈希索引和条件匹配结果仍应保留
+- session overlay：未提交会话修改仍需要独立可见层
+
+因此正确方向不是：
+
+- block cache 替代一切
+
+而是：
+
+- block cache 替代“大 sheet 全量 source cache”这一错误职责
+- `WorksheetCache` 收缩为 overlay
+- 结果缓存、范围缓存、索引缓存继续保留并按需失效
+
 ### 10.4 跨用户共享必须带版本控制
 
 如果场景 1 要彻底成立，必须把 shared source store 与文档版本绑定。
@@ -693,3 +955,74 @@ estimatedCells = len(currentWs.SheetData.Row) * 50
 - 但必须补上一层“大 sheet source cache”
 - 并把 `WorksheetCache` 从“源数据 cache”收缩为“重算结果 overlay”
 - 这才是同时满足内存安全、全量重算性能、以及多用户共享场景的正确方向
+
+## 12. `WorksheetCache` 与 block cache 的直接对比
+
+为了避免误解，这里单独把两者做一个直接对照。
+
+### 12.1 之前的 `WorksheetCache` 是怎样的
+
+当前实现位于：
+
+- `worksheet_cache.go`
+
+核心结构：
+
+- `map[sheet]map[cellRef]formulaArg`
+
+主要行为：
+
+- `Get(sheet, cell)` / `Set(sheet, cell, value)`
+- `Delete(sheet, cell)`
+- `GetSheet(sheet)`
+- `LoadSheet(f, sheet)`
+
+它最初非常适合做这些事：
+
+- 批量重算期间保存最新公式结果
+- 让后续公式优先读取重算后的新值，而不是 XML 中旧值
+- 为 SUMIFS / INDEX-MATCH / AVERAGEIFS 等批量优化提供统一读口
+
+问题在于：
+
+- `LoadSheet()` 会把整张 sheet 的源数据复制成 per-cell map
+- key 使用 `A1` 这种字符串引用
+- value 使用 `formulaArg`
+- 对大 sheet 来说，map 和字符串 key 的开销很高
+
+因此它更像：
+
+- 单元格级覆盖层
+- 而不是适合大 sheet 的底层 source store
+
+### 12.2 `WorksheetCache` 与 block cache 的差异
+
+#### 粒度
+
+- `WorksheetCache`：单元格粒度
+- block cache：块粒度
+
+#### 数据结构
+
+- `WorksheetCache`：`map[sheet]map[cellRef]formulaArg`
+- block cache：更偏数字坐标 + 紧凑块结构
+
+#### 最适合承载的内容
+
+- `WorksheetCache`：最新值 overlay、已计算结果、会话内覆盖
+- block cache：大 sheet 原始源数据、跨请求复用的共享块
+
+#### 生命周期
+
+- `WorksheetCache`：更偏单轮重算 / 单 session
+- block cache：更偏文档基线 / 跨请求 / 跨用户共享
+
+#### 失效方式
+
+- `WorksheetCache`：更偏 `Clear()` / `ClearSheet()` 这种粗粒度清理
+- block cache：目标是 block 级 dirty 和懒重建
+
+#### 最终职责定位
+
+- `WorksheetCache`：保留为 overlay cache
+- block cache：新增为 source data cache
