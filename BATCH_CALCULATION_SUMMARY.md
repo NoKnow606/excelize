@@ -129,6 +129,38 @@ Date: 2026-04-24
 - 后者是“调用方指定一批 cell”的 batch calculation
 - 前者是“系统自己找出所有公式并按依赖批量重算”的 batch recalculation
 
+### 2.7 增量依赖重算：`RecalculateAffectedByColumns()` / `RecalculateAffectedByCellsWithExclusion()`
+
+位置：
+
+- `batch_dependency.go`
+
+核心思路：
+
+- 先基于更新输入定位受影响公式集合
+- 再构建过滤后的依赖图或受影响子图
+- 只清理受影响公式相关缓存
+- 最后复用 `calculateByDAG()` 执行增量重算
+
+主要入口包括：
+
+- `RecalculateAffectedByColumns(updatedColumns map[string]bool)`
+- `RecalculateAffectedByCellsWithExclusion(updatedCells, excludeCells map[string]bool)`
+
+它和全量依赖重算的区别在于：
+
+- 全量重算默认处理整个 workbook 的公式集合
+- 增量重算只处理受影响子集
+
+它和普通 batch API 的区别在于：
+
+- 输入不是“要算哪些目标 cell”
+- 而是“哪些源列 / 源单元格发生了变化”
+
+因此它更准确的定位是：
+
+- dependency-driven incremental batch recalculation
+
 ## 3. 当前设计的主要优点
 
 ### 3.1 批量写入路径简单直接，收益明确
@@ -181,6 +213,26 @@ Date: 2026-04-24
 - 它不是 `CalcCellValuesDependencyAware()` 的简单放大版
 - 也不是只靠 worker pool 的普通并发计算
 - 而是 DAG + batch optimization + cache overlay 的组合执行框架
+
+### 4.1 增量重算也不是普通 batch API
+
+`RecalculateAffectedByColumns()` 和 `RecalculateAffectedByCellsWithExclusion()` 虽然只处理公式子集，但它们仍然属于“重算引擎入口”，而不是简单的批量算值函数。
+
+原因是它们内部仍然会做：
+
+- 受影响范围分析
+- 反向依赖传播
+- 过滤依赖图构建
+- cache 定向失效
+- DAG 执行
+
+所以它们应被理解成：
+
+- 增量版的 batch recalculation
+
+而不是：
+
+- 对若干 cell 直接并发调用 `CalcCellValue()`
 
 ### 4.1 batch calculate 不是一个统一语义
 
@@ -321,6 +373,24 @@ Date: 2026-04-24
 - batch calculate 并不是对所有公式类型都完全同构
 - 调优或重构时必须把 SQL 公式单独考虑
 
+### 5.8 增量重算的“精度”依赖于依赖提取粒度
+
+当前增量路径会利用：
+
+- 普通 cell 依赖
+- `COLUMN:` 级依赖
+- `SHEET:` 级依赖（如 SQL formula 的源 sheet 标记）
+
+这意味着：
+
+- 增量重算不是总能做到精确最小集合
+- 某些场景会偏保守，宁可多算一些公式
+
+典型例子：
+
+- `SQL("select * from A")` 在 `A` sheet 有更新时会被视为受影响
+- 即使 SQL 实际只关心 `A` 的部分行列
+
 ## 6. 当前缺陷中最值得关注的点
 
 ### 6.1 batch 路径之间行为分叉较多
@@ -369,6 +439,19 @@ Date: 2026-04-24
 
 - 模式越多，维护成本越高
 - 很容易出现边缘公式没命中优化，或被错误归类
+
+### 6.4 增量路径容易受“粗粒度依赖”影响而扩大重算面
+
+尤其是以下两类依赖：
+
+- `COLUMN:` 虚拟列依赖
+- `SHEET:` SQL source 依赖
+
+它们很适合控制构图复杂度、保证不漏算。
+
+但代价是：
+
+- 一次很小的源数据变动，也可能触发较大一片公式重新进入增量重算
 
 ## 7. 对 block cache 方案的影响
 

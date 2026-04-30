@@ -59,6 +59,38 @@ Date: 2026-04-24
 
 `RecalculateAllWithDependency()` 的外层职责是“全量依赖重算”，而 batch calculate 是它的内部执行手段。
 
+除了全量路径，当前 DAG 体系还直接承载了两类增量重算入口：
+
+- 基于更新列的增量重算
+- 基于更新单元格的增量重算
+
+所以当前 DAG 执行体系不只是 full recalculation engine，也是 incremental recalculation engine。
+
+## 2.1 增量重算在 DAG 体系中的位置
+
+当前增量重算主要入口：
+
+- `RecalculateAffectedByColumns(updatedColumns map[string]bool)`
+- `RecalculateAffectedByCellsWithExclusion(updatedCells, excludeCells map[string]bool)`
+
+它们与全量重算共用的能力包括：
+
+- 依赖提取
+- 反向依赖传播
+- 依赖图构建
+- `calculateByDAG()`
+
+它们与全量重算不同的地方在于：
+
+- 不是对整个公式集合构图后全部执行
+- 而是先找出 `affected` 子集，再构建 filtered graph
+
+这使得 DAG 体系既服务：
+
+- full recalculation
+- sheet-scoped recalculation
+- incremental recalculation
+
 ## 3. 依赖图与分层逻辑
 
 ### 3.1 `dependencyGraph`
@@ -135,6 +167,26 @@ Date: 2026-04-24
 
 - 尽量检测
 - 然后做保守 fallback
+
+### 3.5 增量重算如何定位受影响公式
+
+当前增量路径并不是直接扫描“哪些公式需要重算”这么简单，而是会先建立反向依赖关系，再做传播。
+
+常见输入有两种：
+
+- 更新列：`updatedColumns`
+- 更新单元格：`updatedCells`
+
+传播过程中会使用的依赖标记包括：
+
+- `Sheet!Cell`
+- `COLUMN:Sheet!Col`
+- `SHEET:SheetName`
+
+因此：
+
+- 普通公式可以通过 cell / column 依赖传播命中
+- SQL formula 可以通过 `SHEET:` 源表依赖传播命中
 
 ## 4. `calculateByDAG()` 的实际执行模型
 
@@ -286,6 +338,26 @@ Date: 2026-04-24
 
 这与 Memory Summary 的方向是一致的。
 
+### 7.4 增量重算的“增量”是执行范围增量，不一定是依赖精度最小化
+
+这是理解当前实现时很容易忽略的一点：
+
+- 当前增量重算确实只执行受影响子图
+- 但“受影响”的判定可能是粗粒度的
+
+例如：
+
+- 列级依赖会放大影响范围
+- SQL formula 的 `SHEET:` 标记也会放大影响范围
+
+所以这里的优化目标更像：
+
+- 比全量重算少算很多
+
+而不是：
+
+- 永远算到理论上的最小精确集合
+
 ## 8. 风险与缺陷
 
 ### 8.1 依赖提取精度与图规模之间存在硬折中
@@ -380,6 +452,20 @@ Date: 2026-04-24
 代价是：
 
 - 任意一层失效不完整，都可能产生“算得快但结果旧”的问题
+
+### 8.8 增量重算正确性依赖反向依赖构建完整性
+
+增量路径的前提是：
+
+- 依赖提取足够覆盖真实数据来源
+- 反向依赖索引构建完整
+
+一旦某类公式的依赖标记漏建，问题会比全量重算更隐蔽，因为：
+
+- 全量重算还能兜底
+- 增量重算则可能直接漏算
+
+目前 SQL formula 通过 `SHEET:` 做了保守兜底，这就是典型的“宁可多算，不漏算”的策略。
 
 ## 9. 对 block cache / source store 的意义
 
