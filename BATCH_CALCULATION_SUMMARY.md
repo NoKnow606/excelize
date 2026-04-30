@@ -13,6 +13,25 @@ Date: 2026-04-24
 
 ## 2. 当前主要 batch 路径
 
+### 2.0 需要先说明：`RecalculateAllWithDependency()` 也属于一条 batch recalculation 路径
+
+虽然 `RecalculateAllWithDependency()` 在架构上更适合归类到 DAG 执行体系，但从执行内容看，它本质上也是当前最重要的一条 batch recalculation 路径。
+
+原因是它并不是“只做依赖拓扑调度”，而是会在 `calculateByDAG()` 中组合使用：
+
+- `preCalculateSimpleFormulas()`
+- `batchOptimizeLevelWithCache()`
+- `PreloadColumnRange()`
+- SUMIFS / INDEX-MATCH / AVERAGE(OFFSET) 的批量优化
+- 层内 `DAGScheduler`
+
+因此更准确的理解应该是：
+
+- `CalcCellValuesConcurrent()` / `CalcCellValuesDependencyAware()` 更像独立 batch API
+- `RecalculateAllWithDependency()` 更像“依赖图驱动的 batch recalculation engine entry”
+
+这也是为什么它既应出现在 DAG 文档里，也应在 batch calculation 文档里被单独点名。
+
 ### 2.1 批量写入：`SetCellValues()`
 
 位置：
@@ -72,7 +91,7 @@ Date: 2026-04-24
 - 与上一条类似
 - 但会把结果写回 worksheet，并可触发 `OnCellCalculated`
 
-### 2.5 DAG 路径中的“批量优化”
+### 2.5 DAG 路径中的“批量优化” 
 
 位置：
 
@@ -85,6 +104,30 @@ Date: 2026-04-24
 - 再交给 DAG scheduler 处理剩余计算
 
 这一条严格说属于 DAG 体系，但它本质上也是 batch calculate 的一部分，因此要和普通 batch API 区分开看。
+
+### 2.6 全量依赖重算：`RecalculateAllWithDependency()`
+
+位置：
+
+- `batch_dependency.go`
+
+核心思路：
+
+- 获取 `recalcMu`
+- 清理旧的 `calcCache` / `rangeCache`
+- 构建 workbook 级依赖图
+- 调用 `calculateByDAG()` 逐层执行
+
+它和普通 batch API 的区别在于：
+
+- 输入不是“某一批 cell 列表”
+- 而是“整个 workbook 中所有公式”
+- batch optimization 是其内部执行手段，而不是外部 API 语义本身
+
+它和 `CalcCellValuesDependencyAware()` 的关系可以概括为：
+
+- 后者是“调用方指定一批 cell”的 batch calculation
+- 前者是“系统自己找出所有公式并按依赖批量重算”的 batch recalculation
 
 ## 3. 当前设计的主要优点
 
@@ -125,6 +168,19 @@ Date: 2026-04-24
 这是很重要的实现细节。
 
 ## 4. 注意点
+
+### 4.0 不要把 `RecalculateAllWithDependency()` 和普通 batch API 混为一类
+
+这条路径虽然内部大量使用 batch 技术，但它的职责层次更高：
+
+- 普通 batch API 解决的是“给定一批 cell，如何更快算完”
+- `RecalculateAllWithDependency()` 解决的是“整本 workbook 如何按依赖顺序完成重算”
+
+因此：
+
+- 它不是 `CalcCellValuesDependencyAware()` 的简单放大版
+- 也不是只靠 worker pool 的普通并发计算
+- 而是 DAG + batch optimization + cache overlay 的组合执行框架
 
 ### 4.1 batch calculate 不是一个统一语义
 

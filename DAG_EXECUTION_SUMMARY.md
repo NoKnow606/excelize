@@ -20,6 +20,20 @@ Date: 2026-04-24
 - `RecalculateAffectedByColumns()`
 - `RecalculateAffectedByCellsWithExclusion()`
 
+这里需要特别说明：
+
+- `RecalculateAllWithDependency()` 虽然归类在 DAG 执行体系中
+- 但它内部并不是“纯 DAG 调度”
+- 而是组合了多段 batch calculation / batch optimization 逻辑
+
+因此它既是：
+
+- DAG execution entry
+
+也是：
+
+- 当前最重要的一条 batch recalculation path
+
 主干流程：
 
 1. 获取 `recalcMu`
@@ -38,6 +52,12 @@ Date: 2026-04-24
 - 层内动态依赖调度
 
 三者组合。
+
+这也是为什么它不能简单等同于：
+
+- `CalcCellValuesConcurrent()` 这种普通批量算值接口
+
+`RecalculateAllWithDependency()` 的外层职责是“全量依赖重算”，而 batch calculate 是它的内部执行手段。
 
 ## 3. 依赖图与分层逻辑
 
