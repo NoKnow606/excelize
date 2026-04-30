@@ -62,6 +62,278 @@ func TestSQLFormulaWithGIDResolverSpillsMatrix(t *testing.T) {
 	}
 }
 
+func TestSQLFormulaSupportsDerivedTableSubqueries(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Sales"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Sales", [][]interface{}{
+		{"Region", "Revenue"},
+		{"North", "10"},
+		{"South", "20"},
+		{"South", "5"},
+	})
+
+	f.SetSQLSourceResolver(SQLSourceResolverFunc(func(token string, sheetList []string) (string, error) {
+		switch unquoteIdentifier(token) {
+		case "gid_7":
+			return "Sales", nil
+		default:
+			return "", fmt.Errorf("unexpected token %s", token)
+		}
+	}))
+
+	formula := `SQL("select Region, sum(amount) as ""Total"" from (select ""Region"" as Region, cast(""Revenue"" as integer) as amount from gid_7) as source group by Region order by ""Total"" desc")`
+	if err := f.SetCellFormula("Report", "A1", formula); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	result, err := f.CalcCellValueWithMatrix("Report", "A1")
+	if err != nil {
+		t.Fatalf("CalcCellValueWithMatrix: %v", err)
+	}
+	if len(result.Matrix) != 3 {
+		t.Fatalf("expected header plus 2 rows, got %#v", result.Matrix)
+	}
+	if got := result.Matrix[0][0]; got != "Region" {
+		t.Fatalf("expected header Region, got %#v", got)
+	}
+	if got := result.Matrix[1][0]; got != "South" {
+		t.Fatalf("expected first data row South, got %#v", got)
+	}
+	if got := result.Matrix[1][1]; got != float64(25) {
+		t.Fatalf("expected South total 25, got %#v", got)
+	}
+	if got := result.Matrix[2][0]; got != "North" {
+		t.Fatalf("expected second data row North, got %#v", got)
+	}
+
+	sourceSheets := f.sqlFormulaSourceSheets(formula)
+	if len(sourceSheets) != 1 || sourceSheets[0] != "Sales" {
+		t.Fatalf("expected nested query dependency on Sales, got %#v", sourceSheets)
+	}
+}
+
+func TestSQLFormulaSupportsProvidedCleanedDataCTE(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Traffic"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Traffic", [][]interface{}{
+		{"店铺", "SPU分类", "主商品货号", "商品访客（访问）", "商品访客（添加至购物车）"},
+		{"Shop-A", "服饰", "SKU-1", "10", "2"},
+		{"Shop-A", "服饰", "SKU-2", "5", "1"},
+		{"Shop-A", "鞋类", "ABC", "3", "0"},
+		{"Shop-B", "服饰", "SKU-9", "-", "4"},
+	})
+
+	f.SetSQLSourceResolver(SQLSourceResolverFunc(func(token string, sheetList []string) (string, error) {
+		switch unquoteIdentifier(token) {
+		case "gid_0":
+			return "Traffic", nil
+		default:
+			return "", fmt.Errorf("unexpected token %s", token)
+		}
+	}))
+
+	formula := `SQL("
+WITH cleaned_data AS (
+    SELECT 
+        LOWER(""店铺"") AS shop,
+        ""SPU分类"" AS category,
+        CASE
+            WHEN INSTR(""主商品货号"", '-') > 0
+            THEN SUBSTR(""主商品货号"", 1, INSTR(""主商品货号"", '-') - 1)
+            ELSE ""主商品货号""
+        END AS main_product_sku,
+        CAST(""商品访客（访问）"" AS INTEGER) AS visit_amount,
+        CAST(""商品访客（添加至购物车）"" AS INTEGER) AS add_cart_amount
+    FROM gid_0
+    WHERE ""商品访客（访问）"" <> '-'
+)
+
+SELECT 
+    shop,
+    category,
+    main_product_sku AS ""主商品货号"",
+    SUM(visit_amount) AS visit_sum,
+    SUM(add_cart_amount) AS add_cart_sum,
+    shop || '-' || category || '-' || main_product_sku AS KID
+FROM cleaned_data
+GROUP BY 
+    shop, 
+    category, 
+    main_product_sku
+")`
+	if err := f.SetCellFormula("Report", "A1", formula); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	result, err := f.CalcCellValueWithMatrix("Report", "A1")
+	if err != nil {
+		t.Fatalf("CalcCellValueWithMatrix: %v", err)
+	}
+	if len(result.Matrix) != 3 {
+		t.Fatalf("expected header plus 2 rows, got %#v", result.Matrix)
+	}
+
+	rowsByKID := make(map[string][]interface{}, len(result.Matrix)-1)
+	for _, row := range result.Matrix[1:] {
+		rowsByKID[row[5].(string)] = row
+	}
+
+	row := rowsByKID["shop-a-服饰-SKU"]
+	if row == nil {
+		t.Fatalf("expected grouped row for shop-a-服饰-SKU, got %#v", result.Matrix)
+	}
+	if row[0] != "shop-a" || row[1] != "服饰" || row[2] != "SKU" || row[3] != float64(15) || row[4] != float64(3) {
+		t.Fatalf("unexpected grouped row for shop-a-服饰-SKU: %#v", row)
+	}
+
+	row = rowsByKID["shop-a-鞋类-ABC"]
+	if row == nil {
+		t.Fatalf("expected grouped row for shop-a-鞋类-ABC, got %#v", result.Matrix)
+	}
+	if row[0] != "shop-a" || row[1] != "鞋类" || row[2] != "ABC" || row[3] != float64(3) || row[4] != float64(0) {
+		t.Fatalf("unexpected grouped row for shop-a-鞋类-ABC: %#v", row)
+	}
+
+	sourceSheets := f.sqlFormulaSourceSheets(formula)
+	if len(sourceSheets) != 1 || sourceSheets[0] != "Traffic" {
+		t.Fatalf("expected CTE query dependency on Traffic, got %#v", sourceSheets)
+	}
+}
+
+func TestSQLFormulaSupportsProvidedBaseDataCTE(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Spend"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Spend", [][]interface{}{
+		{"店铺", "SPU分类", "主货号", "花费"},
+		{"马来站", "配件", "AA-1", "100"},
+		{"泰国站", "配件", "AA-2", "200"},
+		{"CN Shop", "箱包", "BB", "50.5"},
+	})
+
+	f.SetSQLSourceResolver(SQLSourceResolverFunc(func(token string, sheetList []string) (string, error) {
+		switch unquoteIdentifier(token) {
+		case "gid_2":
+			return "Spend", nil
+		default:
+			return "", fmt.Errorf("unexpected token %s", token)
+		}
+	}))
+
+	formula := `SQL("
+WITH base_data AS (
+    SELECT 
+        LOWER(""店铺"") AS shop,
+        ""SPU分类"" AS category,
+        CASE
+            WHEN INSTR(""主货号"", '-') > 0
+            THEN SUBSTR(""主货号"", 1, INSTR(""主货号"", '-') - 1)
+            ELSE ""主货号""
+        END AS main_sku_clean,
+        COALESCE(CAST(""花费"" AS REAL), 0) AS cost_amount,
+        LOWER(""店铺"") || '-' || ""SPU分类"" || '-' ||
+        CASE
+            WHEN INSTR(""主货号"", '-') > 0
+            THEN SUBSTR(""主货号"", 1, INSTR(""主货号"", '-') - 1)
+            ELSE ""主货号""
+        END AS KID
+    FROM gid_2
+)
+
+SELECT 
+    shop,
+    category,
+    main_sku_clean AS ""主货号"",
+    SUM(
+        CASE 
+            WHEN shop LIKE '%马来%' OR shop LIKE '%malaysia%' OR shop LIKE '%my%' 
+            THEN cost_amount * 1.08
+            WHEN shop LIKE '%泰国%' OR shop LIKE '%thailand%' OR shop LIKE '%th%' 
+            THEN cost_amount * 1.07
+            ELSE cost_amount
+        END
+    ) AS cost_sum,
+    KID
+FROM base_data
+GROUP BY 
+    shop, 
+    category, 
+    main_sku_clean, 
+    KID;
+")`
+	if err := f.SetCellFormula("Report", "A1", formula); err != nil {
+		t.Fatalf("SetCellFormula: %v", err)
+	}
+
+	result, err := f.CalcCellValueWithMatrix("Report", "A1")
+	if err != nil {
+		t.Fatalf("CalcCellValueWithMatrix: %v", err)
+	}
+	if len(result.Matrix) != 4 {
+		t.Fatalf("expected header plus 3 rows, got %#v", result.Matrix)
+	}
+
+	rowsByKID := make(map[string][]interface{}, len(result.Matrix)-1)
+	for _, row := range result.Matrix[1:] {
+		rowsByKID[row[4].(string)] = row
+	}
+
+	row := rowsByKID["马来站-配件-AA"]
+	if row == nil {
+		t.Fatalf("expected row for 马来站-配件-AA, got %#v", result.Matrix)
+	}
+	if row[0] != "马来站" || row[1] != "配件" || row[2] != "AA" || row[3] != float64(108) {
+		t.Fatalf("unexpected row for 马来站-配件-AA: %#v", row)
+	}
+
+	row = rowsByKID["泰国站-配件-AA"]
+	if row == nil {
+		t.Fatalf("expected row for 泰国站-配件-AA, got %#v", result.Matrix)
+	}
+	if row[0] != "泰国站" || row[1] != "配件" || row[2] != "AA" || row[3] != float64(214) {
+		t.Fatalf("unexpected row for 泰国站-配件-AA: %#v", row)
+	}
+
+	row = rowsByKID["cn shop-箱包-BB"]
+	if row == nil {
+		t.Fatalf("expected row for cn shop-箱包-BB, got %#v", result.Matrix)
+	}
+	if row[0] != "cn shop" || row[1] != "箱包" || row[2] != "BB" || row[3] != float64(50.5) {
+		t.Fatalf("unexpected row for cn shop-箱包-BB: %#v", row)
+	}
+
+	sourceSheets := f.sqlFormulaSourceSheets(formula)
+	if len(sourceSheets) != 1 || sourceSheets[0] != "Spend" {
+		t.Fatalf("expected CTE query dependency on Spend, got %#v", sourceSheets)
+	}
+}
+
 func TestSQLFormulaFindAffectedCellsByCellsTracksWholeSourceSheet(t *testing.T) {
 	f := NewFile()
 	defer f.Close()
