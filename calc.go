@@ -409,6 +409,19 @@ type formulaFuncs struct {
 	worksheetCache *WorksheetCache // 批量计算时使用的缓存
 }
 
+var formulaFuncNameReplacer = strings.NewReplacer("_XLFN.", "", "_xlfn.", "", "_XLWS.", "", "_xlws.", "", ".", "dot", "_", "")
+
+func normalizeFormulaFuncName(name string) string {
+	return formulaFuncNameReplacer.Replace(strings.ToUpper(name))
+}
+
+func currentFormulaFuncName(opfStack *Stack) string {
+	if opfStack == nil || opfStack.Len() == 0 {
+		return ""
+	}
+	return normalizeFormulaFuncName(opfStack.Peek().(efp.Token).TValue)
+}
+
 // CalcCellValue provides a function to get calculated cell value. This feature
 // is currently in working processing. Iterative calculation, implicit
 // intersection, explicit intersection, array formula, table formula and some
@@ -1238,7 +1251,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 						token.TValue = refTo
 					}
 					// parse reference: must reference at here
-					result, err := f.parseReference(ctx, sheet, token.TValue)
+					result, err := f.parseReference(ctx, sheet, token.TValue, currentFormulaFuncName(opfStack))
 					if err != nil {
 						return result, err
 					}
@@ -1250,7 +1263,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 					if refTo != "" {
 						token.TValue = refTo
 					}
-					result, err := f.parseReference(ctx, sheet, token.TValue)
+					result, err := f.parseReference(ctx, sheet, token.TValue, currentFormulaFuncName(opfStack))
 					if err != nil {
 						return result, err
 					}
@@ -1332,9 +1345,7 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 	}
 	prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack, argBaseStack.Peek().(int))
 	// call formula function to evaluate
-	funcName := opfStack.Peek().(efp.Token).TValue
-	funcName = strings.ToUpper(funcName)
-	funcName = strings.NewReplacer("_XLFN.", "", "_xlfn.", "", "_XLWS.", "", "_xlws.", "", ".", "dot", "_", "").Replace(funcName)
+	funcName := normalizeFormulaFuncName(opfStack.Peek().(efp.Token).TValue)
 	arg := callFuncByName(&formulaFuncs{f: f, sheet: sheet, cell: cell, ctx: ctx, worksheetCache: ctx.worksheetCache}, funcName,
 		[]reflect.Value{reflect.ValueOf(argsStack.Peek().(*list.List))})
 	if arg.Type == ArgError && opfStack.Len() == 1 {
@@ -2231,7 +2242,7 @@ func (f *File) parseToken(ctx *calcContext, sheet string, token efp.Token, opdSt
 			if refTo != "" {
 				token.TValue = refTo
 			}
-			result, err := f.parseReference(ctx, sheet, token.TValue)
+			result, err := f.parseReference(ctx, sheet, token.TValue, "")
 			if err != nil {
 				return errors.New(formulaErrorNAME)
 			}
@@ -2321,7 +2332,7 @@ func (cr *cellRange) prepareCellRange(col, row bool, cellRef cellRef) error {
 
 // parseReference parse reference and extract values by given reference
 // characters and default sheet name.
-func (f *File) parseReference(ctx *calcContext, sheet, reference string) (formulaArg, error) {
+func (f *File) parseReference(ctx *calcContext, sheet, reference, funcName string) (formulaArg, error) {
 	reference = strings.ReplaceAll(reference, "$", "")
 	ranges, cellRanges, cellRefs := strings.Split(reference, ":"), list.New(), list.New()
 	if len(ranges) > 1 {
@@ -2349,7 +2360,7 @@ func (f *File) parseReference(ctx *calcContext, sheet, reference string) (formul
 			}
 		}
 		cellRanges.PushBack(cr)
-		return f.rangeResolver(ctx, cellRefs, cellRanges)
+		return f.rangeResolver(ctx, cellRefs, cellRanges, funcName)
 	}
 	cellRef, _, _, err := parseRef(reference)
 	if err != nil {
@@ -2359,7 +2370,7 @@ func (f *File) parseReference(ctx *calcContext, sheet, reference string) (formul
 		cellRef.Sheet = sheet
 	}
 	cellRefs.PushBack(cellRef)
-	return f.rangeResolver(ctx, cellRefs, cellRanges)
+	return f.rangeResolver(ctx, cellRefs, cellRanges, funcName)
 }
 
 // prepareValueRange prepare value range.
@@ -2554,25 +2565,77 @@ func generateRangeCacheKey(sheet string, valueRange []int) string {
 	return b.String()
 }
 
-// optimizeValueRange intelligently truncates full-column references to the actual
-// maximum row with data, avoiding reading millions of empty cells.
-func (f *File) optimizeValueRange(sheet string, valueRange []int) []int {
-	// Check if this is a full-column reference (ends at TotalRows)
-	if valueRange[1] == TotalRows {
-		ws, err := f.workSheetReader(sheet)
-		if err == nil && len(ws.SheetData.Row) > 0 {
-			// Get actual max row number (not array length!)
-			// ws.SheetData.Row may be sparse (e.g., [Row1, Row5, Row100])
-			maxRow := 0
-			for _, row := range ws.SheetData.Row {
-				if row.R > maxRow {
-					maxRow = row.R
+type worksheetUsedBounds struct {
+	maxRow int
+	maxCol int
+}
+
+func shouldOptimizeValueRange(funcName string) bool {
+	switch funcName {
+	case "SUM", "AVERAGE", "AVERAGEA",
+		"COUNT", "COUNTA",
+		"MAX", "MAXA", "MIN", "MINA",
+		"PRODUCT",
+		"MEDIAN", "LARGE", "SMALL":
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *File) worksheetUsedBounds(sheet string) (worksheetUsedBounds, error) {
+	ws, err := f.workSheetReader(sheet)
+	if err != nil {
+		return worksheetUsedBounds{}, err
+	}
+	if ws.Dimension != nil && ws.Dimension.Ref != "" {
+		if coordinates, err := rangeRefToCoordinates(ws.Dimension.Ref); err == nil {
+			return worksheetUsedBounds{
+				maxRow: max(1, coordinates[3]),
+				maxCol: max(1, coordinates[2]),
+			}, nil
+		}
+	}
+
+	bounds := worksheetUsedBounds{maxRow: 1, maxCol: 1}
+	for rowIdx, row := range ws.SheetData.Row {
+		rowNum := row.R
+		if rowNum == 0 {
+			rowNum = rowIdx + 1
+		}
+		if rowNum > bounds.maxRow {
+			bounds.maxRow = rowNum
+		}
+		for cellIdx, cell := range row.C {
+			colNum := cellIdx + 1
+			if cell.R != "" {
+				if parsedCol, _, err := CellNameToCoordinates(cell.R); err == nil {
+					colNum = parsedCol
 				}
 			}
-			if maxRow > 0 && maxRow < TotalRows {
-				valueRange[1] = maxRow
+			if colNum > bounds.maxCol {
+				bounds.maxCol = colNum
 			}
 		}
+	}
+	return bounds, nil
+}
+
+// optimizeValueRange trims trailing empty worksheet area for aggregate
+// functions that are insensitive to omitted blank cells.
+func (f *File) optimizeValueRange(sheet string, valueRange []int, funcName string) []int {
+	if !shouldOptimizeValueRange(funcName) {
+		return valueRange
+	}
+	bounds, err := f.worksheetUsedBounds(sheet)
+	if err != nil {
+		return valueRange
+	}
+	if valueRange[1] > bounds.maxRow {
+		valueRange[1] = max(valueRange[0], bounds.maxRow)
+	}
+	if valueRange[3] > bounds.maxCol {
+		valueRange[3] = max(valueRange[2], bounds.maxCol)
 	}
 	return valueRange
 }
@@ -2937,7 +3000,7 @@ func (f *File) rangeResolverSerial(ctx *calcContext, sheet string, ws *xlsxWorks
 // rangeResolver extract value as string from given reference and range list.
 // This function will not ignore the empty cell. For example, A1:A2:A2:B3 will
 // be reference A1:B3.
-func (f *File) rangeResolver(ctx *calcContext, cellRefs, cellRanges *list.List) (arg formulaArg, err error) {
+func (f *File) rangeResolver(ctx *calcContext, cellRefs, cellRanges *list.List, funcName string) (arg formulaArg, err error) {
 	arg.cellRefs, arg.cellRanges = cellRefs, cellRanges
 
 	// value range order: from row, to row, from column, to column
@@ -2965,8 +3028,8 @@ func (f *File) rangeResolver(ctx *calcContext, cellRefs, cellRanges *list.List) 
 	if cellRanges.Len() > 0 {
 		arg.Type = ArgMatrix
 
-		// Optimize value range to avoid reading millions of empty cells
-		valueRange = f.optimizeValueRange(sheet, valueRange)
+		// Trim oversized blank tails for safe aggregate functions before matrix materialization.
+		valueRange = f.optimizeValueRange(sheet, valueRange, funcName)
 
 		// Check context range cache first (faster, per-formula cache)
 		cacheKey := generateRangeCacheKey(sheet, valueRange)
@@ -18862,7 +18925,7 @@ func (fn *formulaFuncs) INDIRECT(argsList *list.List) formulaArg {
 		}
 		return newStringFormulaArg(value)
 	}
-	arg, _ := fn.f.parseReference(fn.ctx, fn.sheet, fromRef+":"+toRef)
+	arg, _ := fn.f.parseReference(fn.ctx, fn.sheet, fromRef+":"+toRef, "")
 	return arg
 }
 
