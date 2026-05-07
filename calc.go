@@ -2588,16 +2588,15 @@ func (f *File) worksheetUsedBounds(sheet string) (worksheetUsedBounds, error) {
 	if err != nil {
 		return worksheetUsedBounds{}, err
 	}
+	bounds := worksheetUsedBounds{maxRow: 1, maxCol: 1}
 	if ws.Dimension != nil && ws.Dimension.Ref != "" {
 		if coordinates, err := rangeRefToCoordinates(ws.Dimension.Ref); err == nil {
-			return worksheetUsedBounds{
+			bounds = worksheetUsedBounds{
 				maxRow: max(1, coordinates[3]),
 				maxCol: max(1, coordinates[2]),
-			}, nil
+			}
 		}
 	}
-
-	bounds := worksheetUsedBounds{maxRow: 1, maxCol: 1}
 	for rowIdx, row := range ws.SheetData.Row {
 		rowNum := row.R
 		if rowNum == 0 {
