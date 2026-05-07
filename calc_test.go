@@ -6711,7 +6711,7 @@ func TestCalcRangeResolver(t *testing.T) {
 		From: cellRef{Col: 1, Row: 1, Sheet: "SheetN"},
 		To:   cellRef{Col: 1, Row: TotalRows, Sheet: "SheetN"},
 	})
-	_, err := f.rangeResolver(&calcContext{}, cellRefs, cellRanges, "")
+	_, err := f.rangeResolver(&calcContext{}, cellRefs, cellRanges)
 	assert.EqualError(t, err, "sheet SheetN does not exist")
 
 	ws, err := f.workSheetReader("Sheet1")
@@ -6723,18 +6723,18 @@ func TestCalcRangeResolver(t *testing.T) {
 		From: cellRef{Col: 3, Row: TotalRows, Sheet: "Sheet1"},
 		To:   cellRef{Col: 3, Row: TotalRows + 1, Sheet: "Sheet1"},
 	})
-	_, err = f.rangeResolver(&calcContext{}, cellRefs, cellRanges, "")
+	_, err = f.rangeResolver(&calcContext{}, cellRefs, cellRanges)
 	assert.Equal(t, ErrMaxRows, err)
 
 	// Test extract value from references with invalid references
 	cellRanges.Init()
 	cellRefs.PushBack(cellRef{Col: 1, Row: 1, Sheet: "SheetN"})
-	_, err = f.rangeResolver(&calcContext{}, cellRefs, cellRanges, "")
+	_, err = f.rangeResolver(&calcContext{}, cellRefs, cellRanges)
 	assert.EqualError(t, err, "sheet SheetN does not exist")
 
 	cellRefs.Init()
 	cellRefs.PushBack(cellRef{Col: 1, Row: TotalRows + 1, Sheet: "SheetN"})
-	_, err = f.rangeResolver(&calcContext{}, cellRefs, cellRanges, "")
+	_, err = f.rangeResolver(&calcContext{}, cellRefs, cellRanges)
 	assert.Equal(t, ErrMaxRows, err)
 }
 
