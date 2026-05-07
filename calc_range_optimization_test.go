@@ -1,22 +1,48 @@
 package excelize
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
+type parsedRangeCacheKey struct {
+	sheet          string
+	fromRow, toRow int
+	fromCol, toCol int
+}
+
+func parseRangeCacheKey(t *testing.T, key string) parsedRangeCacheKey {
+	t.Helper()
+
+	parts := strings.SplitN(key, "!", 2)
+	require.Len(t, parts, 2, "unexpected range cache key format %q", key)
+
+	var parsed parsedRangeCacheKey
+	parsed.sheet = parts[0]
+	_, err := fmt.Sscanf(parts[1], "R%dC%d:R%dC%d", &parsed.fromRow, &parsed.fromCol, &parsed.toRow, &parsed.toCol)
+	require.NoError(t, err, "unexpected range cache key format %q", key)
+	return parsed
+}
+
 func requireTrimmedRangeCacheKey(t *testing.T, f *File, expectedKey string) {
 	t.Helper()
 
+	expected := parseRangeCacheKey(t, expectedKey)
 	foundOptimized := false
 	f.rangeCache.Range(func(key string, value interface{}) bool {
-		if strings.Contains(key, "R1000000") {
-			t.Fatalf("expected trimmed range cache key, found oversized cache key %q", key)
-		}
+		parsed := parseRangeCacheKey(t, key)
 		if key == expectedKey {
 			foundOptimized = true
+		}
+		if parsed.sheet == expected.sheet &&
+			parsed.fromRow == expected.fromRow &&
+			parsed.fromCol == expected.fromCol &&
+			parsed.toCol == expected.toCol &&
+			parsed.toRow > expected.toRow {
+			t.Fatalf("expected trimmed range cache key not to exceed %q, got %q", expectedKey, key)
 		}
 		return true
 	})
@@ -36,17 +62,23 @@ func TestCalcRangeOptimizationClampsBoundedSumRangeToWorksheetBounds(t *testing.
 	require.Equal(t, "15", got)
 
 	optimizedKey := "Sheet1!R3C12:R10C12"
+	expected := parseRangeCacheKey(t, optimizedKey)
 	foundOptimized := false
 	f.rangeCache.Range(func(key string, value interface{}) bool {
-		if strings.Contains(key, "R1000000") {
-			t.Fatalf("expected SUM range cache to be trimmed, found oversized cache key %q", key)
-		}
+		parsed := parseRangeCacheKey(t, key)
 		if key == optimizedKey {
 			foundOptimized = true
 			matrix, ok := value.([][]formulaArg)
 			require.True(t, ok, "range cache value should store the materialized matrix")
 			require.Len(t, matrix, 8)
 			require.Len(t, matrix[0], 1)
+		}
+		if parsed.sheet == expected.sheet &&
+			parsed.fromRow == expected.fromRow &&
+			parsed.fromCol == expected.fromCol &&
+			parsed.toCol == expected.toCol &&
+			parsed.toRow > expected.toRow {
+			t.Fatalf("expected SUM range cache key not to exceed %q, got %q", optimizedKey, key)
 		}
 		return true
 	})
@@ -83,13 +115,19 @@ func TestCalcRangeOptimizationClampsMoreSafeAggregateFunctions(t *testing.T) {
 			require.Equal(t, tt.expected, got)
 
 			optimizedKey := "Sheet1!R3C12:R10C12"
+			expected := parseRangeCacheKey(t, optimizedKey)
 			foundOptimized := false
 			f.rangeCache.Range(func(key string, value interface{}) bool {
-				if strings.Contains(key, "R1000000") {
-					t.Fatalf("expected %s range cache to be trimmed, found oversized cache key %q", tt.name, key)
-				}
+				parsed := parseRangeCacheKey(t, key)
 				if key == optimizedKey {
 					foundOptimized = true
+				}
+				if parsed.sheet == expected.sheet &&
+					parsed.fromRow == expected.fromRow &&
+					parsed.fromCol == expected.fromCol &&
+					parsed.toCol == expected.toCol &&
+					parsed.toRow > expected.toRow {
+					t.Fatalf("expected %s range cache key not to exceed %q, got %q", tt.name, optimizedKey, key)
 				}
 				return true
 			})
