@@ -481,6 +481,57 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 	}
 
 	result, err := f.CalcCellValueWithMatrix(sheet, cellName, Options{RawCellValue: true})
+	if err != nil {
+		// Keep the original behavior: still attempt to write the spill range below
+		// using whatever Matrix the calc engine returned (may be empty); the caller
+		// has already received the error via the matrix result. Errors from
+		// CalcCellValueWithMatrix are intentionally swallowed here so persistence
+		// can fall back to the scalar fallbackValue when the matrix is empty.
+		_ = err
+	}
+	return f.applySQLFormulaMatrix(sheet, cellName, fallbackValue, result, worksheetCache, updateCaches, notify)
+}
+
+// persistSQLFormulaResultWithMatrix writes a precomputed SQL spill matrix into
+// the workbook without re-executing the SQL query. This is the recommended hot
+// path for callers that already produced a matrix via CalcCellValueWithMatrix
+// (e.g. CalcCellValues), because re-running the same SQL multiple times
+// allocates a new in-memory SQLite database and re-materializes every source
+// worksheet on each invocation.
+func (f *File) persistSQLFormulaResultWithMatrix(sheet, cellName, fallbackValue string, result CalcCellValueWithMatrixResult, worksheetCache *WorksheetCache, updateCaches, notify bool) bool {
+	formula, err := f.GetCellFormula(sheet, cellName)
+	if err != nil || !IsSQLFormula(formula) {
+		return false
+	}
+	return f.applySQLFormulaMatrix(sheet, cellName, fallbackValue, result, worksheetCache, updateCaches, notify)
+}
+
+// PersistSQLFormulaResultWithMatrix writes a precomputed SQL spill matrix into
+// the workbook for the given anchor cell, mirroring what UpdateSheetFormulaCache
+// does for SQL formulas but without re-executing the SQL query.
+//
+// Callers that have already executed the query (e.g. via ExecuteSQL or
+// CalcCellValueWithMatrix) can pass the resulting matrix directly to this
+// method to persist the spill range and the cached top-left value. This avoids
+// a second materialization of every source worksheet into a fresh in-memory
+// SQLite database, which is otherwise the dominant memory cost of saving a
+// workbook that contains SQL formulas.
+//
+// The cell at cellName must already contain the SQL formula (typically set
+// via SetCellFormula) before calling this method. fallbackValue is written
+// when the matrix is empty so that the cell still receives a sensible value.
+//
+// Returns true if the cell holds a SQL formula and the spill range was
+// applied (or the fallback was written); returns false if the cell does not
+// contain a SQL formula, in which case the caller should fall back to the
+// regular non-SQL persistence path.
+func (f *File) PersistSQLFormulaResultWithMatrix(sheet, cellName, fallbackValue string, result CalcCellValueWithMatrixResult) bool {
+	return f.persistSQLFormulaResultWithMatrix(sheet, cellName, fallbackValue, result, nil, false, false)
+}
+
+// applySQLFormulaMatrix writes the spill range produced by a SQL formula into
+// the worksheet. It does not execute SQL; the caller must supply the matrix.
+func (f *File) applySQLFormulaMatrix(sheet, cellName, fallbackValue string, result CalcCellValueWithMatrixResult, worksheetCache *WorksheetCache, updateCaches, notify bool) bool {
 	f.mu.Lock()
 	ws, err := f.workSheetReader(sheet)
 	f.mu.Unlock()
@@ -503,7 +554,7 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 		oldRef = c.F.Ref
 	}
 
-	if err != nil || len(result.Matrix) == 0 || len(result.Matrix[0]) == 0 {
+	if len(result.Matrix) == 0 || len(result.Matrix[0]) == 0 {
 		if oldRef != "" {
 			clearWorksheetRangeValues(ws, oldRef, cellName)
 		}

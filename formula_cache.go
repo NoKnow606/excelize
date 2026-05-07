@@ -113,16 +113,21 @@ func (f *File) UpdateSheetFormulaCache(sheet string) error {
 	}
 
 	// Phase 3: Update cached values.
+	// Note: SQL formulas are already persisted (including their spill range)
+	// inside CalcCellValues, so we must not run persistFormulaResult on them
+	// here — doing so would re-execute the SQL query through
+	// persistSQLFormulaResult -> CalcCellValueWithMatrix and re-materialize the
+	// source worksheets into a fresh in-memory SQLite database. That redundant
+	// pass was the dominant cause of memory blow-up for SQL-heavy workbooks.
 	for _, fc := range formulas {
-		if value, ok := results[fc.cell]; ok {
-			f.persistFormulaResult(sheet, fc.cell, value, nil, false, false)
-			continue
-		}
 		formula, ferr := f.GetCellFormula(sheet, fc.cell)
-		if ferr != nil || !IsSQLFormula(formula) {
+		if ferr == nil && IsSQLFormula(formula) {
 			continue
 		}
-		value, _ := f.CalcCellValue(sheet, fc.cell, Options{RawCellValue: true})
+		value, ok := results[fc.cell]
+		if !ok {
+			continue
+		}
 		f.persistFormulaResult(sheet, fc.cell, value, nil, false, false)
 	}
 
