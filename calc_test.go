@@ -5222,6 +5222,7 @@ func TestCalcCOVAR(t *testing.T) {
 		assert.Equal(t, expected[0], result, formula)
 		assert.EqualError(t, err, expected[1], formula)
 	}
+
 }
 
 func TestCalcUniqueExactlyOnce(t *testing.T) {
@@ -5700,6 +5701,18 @@ func TestCalcGROWTHandTREND(t *testing.T) {
 		assert.Equal(t, expected[0], result, formula)
 		assert.EqualError(t, err, expected[1], formula)
 	}
+
+	// Regression: replacing a formula that cached an empty-string result must also
+	// clear the simple "Sheet!Cell" calcCache entry, otherwise the next formula
+	// can incorrectly reuse the stale empty result and lose its error value.
+	assert.NoError(t, f.SetCellFormula("Sheet1", "C1", "TREND(A4:A5,A2:B3)"))
+	result, err := f.CalcCellValue("Sheet1", "C1")
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+	assert.NoError(t, f.SetCellFormula("Sheet1", "C1", "TREND(C1:C1,C1:C1)"))
+	result, err = f.CalcCellValue("Sheet1", "C1")
+	assert.Equal(t, "#VALUE!", result)
+	assert.EqualError(t, err, "#VALUE!")
 }
 
 func TestCalcHLOOKUP(t *testing.T) {

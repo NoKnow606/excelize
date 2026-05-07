@@ -1,21 +1,19 @@
 package excelize
 
 import (
-	"fmt"
+	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-// TestListSheets 列出文件中的所有表
 func TestListSheets(t *testing.T) {
-	f, err := OpenFile("/Users/zhoujielun/Downloads/跨境电商-补货计划demo-8.xlsx")
+	f, err := OpenFile(filepath.Join("test", "TestListSheets.xlsx"))
+	assert.NoError(t, err)
 	if err != nil {
-		t.Fatalf("打开文件失败: %v", err)
+		return
 	}
 	defer f.Close()
 
-	fmt.Println("\n=== 文件中的所有工作表 ===")
-	sheets := f.GetSheetList()
-	for i, sheet := range sheets {
-		fmt.Printf("%d. '%s'\n", i+1, sheet)
-	}
+	assert.Equal(t, []string{"Sheet1", "Sheet2", "Sheet3"}, f.GetSheetList())
 }
