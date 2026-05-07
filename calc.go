@@ -1051,15 +1051,28 @@ func (f *File) CalcCellValues(sheet string, cells []string, opts ...Options) (ma
 
 	// Calculate all cells, benefiting from cache.
 	// SQL formulas are persisted back to the worksheet so spill ranges and cached
-	// values survive subsequent reads and saves.
+	// values survive subsequent reads and saves. For SQL formulas we ask for the
+	// matrix result directly and reuse it for persistence so the SQL query only
+	// runs once per cell — re-running it through CalcCellValue + persistFormulaResult
+	// (which would re-invoke CalcCellValueWithMatrix) would double the SQL/SQLite
+	// materialization cost on every call.
 	for _, cell := range cells {
 		formula, ferr := f.GetCellFormula(sheet, cell)
 		isSQLFormula := ferr == nil && IsSQLFormula(formula)
 
-		result, err := f.CalcCellValue(sheet, cell, opts...)
 		if isSQLFormula {
-			f.persistFormulaResult(sheet, cell, result, nil, false, false)
+			matrixResult, mErr := f.CalcCellValueWithMatrix(sheet, cell, opts...)
+			value := matrixResult.Value
+			f.persistSQLFormulaResultWithMatrix(sheet, cell, value, matrixResult, nil, false, false)
+			if mErr != nil {
+				errors = append(errors, fmt.Errorf("failed to calculate %s: %w", cell, mErr))
+				continue
+			}
+			results[cell] = value
+			continue
 		}
+
+		result, err := f.CalcCellValue(sheet, cell, opts...)
 		if err != nil {
 			errors = append(errors, fmt.Errorf("failed to calculate %s: %w", cell, err))
 			continue

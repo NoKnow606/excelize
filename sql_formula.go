@@ -8,10 +8,22 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
 
 	_ "modernc.org/sqlite"
 )
+
+// sqlExecuteCount counts how many times ExecuteSQL has been invoked process-wide.
+// Useful for benchmarking and verifying that callers (e.g. cache persistence)
+// do not redundantly re-execute the same SQL formula.
+var sqlExecuteCount uint64
+
+// SQLExecuteCount returns the cumulative number of ExecuteSQL invocations.
+func SQLExecuteCount() uint64 { return atomic.LoadUint64(&sqlExecuteCount) }
+
+// ResetSQLExecuteCount resets the ExecuteSQL invocation counter to zero.
+func ResetSQLExecuteCount() { atomic.StoreUint64(&sqlExecuteCount, 0) }
 
 var (
 	errSQLFormulaEmptyQuery          = errors.New("SQL formula query cannot be empty")
@@ -79,9 +91,20 @@ func IsSQLFormula(formula string) bool {
 	return strings.HasPrefix(strings.ToUpper(trimmed), "SQL(")
 }
 
-// CompileSQL compiles a SQL formula or raw SQL query against workbook sheets.
+// CompileSQL validates a SQL formula or raw SQL query against the workbook
+// schema (worksheet → table mapping and header columns) without materializing
+// any data. It opens an in-memory SQLite database, creates one empty table per
+// source worksheet (using only the header row, read in streaming fashion), and
+// asks SQLite to prepare the query so that syntax and identifier resolution
+// are still validated.
+//
+// This is significantly cheaper than executing the query: for a workbook whose
+// source worksheets contain hundreds of thousands of rows, it avoids the
+// expensive GetRows()/[][]string materialization plus the per-row INSERTs into
+// SQLite. Callers that need data-level validation (e.g. "does this query
+// actually return at least one row?") should use ExecuteSQL instead.
 func (f *File) CompileSQL(sqlInput string) (*SQLCompileResult, error) {
-	prepared, err := f.prepareSQL(sqlInput)
+	prepared, err := f.prepareSQLSchemaOnly(sqlInput)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +120,7 @@ func (f *File) CompileSQL(sqlInput string) (*SQLCompileResult, error) {
 
 // ExecuteSQL executes a SQL formula or raw SQL query against workbook sheets.
 func (f *File) ExecuteSQL(sqlInput string) (*SQLQueryResult, error) {
+	atomic.AddUint64(&sqlExecuteCount, 1)
 	prepared, err := f.prepareSQL(sqlInput)
 	if err != nil {
 		return nil, err
@@ -227,6 +251,18 @@ func interfaceToFormulaArg(value interface{}) formulaArg {
 }
 
 func (f *File) prepareSQL(sqlInput string) (*preparedSQL, error) {
+	return f.prepareSQLInternal(sqlInput, false)
+}
+
+// prepareSQLSchemaOnly behaves like prepareSQL but skips inserting data rows
+// into the in-memory SQLite database. Source worksheet headers are read in a
+// streaming fashion (only the first row is loaded), enough to let SQLite
+// validate the query syntax and column references during db.Prepare.
+func (f *File) prepareSQLSchemaOnly(sqlInput string) (*preparedSQL, error) {
+	return f.prepareSQLInternal(sqlInput, true)
+}
+
+func (f *File) prepareSQLInternal(sqlInput string, schemaOnly bool) (*preparedSQL, error) {
 	query, err := extractSQLInput(sqlInput)
 	if err != nil {
 		return nil, err
@@ -246,7 +282,7 @@ func (f *File) prepareSQL(sqlInput string) (*preparedSQL, error) {
 		return nil, fmt.Errorf("open in-memory sqlite: %w", err)
 	}
 
-	headersByTable, err := materializeSheets(db, f, sources)
+	headersByTable, err := materializeSheets(db, f, sources, schemaOnly)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -675,14 +711,22 @@ func resolveSQLSourceName(token string, sheetList []string, resolver SQLSourceRe
 	return "", fmt.Errorf("worksheet %q was not found", identifier)
 }
 
-func materializeSheets(db *sql.DB, f *File, sources []sqlResolvedSource) (map[string][]string, error) {
+func materializeSheets(db *sql.DB, f *File, sources []sqlResolvedSource, schemaOnly bool) (map[string][]string, error) {
 	headersByTable := make(map[string][]string, len(sources))
 	for _, source := range sources {
 		if _, ok := headersByTable[source.TableName]; ok {
 			continue
 		}
 
-		headers, err := materializeSheet(db, f, source.TableName, source.SheetName)
+		var (
+			headers []string
+			err     error
+		)
+		if schemaOnly {
+			headers, err = materializeSheetSchema(db, f, source.TableName, source.SheetName)
+		} else {
+			headers, err = materializeSheet(db, f, source.TableName, source.SheetName)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -690,6 +734,41 @@ func materializeSheets(db *sql.DB, f *File, sources []sqlResolvedSource) (map[st
 	}
 
 	return headersByTable, nil
+}
+
+// materializeSheetSchema creates an empty in-memory SQL table whose columns
+// match the first row of the given worksheet. It uses the streaming Rows()
+// iterator and stops after reading just the header row so that data rows are
+// never loaded into memory. This is the fast path used by CompileSQL for
+// schema-level validation.
+func materializeSheetSchema(db *sql.DB, f *File, tableName string, sheetName string) ([]string, error) {
+	rows, err := f.Rows(sheetName)
+	if err != nil {
+		return nil, fmt.Errorf("read source worksheet %q: %w", sheetName, err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Error(); err != nil {
+			return nil, fmt.Errorf("read source worksheet %q: %w", sheetName, err)
+		}
+		return nil, fmt.Errorf("source worksheet %q is empty", sheetName)
+	}
+	headerRow, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("read header row for worksheet %q: %w", sheetName, err)
+	}
+
+	headers := buildSQLHeaders([][]string{headerRow})
+	if len(headers) == 0 {
+		return nil, fmt.Errorf("source worksheet %q has no usable columns", sheetName)
+	}
+
+	createSQL := buildCreateTableSQL(tableName, headers)
+	if _, err := db.Exec(createSQL); err != nil {
+		return nil, fmt.Errorf("create in-memory SQL table: %w", err)
+	}
+	return headers, nil
 }
 
 func buildSQLSourceBindings(sources []sqlResolvedSource) []SQLSourceBinding {
