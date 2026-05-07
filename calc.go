@@ -2596,8 +2596,11 @@ func (f *File) optimizeValueRange(sheet string, valueRange []int) []int {
 func (f *File) clearCellCache(sheet, cell string) {
 	ref := fmt.Sprintf("%s!%s", sheet, cell)
 
-	// Clear calcCache for this cell
-	// Need to clear both raw and formatted cache entries
+	// Clear calcCache for this cell.
+	// We store both the simple "Sheet!Cell" token cache and the raw/formatted
+	// string caches, so all variants must be invalidated when a formula/value is
+	// replaced in place.
+	f.calcCache.Delete(ref)
 	f.calcCache.Delete(fmt.Sprintf("%s!raw=true", ref))
 	f.calcCache.Delete(fmt.Sprintf("%s!raw=false", ref))
 
