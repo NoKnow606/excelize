@@ -6,6 +6,60 @@ import (
 	"testing"
 )
 
+func TestSQLExecutionBackendOverridesSQLitePath(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	var received string
+	f.SetSQLExecutionBackend(SQLExecutionBackendFunc(func(sqlInput string) (*SQLQueryResult, error) {
+		received = sqlInput
+		return &SQLQueryResult{
+			Columns: []string{"source", "value"},
+			Matrix: [][]interface{}{
+				{"source", "value"},
+				{"postgres", float64(42)},
+			},
+			SourceSheet: "Data",
+		}, nil
+	}))
+
+	result, err := f.ExecuteSQL(`select * from gid_0`)
+	if err != nil {
+		t.Fatalf("ExecuteSQL: %v", err)
+	}
+	if received != `select * from gid_0` {
+		t.Fatalf("backend received %q", received)
+	}
+	if got := result.Matrix[1][0]; got != "postgres" {
+		t.Fatalf("expected backend result, got %#v", got)
+	}
+}
+
+func TestSQLExecutionBackendUnsupportedFallsBackToSQLite(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Name", "Amount"},
+		{"fallback", 7},
+	})
+	f.SetSQLExecutionBackend(SQLExecutionBackendFunc(func(sqlInput string) (*SQLQueryResult, error) {
+		return nil, ErrSQLExecutionBackendUnsupported
+	}))
+
+	result, err := f.ExecuteSQL(`select "Name", "Amount" from "Data"`)
+	if err != nil {
+		t.Fatalf("ExecuteSQL fallback: %v", err)
+	}
+	if got := result.Matrix[1][0]; got != "fallback" {
+		t.Fatalf("expected SQLite fallback result, got %#v", got)
+	}
+}
+
 func TestSQLFormulaWithGIDResolverSpillsMatrix(t *testing.T) {
 	f := NewFile()
 	defer f.Close()

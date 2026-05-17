@@ -26,8 +26,9 @@ func SQLExecuteCount() uint64 { return atomic.LoadUint64(&sqlExecuteCount) }
 func ResetSQLExecuteCount() { atomic.StoreUint64(&sqlExecuteCount, 0) }
 
 var (
-	errSQLFormulaEmptyQuery          = errors.New("SQL formula query cannot be empty")
-	errSQLFormulaOnlySelectSupported = errors.New("only single SELECT statements are supported")
+	errSQLFormulaEmptyQuery           = errors.New("SQL formula query cannot be empty")
+	errSQLFormulaOnlySelectSupported  = errors.New("only single SELECT statements are supported")
+	ErrSQLExecutionBackendUnsupported = errors.New("SQL execution backend unsupported")
 )
 
 // SQLSourceResolver resolves SQL source tokens such as worksheet names or gid_*
@@ -42,6 +43,19 @@ type SQLSourceResolverFunc func(token string, sheetList []string) (string, error
 // ResolveSQLSource implements SQLSourceResolver.
 func (fn SQLSourceResolverFunc) ResolveSQLSource(token string, sheetList []string) (string, error) {
 	return fn(token, sheetList)
+}
+
+// SQLExecutionBackend executes SQL outside the built-in workbook/SQLite path.
+type SQLExecutionBackend interface {
+	ExecuteSQL(sqlInput string) (*SQLQueryResult, error)
+}
+
+// SQLExecutionBackendFunc adapts a function into SQLExecutionBackend.
+type SQLExecutionBackendFunc func(sqlInput string) (*SQLQueryResult, error)
+
+// ExecuteSQL implements SQLExecutionBackend.
+func (fn SQLExecutionBackendFunc) ExecuteSQL(sqlInput string) (*SQLQueryResult, error) {
+	return fn(sqlInput)
 }
 
 // SQLQueryResult contains the SQL result matrix, including the header row.
@@ -121,6 +135,15 @@ func (f *File) CompileSQL(sqlInput string) (*SQLCompileResult, error) {
 // ExecuteSQL executes a SQL formula or raw SQL query against workbook sheets.
 func (f *File) ExecuteSQL(sqlInput string) (*SQLQueryResult, error) {
 	atomic.AddUint64(&sqlExecuteCount, 1)
+	if f.sqlExecutionBackend != nil {
+		result, err := f.sqlExecutionBackend.ExecuteSQL(sqlInput)
+		if err == nil {
+			return result, nil
+		}
+		if !errors.Is(err, ErrSQLExecutionBackendUnsupported) {
+			return nil, err
+		}
+	}
 	prepared, err := f.prepareSQL(sqlInput)
 	if err != nil {
 		return nil, err
