@@ -759,10 +759,7 @@ func materializeSheetSchema(db *sql.DB, f *File, tableName string, sheetName str
 		return nil, fmt.Errorf("read header row for worksheet %q: %w", sheetName, err)
 	}
 
-	headers, err := buildSQLHeaders([][]string{headerRow})
-	if err != nil {
-		return nil, fmt.Errorf("build SQL headers for worksheet %q: %w", sheetName, err)
-	}
+	headers := buildSQLHeaders([][]string{headerRow})
 	if len(headers) == 0 {
 		return nil, fmt.Errorf("source worksheet %q has no usable columns", sheetName)
 	}
@@ -794,10 +791,7 @@ func materializeSheet(db *sql.DB, f *File, tableName string, sheetName string) (
 		return nil, fmt.Errorf("source worksheet %q is empty", sheetName)
 	}
 
-	headers, err := buildSQLHeaders(rows)
-	if err != nil {
-		return nil, fmt.Errorf("build SQL headers for worksheet %q: %w", sheetName, err)
-	}
+	headers := buildSQLHeaders(rows)
 	if len(headers) == 0 {
 		return nil, fmt.Errorf("source worksheet %q has no usable columns", sheetName)
 	}
@@ -850,7 +844,7 @@ func materializeSheet(db *sql.DB, f *File, tableName string, sheetName string) (
 	return headers, nil
 }
 
-func buildSQLHeaders(rows [][]string) ([]string, error) {
+func buildSQLHeaders(rows [][]string) []string {
 	maxCols := 0
 	for _, row := range rows {
 		if len(row) > maxCols {
@@ -858,8 +852,7 @@ func buildSQLHeaders(rows [][]string) ([]string, error) {
 		}
 	}
 
-	used := make(map[string]struct{}, maxCols)
-	nextSuffix := make(map[string]int, maxCols)
+	seen := make(map[string]int)
 	headers := make([]string, 0, maxCols)
 	for colIdx := 0; colIdx < maxCols; colIdx++ {
 		header := ""
@@ -870,37 +863,15 @@ func buildSQLHeaders(rows [][]string) ([]string, error) {
 			header = fmt.Sprintf("_col_%s", sqlColumnIndexToLetter(colIdx))
 		}
 
-		baseHeader := header
-		baseKey := strings.ToLower(baseHeader)
-		headerKey := baseKey
-		if _, exists := used[headerKey]; exists {
-			suffix := nextSuffix[baseKey]
-			if suffix < 2 {
-				suffix = 2
-			}
-			maxSuffix := maxCols + 1
-			for suffix <= maxSuffix {
-				candidate := fmt.Sprintf("%s__%d", baseHeader, suffix)
-				candidateKey := strings.ToLower(candidate)
-				if _, candidateExists := used[candidateKey]; !candidateExists {
-					header = candidate
-					headerKey = candidateKey
-					nextSuffix[baseKey] = suffix + 1
-					break
-				}
-				suffix++
-			}
-			if headerKey == baseKey {
-				return nil, fmt.Errorf("exceeded SQL header deduplication limit for %q after probing to suffix %d", baseHeader, maxSuffix)
-			}
-		} else if nextSuffix[baseKey] < 2 {
-			nextSuffix[baseKey] = 2
+		key := strings.ToLower(header)
+		if count := seen[key]; count > 0 {
+			header = fmt.Sprintf("%s__%d", header, count+1)
+			key = strings.ToLower(header)
 		}
-
-		used[headerKey] = struct{}{}
+		seen[key]++
 		headers = append(headers, header)
 	}
-	return headers, nil
+	return headers
 }
 
 func validateQuotedIdentifiers(query string, headersByTable map[string][]string, cteNames map[string]struct{}) error {
