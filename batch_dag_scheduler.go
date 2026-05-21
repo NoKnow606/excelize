@@ -500,10 +500,19 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 // worksheet on each invocation.
 func (f *File) persistSQLFormulaResultWithMatrix(sheet, cellName, fallbackValue string, result CalcCellValueWithMatrixResult, worksheetCache *WorksheetCache, updateCaches, notify bool) bool {
 	formula, err := f.GetCellFormula(sheet, cellName)
-	if err != nil || !IsSQLFormula(formula) {
+	if err != nil || !isExternalSpillFormula(formula) {
 		return false
 	}
 	return f.applySQLFormulaMatrix(sheet, cellName, fallbackValue, result, worksheetCache, updateCaches, notify)
+}
+
+func isExternalSpillFormula(formula string) bool {
+	if IsSQLFormula(formula) {
+		return true
+	}
+	trimmed := strings.TrimSpace(formula)
+	trimmed = strings.TrimPrefix(trimmed, "=")
+	return strings.HasPrefix(strings.ToUpper(trimmed), "MAYBE_PIVOT(")
 }
 
 // PersistSQLFormulaResultWithMatrix writes a precomputed SQL spill matrix into
