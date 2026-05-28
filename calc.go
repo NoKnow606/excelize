@@ -1054,7 +1054,7 @@ func (f *File) CalcCellValues(sheet string, cells []string, opts ...Options) (ma
 	// values survive subsequent reads and saves. For SQL formulas we ask for the
 	// matrix result directly and reuse it for persistence so the SQL query only
 	// runs once per cell — re-running it through CalcCellValue + persistFormulaResult
-	// (which would re-invoke CalcCellValueWithMatrix) would double the SQL/SQLite
+	// (which would re-invoke CalcCellValueWithMatrix) would double the SQL/PostgreSQL
 	// materialization cost on every call.
 	for _, cell := range cells {
 		formula, ferr := f.GetCellFormula(sheet, cell)

@@ -1,6 +1,6 @@
 # SQL Formula Architecture
 
-This document explains how the native `SQL("...")` formula works in `omnimcp-excelize`, where the SQLite data is stored, why this feature exists, and the main tradeoffs.
+This document explains how the native `SQL("...")` formula works in `omnimcp-excelize`, how PostgreSQL is used for query execution, and the main tradeoffs.
 
 ## Overview
 
@@ -35,8 +35,8 @@ At a high level:
 1. The formula engine recognizes `SQL(...)`.
 2. The SQL text is extracted and validated.
 3. Worksheet names or custom tokens such as `gid_7` are resolved.
-4. Referenced worksheets are copied into temporary SQLite tables.
-5. SQLite executes the query.
+4. Referenced worksheets are copied into temporary PostgreSQL tables.
+5. PostgreSQL executes the query.
 6. The result is converted to a matrix and spilled back into the worksheet.
 7. The spilled cells and spill range metadata are persisted so the workbook can be saved and reopened with the computed result intact.
 
@@ -48,10 +48,10 @@ flowchart TD
     B --> C["Validate single SELECT or WITH query"]
     C --> D["Find FROM and JOIN source tokens"]
     D --> E["Resolve worksheet names or gid_* tokens"]
-    E --> F["Rewrite sources to internal SQLite table names"]
-    F --> G["Open temporary in-memory SQLite database"]
+    E --> F["Rewrite sources to internal PostgreSQL table names"]
+    F --> G["Open PostgreSQL connection from DSN"]
     G --> H["Read worksheet rows via GetRows"]
-    H --> I["Build SQLite tables from sheet headers and rows"]
+    H --> I["Build temporary PostgreSQL tables from sheet headers and rows"]
     I --> J["Execute rewritten SQL"]
     J --> K["Convert result rows to formula matrix"]
     K --> L["Spill matrix into worksheet cells"]
@@ -65,7 +65,7 @@ sequenceDiagram
     participant User as Workbook Cell
     participant Engine as Formula Engine
     participant Resolver as SQL Source Resolver
-    participant SQLite as In-Memory SQLite
+    participant Postgres as External PostgreSQL
     participant Sheet as Source Worksheet
     participant Target as Target Worksheet
 
@@ -73,12 +73,12 @@ sequenceDiagram
     Engine->>Engine: Extract and validate query
     Engine->>Resolver: Resolve source token
     Resolver-->>Engine: Resolve source token to worksheet name
-    Engine->>SQLite: Open :memory: database
+    Engine->>Postgres: Open DSN connection
     Engine->>Sheet: Read rows from source worksheet
     Sheet-->>Engine: Header row + data rows
-    Engine->>SQLite: CREATE TABLE + INSERT rows
-    Engine->>SQLite: Execute rewritten SELECT
-    SQLite-->>Engine: Result columns + result rows
+    Engine->>Postgres: CREATE TEMP TABLE + INSERT rows
+    Engine->>Postgres: Execute rewritten SELECT
+    Postgres-->>Engine: Result columns + result rows
     Engine->>Target: Write spill cells and spill ref
     Target-->>User: Anchor cell returns top-left result
 ```
@@ -87,16 +87,17 @@ sequenceDiagram
 
 There are two different storage layers involved.
 
-### 1. SQLite Storage
+### 1. PostgreSQL Execution Storage
 
-The SQLite database is temporary and in-memory only.
+The SQL formula engine uses an external PostgreSQL database process via DSN.
 
-- It is opened with `sql.Open("sqlite", ":memory:")`.
-- A fresh database is built during evaluation.
-- Referenced worksheet data is materialized into temporary SQLite tables.
-- The database is closed after compilation or execution finishes.
+- The DSN comes from `File.SetSQLPostgresDSN(...)`, `EXCELIZE_SQL_POSTGRES_DSN`, or `POSTGRES_DSN`.
+- Each compile or execute call opens a short-lived PostgreSQL connection.
+- Referenced worksheet data is materialized into temporary PostgreSQL tables on that connection.
+- Compatibility functions and aggregates are installed in the `excelize_sql_compat` schema and used through `search_path`.
+- The connection is closed after compilation or execution finishes.
 
-This means there is no persistent `.sqlite` file on disk for the SQL formula engine itself.
+This means the workbook SQL formula path no longer embeds or opens SQLite. PostgreSQL must be reachable when using the built-in SQL formula execution path.
 
 ### 2. Workbook Storage
 
@@ -111,13 +112,14 @@ That persisted spill output is what survives `SaveAs(...)` and `OpenFile(...)`.
 
 ## Data Mapping Rules
 
-When a worksheet is copied into SQLite:
+When a worksheet is copied into PostgreSQL:
 
 - row 1 becomes the SQL column header row
 - blank headers are replaced with generated names such as `_col_A`
 - duplicate headers are made unique, for example `Amount__2`
-- empty cells become `nil` or empty string depending on the row value
-- text values are heuristically coerced into booleans, integers, or floats when possible
+- missing cells become `NULL`
+- present worksheet values are inserted as text
+- compatibility helpers provide workbook-style `sum(text)`, `avg(text)`, `instr(...)`, and permissive `CAST(... AS REAL|INTEGER)` behavior
 
 This gives SQL a table-like view of a worksheet without changing the original sheet data model.
 
@@ -183,23 +185,23 @@ Normal Excel formulas are still a better fit when:
 
 ## Cons
 
-- every evaluation rebuilds temporary SQLite tables from worksheet rows
+- every evaluation rebuilds temporary PostgreSQL tables from worksheet rows
 - dependency tracking is sheet-level, not cell-level
-- type coercion is heuristic and may not always match user expectations
+- workbook-style type compatibility is intentionally limited to the helper functions installed for SQL formulas
 - users need to know SQL syntax in addition to spreadsheet formulas
 - exact quoted identifier matching can be strict for messy headers
 - large sheets can make repeated SQL recalculation expensive
 
-## Why SQLite Was Chosen
+## Why PostgreSQL Is Used
 
-SQLite is used here as an embedded query engine, not as a durable database.
+PostgreSQL is used as the SQL runtime for workbook-aware formulas.
 
 It is a practical choice because it provides:
 
-- SQL parsing and execution without running an external service
-- low integration overhead inside Go
 - support for `SELECT`, `WITH`, grouping, sorting, casting, and expressions
-- an in-memory mode that fits formula evaluation well
+- process isolation from this Go library
+- a shared execution model with the upstream `excelize-mcp` PostgreSQL sheet engine
+- a DSN-based deployment model for standalone database processes
 
 The design goal is not persistent storage. The goal is to get a compact embedded SQL runtime over workbook data.
 
@@ -236,11 +238,11 @@ stateDiagram-v2
 `SQL("...")` is best understood as:
 
 - a native formula entry point
-- backed by a temporary in-memory SQLite database
+- backed by temporary PostgreSQL tables over a DSN connection
 - sourcing data from workbook worksheets
 - producing a persistent spill range in the workbook
 
-That combination gives the project an embedded relational query capability without introducing an external database dependency into normal formula execution.
+That combination gives the project a relational query capability while removing the embedded SQLite dependency from this repo.
 
 ## Relevant Implementation Files
 

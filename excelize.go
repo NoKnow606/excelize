@@ -68,6 +68,7 @@ type File struct {
 	WorkBook            *xlsxWorkbook
 	sqlSourceResolver   SQLSourceResolver
 	sqlExecutionBackend SQLExecutionBackend
+	sqlPostgresDSN      string
 	// OnCellCalculated is an optional callback invoked when a formula
 	// calculation writes a new value to a cell. It is only triggered when
 	// the value actually changes. Callers must ensure concurrency safety
@@ -283,9 +284,17 @@ func (f *File) SetSQLSourceResolver(resolver SQLSourceResolver) *File {
 
 // SetSQLExecutionBackend configures an optional SQL execution backend.
 // If the backend returns ErrSQLExecutionBackendUnsupported, ExecuteSQL falls
-// back to the built-in workbook/SQLite path.
+// back to the built-in workbook/PostgreSQL path.
 func (f *File) SetSQLExecutionBackend(backend SQLExecutionBackend) *File {
 	f.sqlExecutionBackend = backend
+	return f
+}
+
+// SetSQLPostgresDSN configures the PostgreSQL connection URL used by the
+// built-in workbook SQL formula engine. If unset, CompileSQL and ExecuteSQL
+// read EXCELIZE_SQL_POSTGRES_DSN and then POSTGRES_DSN from the environment.
+func (f *File) SetSQLPostgresDSN(dsn string) *File {
+	f.sqlPostgresDSN = strings.TrimSpace(dsn)
 	return f
 }
 

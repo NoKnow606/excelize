@@ -5,13 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"regexp"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"unicode"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // sqlExecuteCount counts how many times ExecuteSQL has been invoked process-wide.
@@ -29,6 +29,13 @@ var (
 	errSQLFormulaEmptyQuery           = errors.New("SQL formula query cannot be empty")
 	errSQLFormulaOnlySelectSupported  = errors.New("only single SELECT statements are supported")
 	ErrSQLExecutionBackendUnsupported = errors.New("SQL execution backend unsupported")
+	ErrSQLPostgresDSNRequired         = errors.New("SQL formula PostgreSQL DSN is required")
+)
+
+const (
+	sqlPostgresDSNEnv         = "EXCELIZE_SQL_POSTGRES_DSN"
+	sqlPostgresFallbackDSNEnv = "POSTGRES_DSN"
+	sqlPostgresCompatSchema   = "excelize_sql_compat"
 )
 
 // SQLSourceResolver resolves SQL source tokens such as worksheet names or gid_*
@@ -45,7 +52,7 @@ func (fn SQLSourceResolverFunc) ResolveSQLSource(token string, sheetList []strin
 	return fn(token, sheetList)
 }
 
-// SQLExecutionBackend executes SQL outside the built-in workbook/SQLite path.
+// SQLExecutionBackend executes SQL outside the built-in workbook/PostgreSQL path.
 type SQLExecutionBackend interface {
 	ExecuteSQL(sqlInput string) (*SQLQueryResult, error)
 }
@@ -107,15 +114,15 @@ func IsSQLFormula(formula string) bool {
 
 // CompileSQL validates a SQL formula or raw SQL query against the workbook
 // schema (worksheet → table mapping and header columns) without materializing
-// any data. It opens an in-memory SQLite database, creates one empty table per
-// source worksheet (using only the header row, read in streaming fashion), and
-// asks SQLite to prepare the query so that syntax and identifier resolution
-// are still validated.
+// any data. It opens a PostgreSQL connection, creates one temporary empty table
+// per source worksheet (using only the header row, read in streaming fashion),
+// and asks PostgreSQL to prepare the query so that syntax and identifier
+// resolution are still validated.
 //
 // This is significantly cheaper than executing the query: for a workbook whose
 // source worksheets contain hundreds of thousands of rows, it avoids the
 // expensive GetRows()/[][]string materialization plus the per-row INSERTs into
-// SQLite. Callers that need data-level validation (e.g. "does this query
+// PostgreSQL. Callers that need data-level validation (e.g. "does this query
 // actually return at least one row?") should use ExecuteSQL instead.
 func (f *File) CompileSQL(sqlInput string) (*SQLCompileResult, error) {
 	prepared, err := f.prepareSQLSchemaOnly(sqlInput)
@@ -160,6 +167,7 @@ func (f *File) ExecuteSQL(sqlInput string) (*SQLQueryResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read query columns: %w", err)
 	}
+	columnTypes, _ := rows.ColumnTypes()
 
 	matrix := make([][]interface{}, 0, 8)
 	headerRow := make([]interface{}, len(columns))
@@ -180,7 +188,7 @@ func (f *File) ExecuteSQL(sqlInput string) (*SQLQueryResult, error) {
 
 		row := make([]interface{}, len(columns))
 		for i, value := range values {
-			row[i] = normalizeSQLiteValue(value)
+			row[i] = normalizePostgresValue(value, postgresColumnDatabaseType(columnTypes, i))
 		}
 		matrix = append(matrix, row)
 	}
@@ -278,8 +286,8 @@ func (f *File) prepareSQL(sqlInput string) (*preparedSQL, error) {
 }
 
 // prepareSQLSchemaOnly behaves like prepareSQL but skips inserting data rows
-// into the in-memory SQLite database. Source worksheet headers are read in a
-// streaming fashion (only the first row is loaded), enough to let SQLite
+// into temporary PostgreSQL tables. Source worksheet headers are read in a
+// streaming fashion (only the first row is loaded), enough to let PostgreSQL
 // validate the query syntax and column references during db.Prepare.
 func (f *File) prepareSQLSchemaOnly(sqlInput string) (*preparedSQL, error) {
 	return f.prepareSQLInternal(sqlInput, true)
@@ -300,10 +308,16 @@ func (f *File) prepareSQLInternal(sqlInput string, schemaOnly bool) (*preparedSQ
 		sourceSheet = sources[0].SheetName
 	}
 
-	db, err := sql.Open("sqlite", ":memory:")
+	db, err := f.openSQLPostgres()
 	if err != nil {
-		return nil, fmt.Errorf("open in-memory sqlite: %w", err)
+		return nil, err
 	}
+	if err := preparePostgresSQLSession(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	rewrittenQuery = rewriteSQLiteStyleCasts(rewrittenQuery)
 
 	headersByTable, err := materializeSheets(db, f, sources, schemaOnly)
 	if err != nil {
@@ -317,7 +331,7 @@ func (f *File) prepareSQLInternal(sqlInput string, schemaOnly bool) (*preparedSQ
 	stmt, err := db.Prepare(rewrittenQuery)
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("compile SQL query: %w", err)
+		return nil, fmt.Errorf("compile PostgreSQL query: %w", err)
 	}
 	stmt.Close()
 
@@ -328,6 +342,32 @@ func (f *File) prepareSQLInternal(sqlInput string, schemaOnly bool) (*preparedSQ
 		sourceSheet:    sourceSheet,
 		db:             db,
 	}, nil
+}
+
+func (f *File) openSQLPostgres() (*sql.DB, error) {
+	dsn := strings.TrimSpace(f.sqlPostgresDSN)
+	if dsn == "" {
+		dsn = strings.TrimSpace(os.Getenv(sqlPostgresDSNEnv))
+	}
+	if dsn == "" {
+		dsn = strings.TrimSpace(os.Getenv(sqlPostgresFallbackDSNEnv))
+	}
+	if dsn == "" {
+		return nil, fmt.Errorf("%w: call SetSQLPostgresDSN or set %s/%s", ErrSQLPostgresDSNRequired, sqlPostgresDSNEnv, sqlPostgresFallbackDSNEnv)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open PostgreSQL SQL formula connection: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping PostgreSQL SQL formula connection: %w", err)
+	}
+	return db, nil
 }
 
 func (f *File) sqlFormulaSourceSheets(formula string) []string {
@@ -734,6 +774,131 @@ func resolveSQLSourceName(token string, sheetList []string, resolver SQLSourceRe
 	return "", fmt.Errorf("worksheet %q was not found", identifier)
 }
 
+func preparePostgresSQLSession(db *sql.DB) error {
+	schema := quotePostgresIdentifier(sqlPostgresCompatSchema)
+	statements := []string{
+		fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.numeric_or_null(value text)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT CASE
+		WHEN value IS NULL OR pg_catalog.btrim(value) = '' THEN NULL
+		WHEN pg_catalog.lower(pg_catalog.btrim(value)) IN ('nan', 'inf', 'infinity', '-inf', '-infinity') THEN NULL
+		WHEN pg_catalog.btrim(value) ~ '^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$' THEN pg_catalog.btrim(value)::double precision
+		ELSE NULL
+	END
+$$`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.numeric_or_null(value anyelement)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT %s.numeric_or_null(value::text)
+$$`, schema, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.sqlite_cast_real(value anyelement)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT CASE
+		WHEN value IS NULL THEN NULL
+		WHEN pg_catalog.btrim(value::text) = '' THEN 0
+		WHEN pg_catalog.lower(pg_catalog.btrim(value::text)) IN ('nan', 'inf', 'infinity', '-inf', '-infinity') THEN NULL
+		WHEN pg_catalog.btrim(value::text) ~ '^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$' THEN pg_catalog.btrim(value::text)::double precision
+		ELSE 0
+	END
+$$`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.sqlite_cast_integer(value anyelement)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT CASE
+		WHEN value IS NULL THEN NULL
+		WHEN pg_catalog.btrim(value::text) = '' THEN 0
+		WHEN pg_catalog.lower(pg_catalog.btrim(value::text)) IN ('nan', 'inf', 'infinity', '-inf', '-infinity') THEN NULL
+		WHEN pg_catalog.btrim(value::text) ~ '^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$' THEN pg_catalog.trunc(pg_catalog.btrim(value::text)::numeric)::bigint
+		ELSE 0
+	END
+$$`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.lower(value anyelement)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT pg_catalog.lower(value::text)
+$$`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.instr(haystack text, needle text)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT POSITION(needle IN haystack)
+$$`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.float8_sum_text(state double precision, value text)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT CASE
+		WHEN %s.numeric_or_null(value) IS NULL THEN state
+		ELSE COALESCE(state, 0) + %s.numeric_or_null(value)
+	END
+$$`, schema, schema, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.float8_avg_text_state(state double precision[], value text)
+RETURNS double precision[]
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT CASE
+		WHEN %s.numeric_or_null(value) IS NULL THEN state
+		WHEN state IS NULL THEN ARRAY[%s.numeric_or_null(value), 1::double precision]
+		ELSE ARRAY[state[1] + %s.numeric_or_null(value), state[2] + 1::double precision]
+	END
+$$`, schema, schema, schema, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.float8_avg_text_final(state double precision[])
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+AS $$
+	SELECT CASE
+		WHEN state IS NULL OR array_length(state, 1) < 2 OR state[2] = 0 THEN NULL
+		ELSE state[1] / state[2]
+	END
+$$`, schema),
+		fmt.Sprintf(`DO $$
+BEGIN
+	CREATE AGGREGATE %s.sum(text) (
+	SFUNC = %s.float8_sum_text,
+	STYPE = double precision
+	);
+EXCEPTION WHEN duplicate_function THEN
+	NULL;
+END;
+$$`, schema, schema),
+		fmt.Sprintf(`DO $$
+BEGIN
+	CREATE AGGREGATE %s.avg(text) (
+	SFUNC = %s.float8_avg_text_state,
+	STYPE = double precision[],
+	FINALFUNC = %s.float8_avg_text_final
+	);
+EXCEPTION WHEN duplicate_function THEN
+	NULL;
+END;
+$$`, schema, schema, schema),
+		fmt.Sprintf(`SET search_path TO pg_temp, %s, pg_catalog`, schema),
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("prepare PostgreSQL SQL formula session: %w", err)
+		}
+	}
+	return nil
+}
+
 func materializeSheets(db *sql.DB, f *File, sources []sqlResolvedSource, schemaOnly bool) (map[string][]string, error) {
 	headersByTable := make(map[string][]string, len(sources))
 	for _, source := range sources {
@@ -789,7 +954,7 @@ func materializeSheetSchema(db *sql.DB, f *File, tableName string, sheetName str
 
 	createSQL := buildCreateTableSQL(tableName, headers)
 	if _, err := db.Exec(createSQL); err != nil {
-		return nil, fmt.Errorf("create in-memory SQL table: %w", err)
+		return nil, fmt.Errorf("create temporary PostgreSQL table: %w", err)
 	}
 	return headers, nil
 }
@@ -821,13 +986,13 @@ func materializeSheet(db *sql.DB, f *File, tableName string, sheetName string) (
 
 	createSQL := buildCreateTableSQL(tableName, headers)
 	if _, err := db.Exec(createSQL); err != nil {
-		return nil, fmt.Errorf("create in-memory SQL table: %w", err)
+		return nil, fmt.Errorf("create temporary PostgreSQL table: %w", err)
 	}
 
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(headers)), ",")
+	placeholders := buildPostgresPlaceholders(len(headers))
 	insertSQL := fmt.Sprintf(
 		`INSERT INTO "%s" (%s) VALUES (%s)`,
-		tableName,
+		escapeDoubleQuotes(tableName),
 		buildQuotedIdentifierList(headers),
 		placeholders,
 	)
@@ -850,19 +1015,17 @@ func materializeSheet(db *sql.DB, f *File, tableName string, sheetName string) (
 			switch {
 			case colIdx >= len(row):
 				values[colIdx] = nil
-			case row[colIdx] == "":
-				values[colIdx] = ""
 			default:
-				values[colIdx] = coerceCellValue(row[colIdx])
+				values[colIdx] = row[colIdx]
 			}
 		}
 		if _, err := stmt.Exec(values...); err != nil {
-			return nil, fmt.Errorf("insert worksheet row into SQL table: %w", err)
+			return nil, fmt.Errorf("insert worksheet row into PostgreSQL table: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit SQL transaction: %w", err)
+		return nil, fmt.Errorf("commit PostgreSQL transaction: %w", err)
 	}
 	return headers, nil
 }
@@ -1098,9 +1261,9 @@ func collapseWhitespace(input string) string {
 func buildCreateTableSQL(tableName string, headers []string) string {
 	columns := make([]string, len(headers))
 	for i, header := range headers {
-		columns[i] = fmt.Sprintf(`"%s"`, escapeDoubleQuotes(header))
+		columns[i] = fmt.Sprintf(`"%s" text`, escapeDoubleQuotes(header))
 	}
-	return fmt.Sprintf(`CREATE TABLE "%s" (%s)`, tableName, strings.Join(columns, ", "))
+	return fmt.Sprintf(`CREATE TEMP TABLE "%s" (%s)`, escapeDoubleQuotes(tableName), strings.Join(columns, ", "))
 }
 
 func buildQuotedIdentifierList(headers []string) string {
@@ -1111,50 +1274,157 @@ func buildQuotedIdentifierList(headers []string) string {
 	return strings.Join(quoted, ", ")
 }
 
-func coerceCellValue(raw string) interface{} {
-	trimmed := strings.TrimSpace(raw)
-	switch strings.ToLower(trimmed) {
-	case "true":
-		return true
-	case "false":
-		return false
+func buildPostgresPlaceholders(count int) string {
+	placeholders := make([]string, count)
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
 	}
+	return strings.Join(placeholders, ",")
+}
 
-	if isLikelyInteger(trimmed) {
-		if intVal, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
-			return intVal
+func rewriteSQLiteStyleCasts(query string) string {
+	lowerQuery := strings.ToLower(query)
+	var out strings.Builder
+	out.Grow(len(query) + 64)
+	for i := 0; i < len(query); {
+		if !strings.HasPrefix(lowerQuery[i:], "cast(") {
+			out.WriteByte(query[i])
+			i++
+			continue
+		}
+		end, expr, targetType, ok := parseSQLiteStyleCast(query, i)
+		if !ok {
+			out.WriteByte(query[i])
+			i++
+			continue
+		}
+		switch targetType {
+		case "real":
+			out.WriteString(fmt.Sprintf(`%s.sqlite_cast_real(%s)`, quotePostgresIdentifier(sqlPostgresCompatSchema), strings.TrimSpace(expr)))
+		case "integer":
+			out.WriteString(fmt.Sprintf(`%s.sqlite_cast_integer(%s)`, quotePostgresIdentifier(sqlPostgresCompatSchema), strings.TrimSpace(expr)))
+		default:
+			out.WriteString(query[i:end])
+		}
+		i = end
+	}
+	return out.String()
+}
+
+func parseSQLiteStyleCast(query string, start int) (end int, expr string, targetType string, ok bool) {
+	if start < 0 || start+5 > len(query) || !strings.EqualFold(query[start:start+5], "cast(") {
+		return 0, "", "", false
+	}
+	depth := 1
+	inSingleQuote := false
+	for i := start + 5; i < len(query); i++ {
+		switch query[i] {
+		case '\'':
+			if inSingleQuote && i+1 < len(query) && query[i+1] == '\'' {
+				i++
+				continue
+			}
+			inSingleQuote = !inSingleQuote
+		case '(':
+			if !inSingleQuote {
+				depth++
+			}
+		case ')':
+			if !inSingleQuote {
+				depth--
+				if depth == 0 {
+					inner := query[start+5 : i]
+					expr, targetType, ok = splitSQLiteStyleCastInner(inner)
+					if !ok {
+						return 0, "", "", false
+					}
+					return i + 1, expr, targetType, true
+				}
+			}
 		}
 	}
-	if floatVal, err := strconv.ParseFloat(trimmed, 64); err == nil {
-		return floatVal
-	}
-
-	return raw
+	return 0, "", "", false
 }
 
-func isLikelyInteger(value string) bool {
-	if value == "" {
-		return false
+func splitSQLiteStyleCastInner(inner string) (expr string, targetType string, ok bool) {
+	lowerInner := strings.ToLower(inner)
+	depth := 0
+	inSingleQuote := false
+	for i := len(inner) - 1; i >= 0; i-- {
+		switch inner[i] {
+		case '\'':
+			if i > 0 && inner[i-1] == '\'' {
+				i--
+				continue
+			}
+			inSingleQuote = !inSingleQuote
+		case ')':
+			if !inSingleQuote {
+				depth++
+			}
+		case '(':
+			if !inSingleQuote {
+				depth--
+			}
+		}
+		if depth != 0 || inSingleQuote {
+			continue
+		}
+		if i+4 > len(inner) {
+			continue
+		}
+		if !strings.HasPrefix(lowerInner[i:], " as ") {
+			continue
+		}
+		left := strings.TrimSpace(inner[:i])
+		right := strings.TrimSpace(inner[i+4:])
+		switch strings.ToLower(right) {
+		case "real", "integer":
+			if left == "" {
+				return "", "", false
+			}
+			return left, strings.ToLower(right), true
+		}
 	}
-	if matched, _ := regexp.MatchString(`^-?\d+$`, value); !matched {
-		return false
-	}
-
-	unsigned := strings.TrimPrefix(value, "-")
-	if len(unsigned) > 1 && unsigned[0] == '0' {
-		return false
-	}
-	return len(unsigned) <= 15
+	return "", "", false
 }
 
-func normalizeSQLiteValue(value interface{}) interface{} {
+func postgresColumnDatabaseType(columnTypes []*sql.ColumnType, idx int) string {
+	if idx < 0 || idx >= len(columnTypes) || columnTypes[idx] == nil {
+		return ""
+	}
+	return strings.ToUpper(columnTypes[idx].DatabaseTypeName())
+}
+
+func normalizePostgresValue(value interface{}, databaseType string) interface{} {
 	switch typed := value.(type) {
 	case nil:
 		return nil
 	case []byte:
+		if isPostgresNumericType(databaseType) {
+			if number, err := strconv.ParseFloat(string(typed), 64); err == nil {
+				return number
+			}
+		}
 		return string(typed)
+	case string:
+		if isPostgresNumericType(databaseType) {
+			if number, err := strconv.ParseFloat(typed, 64); err == nil {
+				return number
+			}
+		}
+		return typed
 	default:
 		return typed
+	}
+}
+
+func isPostgresNumericType(databaseType string) bool {
+	switch strings.ToUpper(databaseType) {
+	case "NUMERIC", "DECIMAL":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1319,6 +1589,10 @@ func unquoteIdentifier(identifier string) string {
 
 func escapeDoubleQuotes(input string) string {
 	return strings.ReplaceAll(input, `"`, `""`)
+}
+
+func quotePostgresIdentifier(identifier string) string {
+	return `"` + escapeDoubleQuotes(identifier) + `"`
 }
 
 func sqlColumnIndexToLetter(idx int) string {

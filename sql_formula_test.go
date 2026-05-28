@@ -1,12 +1,16 @@
 package excelize
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
 
-func TestSQLExecutionBackendOverridesSQLitePath(t *testing.T) {
+const sqlPostgresTestDSNEnv = "SHEETDB_TEST_DSN"
+
+func TestSQLExecutionBackendOverridesBuiltInPostgresPath(t *testing.T) {
 	f := NewFile()
 	defer f.Close()
 
@@ -35,28 +39,21 @@ func TestSQLExecutionBackendOverridesSQLitePath(t *testing.T) {
 	}
 }
 
-func TestSQLExecutionBackendUnsupportedFallsBackToSQLite(t *testing.T) {
+func TestSQLExecutionBackendUnsupportedRequiresPostgresDSN(t *testing.T) {
+	t.Setenv(sqlPostgresDSNEnv, "")
+	t.Setenv(sqlPostgresTestDSNEnv, "")
+	t.Setenv(sqlPostgresFallbackDSNEnv, "")
+
 	f := NewFile()
 	defer f.Close()
 
-	defaultSheet := f.GetSheetName(0)
-	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
-		t.Fatalf("SetSheetName: %v", err)
-	}
-	writeSQLSheetRows(t, f, "Data", [][]interface{}{
-		{"Name", "Amount"},
-		{"fallback", 7},
-	})
 	f.SetSQLExecutionBackend(SQLExecutionBackendFunc(func(sqlInput string) (*SQLQueryResult, error) {
 		return nil, ErrSQLExecutionBackendUnsupported
 	}))
 
-	result, err := f.ExecuteSQL(`select "Name", "Amount" from "Data"`)
-	if err != nil {
-		t.Fatalf("ExecuteSQL fallback: %v", err)
-	}
-	if got := result.Matrix[1][0]; got != "fallback" {
-		t.Fatalf("expected SQLite fallback result, got %#v", got)
+	_, err := f.ExecuteSQL(`select * from "Sheet1"`)
+	if !errors.Is(err, ErrSQLPostgresDSNRequired) {
+		t.Fatalf("expected PostgreSQL DSN required error, got %v", err)
 	}
 }
 
@@ -156,8 +153,8 @@ func TestSQLFormulaSupportsDerivedTableSubqueries(t *testing.T) {
 	if len(result.Matrix) != 3 {
 		t.Fatalf("expected header plus 2 rows, got %#v", result.Matrix)
 	}
-	if got := result.Matrix[0][0]; got != "Region" {
-		t.Fatalf("expected header Region, got %#v", got)
+	if got := result.Matrix[0][0]; got != "Region" && got != "region" {
+		t.Fatalf("expected header Region/region, got %#v", got)
 	}
 	if got := result.Matrix[1][0]; got != "South" {
 		t.Fatalf("expected first data row South, got %#v", got)
@@ -1245,6 +1242,7 @@ func TestSQLFormulaShrinkClearsStaleCellsBeyondStoredSpillRef(t *testing.T) {
 
 func writeSQLSheetRows(t *testing.T, f *File, sheet string, rows [][]interface{}) {
 	t.Helper()
+	requirePostgresSQL(t, f)
 	for rowIdx, row := range rows {
 		cell, err := CoordinatesToCellName(1, rowIdx+1)
 		if err != nil {
@@ -1254,6 +1252,21 @@ func writeSQLSheetRows(t *testing.T, f *File, sheet string, rows [][]interface{}
 			t.Fatalf("SetSheetRow: %v", err)
 		}
 	}
+}
+
+func requirePostgresSQL(t *testing.T, f *File) {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv(sqlPostgresDSNEnv))
+	if dsn == "" {
+		dsn = strings.TrimSpace(os.Getenv(sqlPostgresTestDSNEnv))
+	}
+	if dsn == "" {
+		dsn = strings.TrimSpace(os.Getenv(sqlPostgresFallbackDSNEnv))
+	}
+	if dsn == "" {
+		t.Skipf("PostgreSQL SQL formula test requires %s, %s, or %s", sqlPostgresDSNEnv, sqlPostgresTestDSNEnv, sqlPostgresFallbackDSNEnv)
+	}
+	f.SetSQLPostgresDSN(dsn)
 }
 
 func containsString(values []string, want string) bool {

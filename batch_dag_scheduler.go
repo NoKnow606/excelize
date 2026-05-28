@@ -496,7 +496,7 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 // the workbook without re-executing the SQL query. This is the recommended hot
 // path for callers that already produced a matrix via CalcCellValueWithMatrix
 // (e.g. CalcCellValues), because re-running the same SQL multiple times
-// allocates a new in-memory SQLite database and re-materializes every source
+// allocates a new PostgreSQL SQL formula session and re-materializes every source
 // worksheet on each invocation.
 func (f *File) persistSQLFormulaResultWithMatrix(sheet, cellName, fallbackValue string, result CalcCellValueWithMatrixResult, worksheetCache *WorksheetCache, updateCaches, notify bool) bool {
 	formula, err := f.GetCellFormula(sheet, cellName)
@@ -513,8 +513,8 @@ func (f *File) persistSQLFormulaResultWithMatrix(sheet, cellName, fallbackValue 
 // Callers that have already executed the query (e.g. via ExecuteSQL or
 // CalcCellValueWithMatrix) can pass the resulting matrix directly to this
 // method to persist the spill range and the cached top-left value. This avoids
-// a second materialization of every source worksheet into a fresh in-memory
-// SQLite database, which is otherwise the dominant memory cost of saving a
+// a second materialization of every source worksheet into a fresh PostgreSQL SQL
+// formula session, which is otherwise the dominant memory cost of saving a
 // workbook that contains SQL formulas.
 //
 // The cell at cellName must already contain the SQL formula (typically set

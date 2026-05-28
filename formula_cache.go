@@ -117,7 +117,7 @@ func (f *File) UpdateSheetFormulaCache(sheet string) error {
 	// inside CalcCellValues, so we must not run persistFormulaResult on them
 	// here — doing so would re-execute the SQL query through
 	// persistSQLFormulaResult -> CalcCellValueWithMatrix and re-materialize the
-	// source worksheets into a fresh in-memory SQLite database. That redundant
+	// source worksheets into a fresh PostgreSQL SQL formula session. That redundant
 	// pass was the dominant cause of memory blow-up for SQL-heavy workbooks.
 	for _, fc := range formulas {
 		formula, ferr := f.GetCellFormula(sheet, fc.cell)

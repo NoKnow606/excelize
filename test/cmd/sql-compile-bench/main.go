@@ -4,10 +4,10 @@ package main
 // excelize-mcp's /formula/compile and /sql/compile endpoints.
 //
 // CompileSQL is *meant* to be a lightweight schema-level validator: it should
-// only need worksheet headers to ask SQLite to prepare the rewritten query.
+// only need worksheet headers to ask PostgreSQL to prepare the rewritten query.
 // In practice it used to share materializeSheets with ExecuteSQL, which read
-// every source row into Go memory and inserted them into an in-memory SQLite
-// database. For workbooks with hundreds of thousands of source rows this made
+// every source row into Go memory and inserted them into temporary PostgreSQL
+// tables. For workbooks with hundreds of thousands of source rows this made
 // /formula/compile nearly as expensive as /formula/calculate.
 //
 // This benchmark exercises CompileSQL on a real workbook so we can compare
@@ -73,7 +73,7 @@ func main() {
 }
 
 type sn struct {
-	wallNs              int64
+	wallNs                                int64
 	heapAlloc, heapInuse, totalAlloc, sys uint64
 }
 
