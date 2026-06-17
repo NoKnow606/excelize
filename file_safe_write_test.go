@@ -3,9 +3,11 @@ package excelize
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestWriteNonDestructive tests that WriteNonDestructive preserves internal state
@@ -60,7 +62,7 @@ func TestWriteNonDestructive(t *testing.T) {
 	// Step 4: Compare with original Write()
 	fmt.Println("\n--- Step 4: Compare with Write() ---")
 	f2 := NewFile()
-	f2.options = &Options{KeepWorksheetInMemory: true}  // 🔥 Keep worksheet in memory
+	f2.options = &Options{KeepWorksheetInMemory: true} // 🔥 Keep worksheet in memory
 	defer f2.Close()
 
 	for row := 1; row <= 5; row++ {
@@ -155,6 +157,72 @@ func TestWriteNonDestructiveMultiWorksheet(t *testing.T) {
 	}
 
 	fmt.Println("\n✅ WriteNonDestructive preserves multi-worksheet state correctly!")
+}
+
+func TestWriteNonDestructivePreservesUnloadedWorksheetTempFiles(t *testing.T) {
+	source := NewFile()
+	defer source.Close()
+
+	const largeSheet = "LargeData"
+	_, err := source.NewSheet(largeSheet)
+	require.NoError(t, err)
+	for row := 1; row <= 300; row++ {
+		cell := fmt.Sprintf("A%d", row)
+		require.NoError(t, source.SetCellValue(largeSheet, cell, strings.Repeat("large-value-", 20)+fmt.Sprint(row)))
+	}
+	require.NoError(t, source.SetCellValue("Sheet1", "A1", "small"))
+
+	var original bytes.Buffer
+	require.NoError(t, source.WriteNonDestructive(&original))
+
+	f, err := OpenReader(bytes.NewReader(original.Bytes()), Options{UnzipXMLSizeLimit: 256})
+	require.NoError(t, err)
+	defer f.Close()
+	require.False(t, f.IsWorksheetLoaded(largeSheet), "large worksheet should stay unloaded before save")
+	require.NoError(t, f.SetCellValue("Sheet1", "A1", "updated"))
+	require.False(t, f.IsWorksheetLoaded(largeSheet), "updating another sheet should not load the large worksheet")
+
+	var saved bytes.Buffer
+	require.NoError(t, f.WriteNonDestructive(&saved))
+
+	reopened, err := OpenReader(bytes.NewReader(saved.Bytes()), Options{UnzipXMLSizeLimit: 256})
+	require.NoError(t, err)
+	defer reopened.Close()
+	value, err := reopened.GetCellValue(largeSheet, "A300")
+	require.NoError(t, err)
+	assert.Equal(t, strings.Repeat("large-value-", 20)+"300", value)
+}
+
+func TestWriteNonDestructiveDoesNotRestoreDeletedTempWorksheet(t *testing.T) {
+	source := NewFile()
+	defer source.Close()
+
+	const largeSheet = "LargeData"
+	_, err := source.NewSheet(largeSheet)
+	require.NoError(t, err)
+	for row := 1; row <= 300; row++ {
+		cell := fmt.Sprintf("A%d", row)
+		require.NoError(t, source.SetCellValue(largeSheet, cell, strings.Repeat("deleted-value-", 20)+fmt.Sprint(row)))
+	}
+
+	var original bytes.Buffer
+	require.NoError(t, source.WriteNonDestructive(&original))
+
+	f, err := OpenReader(bytes.NewReader(original.Bytes()), Options{UnzipXMLSizeLimit: 256})
+	require.NoError(t, err)
+	defer f.Close()
+	require.False(t, f.IsWorksheetLoaded(largeSheet), "large worksheet should stay unloaded before delete")
+	require.NoError(t, f.DeleteSheet(largeSheet))
+
+	var saved bytes.Buffer
+	require.NoError(t, f.WriteNonDestructive(&saved))
+
+	reopened, err := OpenReader(bytes.NewReader(saved.Bytes()), Options{UnzipXMLSizeLimit: 256})
+	require.NoError(t, err)
+	defer reopened.Close()
+	assert.NotContains(t, reopened.GetSheetList(), largeSheet)
+	_, err = reopened.GetCellValue(largeSheet, "A1")
+	assert.Error(t, err)
 }
 
 // TestWriteNonDestructiveWithInsertRows tests the exact production bug scenario

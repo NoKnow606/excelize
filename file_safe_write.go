@@ -8,8 +8,10 @@ import (
 	"bytes"
 	"encoding/xml"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // WriteNonDestructive provides a function to write the file to io.Writer
@@ -134,10 +136,11 @@ func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
 		}
 	}
 
-	// Write remaining files (unchanged from original)
+	// Write remaining files from memory.
 	var (
-		err   error
-		files []string
+		n                int
+		err              error
+		files, tempFiles []string
 	)
 	f.Pkg.Range(func(path, content interface{}) bool {
 		if _, ok := f.streams[path.(string)]; ok {
@@ -146,13 +149,59 @@ func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
 		files = append(files, path.(string))
 		return true
 	})
+	sort.Sort(sort.Reverse(sort.StringSlice(files)))
 	for _, path := range files {
 		var fi io.Writer
 		if fi, err = zw.Create(path); err != nil {
 			break
 		}
 		content, _ := f.Pkg.Load(path)
-		if _, err = fi.Write(content.([]byte)); err != nil {
+		if n, err = fi.Write(content.([]byte)); int64(n) > math.MaxUint32 {
+			f.zip64Entries = append(f.zip64Entries, path)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	// Preserve files that were lazily extracted to temp files and never loaded
+	// into Pkg. Large worksheet XML parts commonly live here; dropping them
+	// during a non-destructive save corrupts untouched sheets.
+	f.tempFiles.Range(func(path, content interface{}) bool {
+		pathStr := path.(string)
+		if _, ok := f.Pkg.Load(pathStr); ok {
+			return true
+		}
+		if _, ok := f.streams[pathStr]; ok {
+			return true
+		}
+		tempFiles = append(tempFiles, pathStr)
+		return true
+	})
+	sort.Sort(sort.Reverse(sort.StringSlice(tempFiles)))
+	for _, path := range tempFiles {
+		var fi io.Writer
+		if fi, err = zw.Create(path); err != nil {
+			break
+		}
+		var file *os.File
+		if file, err = f.readTemp(path); err != nil {
+			break
+		}
+		written, copyErr := io.Copy(fi, file)
+		closeErr := file.Close()
+		if written > math.MaxUint32 {
+			f.zip64Entries = append(f.zip64Entries, path)
+		}
+		if copyErr != nil {
+			err = copyErr
+			break
+		}
+		if closeErr != nil {
+			err = closeErr
 			break
 		}
 	}
