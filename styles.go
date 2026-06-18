@@ -1437,7 +1437,16 @@ func (f *File) GetBaseColor(hexColor string, indexedColor int, themeColor *int) 
 // RGB color.
 func (f *File) getThemeColor(clr *xlsxColor) string {
 	var RGB string
-	if clr == nil || f.Theme == nil {
+	if clr == nil {
+		return RGB
+	}
+	if clr.RGB != "" {
+		if RGB = f.GetBaseColor(clr.RGB, clr.Indexed, clr.Theme); RGB != "" {
+			RGB = strings.TrimPrefix(ThemeColor(RGB, clr.Tint), "FF")
+		}
+		return RGB
+	}
+	if f.Theme == nil {
 		return RGB
 	}
 	if RGB = f.GetBaseColor(clr.RGB, clr.Indexed, clr.Theme); RGB != "" {

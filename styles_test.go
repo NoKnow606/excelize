@@ -616,6 +616,8 @@ func TestGetNumFmtID(t *testing.T) {
 
 func TestGetThemeColor(t *testing.T) {
 	assert.Empty(t, (&File{}).getThemeColor(&xlsxColor{}))
+	assert.Equal(t, "305496", (&File{}).getThemeColor(&xlsxColor{RGB: "FF305496"}))
+	assert.Equal(t, "305496", (&File{}).getThemeColor(&xlsxColor{RGB: "305496"}))
 	f := NewFile()
 	assert.Empty(t, f.getThemeColor(nil))
 	var theme int
@@ -625,6 +627,18 @@ func TestGetThemeColor(t *testing.T) {
 	assert.Empty(t, f.getThemeColor(&xlsxColor{Indexed: len(IndexedColorMapping), Tint: 0.5}))
 	clr := &decodeCTColor{}
 	assert.Nil(t, clr.colorChoice())
+}
+
+func TestGetStyleWithRGBFillWithoutTheme(t *testing.T) {
+	f := NewFile()
+	styleID, err := f.NewStyle(&Style{Fill: Fill{Type: "pattern", Pattern: 1, Color: []string{"305496"}}})
+	assert.NoError(t, err)
+
+	f.Theme = nil
+	f.Pkg.Delete(defaultXMLPathTheme)
+	style, err := f.GetStyle(styleID)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"305496"}, style.Fill.Color)
 }
 
 func TestGetStyle(t *testing.T) {
