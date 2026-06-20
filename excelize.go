@@ -67,6 +67,8 @@ type File struct {
 	VolatileDeps      *xlsxVolTypes
 	WorkBook          *xlsxWorkbook
 	sqlSourceResolver SQLSourceResolver
+	duckDBEnabled     bool
+	duckDBPath        string
 	// OnCellCalculated is an optional callback invoked when a formula
 	// calculation writes a new value to a cell. It is only triggered when
 	// the value actually changes. Callers must ensure concurrency safety
