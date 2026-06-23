@@ -193,6 +193,54 @@ func TestWriteNonDestructivePreservesUnloadedWorksheetTempFiles(t *testing.T) {
 	assert.Equal(t, strings.Repeat("large-value-", 20)+"300", value)
 }
 
+func TestWriteNonDestructiveWithDirtySheetsPreservesCleanLoadedWorksheetXML(t *testing.T) {
+	source := NewFile()
+	defer source.Close()
+
+	const largeSheet = "LargeData"
+	_, err := source.NewSheet(largeSheet)
+	require.NoError(t, err)
+	for row := 1; row <= 300; row++ {
+		cell := fmt.Sprintf("A%d", row)
+		require.NoError(t, source.SetCellValue(largeSheet, cell, strings.Repeat("preserve-value-", 20)+fmt.Sprint(row)))
+	}
+	require.NoError(t, source.SetCellValue("Sheet1", "A1", "small"))
+
+	var original bytes.Buffer
+	require.NoError(t, source.WriteNonDestructive(&original))
+
+	f, err := OpenReader(bytes.NewReader(original.Bytes()), Options{UnzipXMLSizeLimit: 256})
+	require.NoError(t, err)
+	defer f.Close()
+	require.NoError(t, f.LoadWorksheet(largeSheet))
+
+	largeSheetPath, ok := f.getSheetXMLPath(largeSheet)
+	require.True(t, ok)
+	loaded, ok := f.Sheet.Load(largeSheetPath)
+	require.True(t, ok)
+	loaded.(*xlsxWorksheet).SheetData.Row = nil
+
+	require.NoError(t, f.SetCellValue("Sheet1", "A1", "updated"))
+
+	var saved bytes.Buffer
+	require.NoError(t, f.WriteNonDestructiveWithDirtySheets(&saved, DirtySheetWriteOptions{
+		DirtyWorksheets:           map[string]bool{"Sheet1": true},
+		PreserveCleanWorksheetXML: true,
+	}))
+
+	reopened, err := OpenReader(bytes.NewReader(saved.Bytes()), Options{UnzipXMLSizeLimit: 256})
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	value, err := reopened.GetCellValue(largeSheet, "A300")
+	require.NoError(t, err)
+	assert.Equal(t, strings.Repeat("preserve-value-", 20)+"300", value)
+
+	updated, err := reopened.GetCellValue("Sheet1", "A1")
+	require.NoError(t, err)
+	assert.Equal(t, "updated", updated)
+}
+
 func TestWriteNonDestructiveDoesNotRestoreDeletedTempWorksheet(t *testing.T) {
 	source := NewFile()
 	defer source.Close()

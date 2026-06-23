@@ -7,12 +7,25 @@ package excelize
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
+
+// DirtySheetWriteOptions controls worksheet-level serialization during
+// non-destructive writes.
+type DirtySheetWriteOptions struct {
+	// DirtyWorksheets contains worksheet names or worksheet XML paths that may
+	// be serialized from in-memory worksheet objects.
+	DirtyWorksheets map[string]bool
+	// PreserveCleanWorksheetXML forces clean worksheets to be copied from their
+	// original package XML or temp file instead of f.Sheet.
+	PreserveCleanWorksheetXML bool
+}
 
 // WriteNonDestructive provides a function to write the file to io.Writer
 // WITHOUT modifying the internal worksheet state.
@@ -57,13 +70,27 @@ func (f *File) WriteNonDestructive(w io.Writer, opts ...Options) error {
 	return err
 }
 
+// WriteNonDestructiveWithDirtySheets writes the workbook while only
+// serializing worksheets explicitly marked dirty. Clean worksheets are copied
+// from their original XML bytes when PreserveCleanWorksheetXML is enabled.
+func (f *File) WriteNonDestructiveWithDirtySheets(w io.Writer, dirtyOpts DirtySheetWriteOptions, opts ...Options) error {
+	_, err := f.WriteToNonDestructiveWithDirtySheets(w, dirtyOpts, opts...)
+	return err
+}
+
 // WriteToNonDestructive implements io.WriterTo to write the file without
 // modifying internal state. Returns the number of bytes written.
 func (f *File) WriteToNonDestructive(w io.Writer, opts ...Options) (int64, error) {
+	return f.WriteToNonDestructiveWithDirtySheets(w, DirtySheetWriteOptions{}, opts...)
+}
+
+// WriteToNonDestructiveWithDirtySheets implements io.WriterTo using dirty
+// worksheet awareness.
+func (f *File) WriteToNonDestructiveWithDirtySheets(w io.Writer, dirtyOpts DirtySheetWriteOptions, opts ...Options) (int64, error) {
 	for i := range opts {
 		f.options = &opts[i]
 	}
-	buf, err := f.WriteToBufferNonDestructive()
+	buf, err := f.WriteToBufferNonDestructiveWithDirtySheets(dirtyOpts)
 	if err != nil {
 		return 0, err
 	}
@@ -76,10 +103,16 @@ func (f *File) WriteToNonDestructive(w io.Writer, opts ...Options) (int64, error
 // This function creates a snapshot of all worksheets for serialization,
 // leaving the original in-memory data untouched.
 func (f *File) WriteToBufferNonDestructive() (*bytes.Buffer, error) {
+	return f.WriteToBufferNonDestructiveWithDirtySheets(DirtySheetWriteOptions{})
+}
+
+// WriteToBufferNonDestructiveWithDirtySheets provides a function to get
+// bytes.Buffer from the file while preserving clean worksheet XML.
+func (f *File) WriteToBufferNonDestructiveWithDirtySheets(dirtyOpts DirtySheetWriteOptions) (*bytes.Buffer, error) {
 	buf := new(bytes.Buffer)
 	zw := f.ZipWriter(buf)
 
-	if err := f.writeToZipNonDestructive(zw); err != nil {
+	if err := f.writeToZipNonDestructive(zw, &dirtyOpts); err != nil {
 		_ = zw.Close()
 		return buf, err
 	}
@@ -100,7 +133,7 @@ func (f *File) WriteToBufferNonDestructive() (*bytes.Buffer, error) {
 
 // writeToZipNonDestructive writes file content to zip WITHOUT modifying
 // internal worksheet state.
-func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
+func (f *File) writeToZipNonDestructive(zw ZipWriter, dirtyOpts *DirtySheetWriteOptions) error {
 	// These writers don't modify worksheet state, safe to call directly
 	f.calcChainWriter()
 	f.commentsWriter()
@@ -112,7 +145,9 @@ func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
 
 	// ⚠️ CRITICAL: workSheetWriter() calls trimRow() which modifies state!
 	// Use our non-destructive version instead
-	f.workSheetWriterNonDestructive()
+	if err := f.workSheetWriterNonDestructive(dirtyOpts); err != nil {
+		return err
+	}
 
 	f.relsWriter()
 	_ = f.sharedStringsLoader()
@@ -142,11 +177,33 @@ func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
 		err              error
 		files, tempFiles []string
 	)
+	preserveCleanWorksheets := dirtyOpts != nil && dirtyOpts.PreserveCleanWorksheetXML
+	dirtyWorksheetPaths := f.dirtyWorksheetPaths(dirtyOpts)
+	cleanWorksheetPaths := map[string]bool{}
+	cleanTempWorksheetPaths := map[string]bool{}
+	if preserveCleanWorksheets {
+		cleanWorksheetPaths = f.cleanWorksheetPaths(dirtyWorksheetPaths)
+		if err := f.validateCleanWorksheetXML(cleanWorksheetPaths); err != nil {
+			return err
+		}
+		for path := range cleanWorksheetPaths {
+			if _, ok := f.tempFiles.Load(path); ok {
+				cleanTempWorksheetPaths[path] = true
+			}
+			if _, ok := f.streams[path]; ok {
+				return fmt.Errorf("clean worksheet %q has stream data but no original XML source", path)
+			}
+		}
+	}
 	f.Pkg.Range(func(path, content interface{}) bool {
-		if _, ok := f.streams[path.(string)]; ok {
+		pathStr := path.(string)
+		if _, ok := f.streams[pathStr]; ok {
 			return true
 		}
-		files = append(files, path.(string))
+		if preserveCleanWorksheets && cleanTempWorksheetPaths[pathStr] {
+			return true
+		}
+		files = append(files, pathStr)
 		return true
 	})
 	sort.Sort(sort.Reverse(sort.StringSlice(files)))
@@ -172,7 +229,8 @@ func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
 	// during a non-destructive save corrupts untouched sheets.
 	f.tempFiles.Range(func(path, content interface{}) bool {
 		pathStr := path.(string)
-		if _, ok := f.Pkg.Load(pathStr); ok {
+		_, hasPkg := f.Pkg.Load(pathStr)
+		if hasPkg && !(preserveCleanWorksheets && cleanTempWorksheetPaths[pathStr]) {
 			return true
 		}
 		if _, ok := f.streams[pathStr]; ok {
@@ -216,15 +274,22 @@ func (f *File) writeToZipNonDestructive(zw ZipWriter) error {
 // 2. Trims the COPY, not the original
 // 3. Does NOT delete worksheets from memory
 // 4. Preserves original state for subsequent operations
-func (f *File) workSheetWriterNonDestructive() {
+func (f *File) workSheetWriterNonDestructive(dirtyOpts *DirtySheetWriteOptions) error {
 	var (
 		arr     []byte
 		buffer  = bytes.NewBuffer(arr)
 		encoder = xml.NewEncoder(buffer)
+		err     error
 	)
 
+	preserveCleanWorksheets := dirtyOpts != nil && dirtyOpts.PreserveCleanWorksheetXML
+	dirtyWorksheetPaths := f.dirtyWorksheetPaths(dirtyOpts)
 	f.Sheet.Range(func(p, ws interface{}) bool {
 		if ws != nil {
+			path := p.(string)
+			if preserveCleanWorksheets && !dirtyWorksheetPaths[path] {
+				return true
+			}
 			originalSheet := ws.(*xlsxWorksheet)
 
 			// 🔒 Lock the worksheet to prevent concurrent modifications during copy
@@ -253,7 +318,7 @@ func (f *File) workSheetWriterNonDestructive() {
 
 			// Add namespaces if needed
 			if sheetCopy.SheetPr != nil || sheetCopy.Drawing != nil || sheetCopy.Hyperlinks != nil || sheetCopy.Picture != nil || sheetCopy.TableParts != nil {
-				f.addNameSpaces(p.(string), SourceRelationship)
+				f.addNameSpaces(path, SourceRelationship)
 			}
 
 			// Handle alternate content
@@ -266,8 +331,10 @@ func (f *File) workSheetWriterNonDestructive() {
 			sheetCopy.DecodeAlternateContent = nil
 
 			// Encode the COPY
-			_ = encoder.Encode(sheetCopy)
-			f.saveFileList(p.(string), replaceRelationshipsBytes(f.replaceNameSpaceBytes(p.(string), buffer.Bytes())))
+			if err = encoder.Encode(sheetCopy); err != nil {
+				return false
+			}
+			f.saveFileList(path, replaceRelationshipsBytes(f.replaceNameSpaceBytes(path, buffer.Bytes())))
 
 			buffer.Reset()
 
@@ -276,6 +343,65 @@ func (f *File) workSheetWriterNonDestructive() {
 		}
 		return true
 	})
+	return err
+}
+
+func (f *File) dirtyWorksheetPaths(dirtyOpts *DirtySheetWriteOptions) map[string]bool {
+	paths := map[string]bool{}
+	if dirtyOpts == nil || !dirtyOpts.PreserveCleanWorksheetXML {
+		return paths
+	}
+	for dirtySheet, dirty := range dirtyOpts.DirtyWorksheets {
+		if !dirty {
+			continue
+		}
+		dirtySheet = strings.TrimSpace(dirtySheet)
+		if dirtySheet == "" {
+			continue
+		}
+		if isWorksheetXMLPath(dirtySheet) {
+			paths[dirtySheet] = true
+			continue
+		}
+		for sheetName, path := range f.sheetMap {
+			if strings.EqualFold(sheetName, dirtySheet) || strings.EqualFold(path, dirtySheet) {
+				paths[path] = true
+				break
+			}
+		}
+	}
+	return paths
+}
+
+func (f *File) cleanWorksheetPaths(dirtyWorksheetPaths map[string]bool) map[string]bool {
+	paths := map[string]bool{}
+	for _, path := range f.sheetMap {
+		if path == "" || dirtyWorksheetPaths[path] {
+			continue
+		}
+		paths[path] = true
+	}
+	return paths
+}
+
+func (f *File) validateCleanWorksheetXML(cleanWorksheetPaths map[string]bool) error {
+	for path := range cleanWorksheetPaths {
+		if _, ok := f.tempFiles.Load(path); ok {
+			continue
+		}
+		if content, ok := f.Pkg.Load(path); ok {
+			if b, ok := content.([]byte); ok && len(b) > 0 {
+				continue
+			}
+		}
+		return fmt.Errorf("clean worksheet %q has no original XML source", path)
+	}
+	return nil
+}
+
+func isWorksheetXMLPath(path string) bool {
+	path = strings.ToLower(strings.ReplaceAll(path, "\\", "/"))
+	return strings.HasPrefix(path, "xl/worksheets/sheet") && strings.HasSuffix(path, ".xml")
 }
 
 // deepCopyWorksheet creates a deep copy of a worksheet structure.
