@@ -273,7 +273,11 @@ func TestGetConditionalFormats(t *testing.T) {
 		{{Type: "no_blanks", Format: intPtr(1)}},
 		{{Type: "errors", Format: intPtr(1)}},
 		{{Type: "no_errors", Format: intPtr(1)}},
-		{{Type: "icon_set", IconStyle: "3Arrows", ReverseIcons: true, IconsOnly: true}},
+		{{Type: "icon_set", IconStyle: "3Arrows", ReverseIcons: true, IconsOnly: true, IconCfvo: []ConditionalFormatIconCfvo{
+			{Operator: "greaterThan", Type: "percent", Val: "0"},
+			{Operator: "greaterThan", Type: "percent", Val: "33"},
+			{Operator: "greaterThan", Type: "percent", Val: "67"},
+		}}},
 	} {
 		f := NewFile()
 		err := f.SetConditionalFormat("Sheet1", "A2:A1,B:B,2:2", format)

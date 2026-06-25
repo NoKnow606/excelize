@@ -3345,6 +3345,20 @@ func (f *File) extractCondFmtIconSet(c *xlsxCfRule, extLst *xlsxExtLst) Conditio
 		}
 		format.IconStyle = c.IconSet.IconSet
 		format.ReverseIcons = c.IconSet.Reverse
+		for _, cfvo := range c.IconSet.Cfvo {
+			if cfvo == nil {
+				continue
+			}
+			operator := "greaterThan"
+			if cfvo.Gte {
+				operator = "greaterThanOrEqual"
+			}
+			format.IconCfvo = append(format.IconCfvo, ConditionalFormatIconCfvo{
+				Operator: operator,
+				Type:     cfvo.Type,
+				Val:      cfvo.Val,
+			})
+		}
 	}
 	return format
 }
@@ -3652,6 +3666,16 @@ func drawCondFmtIconSet(p int, ct, ref, GUID string, format *ConditionalFormatOp
 	// Deep copy to avoid mutating the shared preset pointer when multiple
 	// rules share the same icon style.
 	iconSetCopy := *preset.IconSet
+	if len(preset.IconSet.Cfvo) > 0 {
+		iconSetCopy.Cfvo = make([]*xlsxCfvo, 0, len(preset.IconSet.Cfvo))
+		for _, cfvo := range preset.IconSet.Cfvo {
+			if cfvo == nil {
+				continue
+			}
+			cfvoCopy := *cfvo
+			iconSetCopy.Cfvo = append(iconSetCopy.Cfvo, &cfvoCopy)
+		}
+	}
 	cfRule := &xlsxCfRule{
 		Type:    preset.Type,
 		IconSet: &iconSetCopy,
@@ -3660,6 +3684,16 @@ func drawCondFmtIconSet(p int, ct, ref, GUID string, format *ConditionalFormatOp
 	cfRule.IconSet.IconSet = format.IconStyle
 	cfRule.IconSet.Reverse = format.ReverseIcons
 	cfRule.IconSet.ShowValue = boolPtr(!format.IconsOnly)
+	if len(format.IconCfvo) > 0 {
+		cfRule.IconSet.Cfvo = make([]*xlsxCfvo, 0, len(format.IconCfvo))
+		for _, cfvo := range format.IconCfvo {
+			cfRule.IconSet.Cfvo = append(cfRule.IconSet.Cfvo, &xlsxCfvo{
+				Gte:  cfvo.Operator == "greaterThanOrEqual",
+				Type: cfvo.Type,
+				Val:  cfvo.Val,
+			})
+		}
+	}
 	cfRule.Type = validType[format.Type]
 	return cfRule, nil
 }

@@ -1772,6 +1772,7 @@ func (f *File) extractCharts(cs *xlsxChartSpace, rawXML []byte) []*Chart {
 			Series: extractChartSeries(info.charts),
 		}
 		f.extractChartTitle(rawXML, chart)
+		extractChartAxisTitles(rawXML, chart)
 		extractChartLegend(cs.Chart.Legend, chart)
 		extractChartPlotArea(info.charts, chart)
 		if info.charts.VaryColors != nil {
@@ -1800,6 +1801,108 @@ func (f *File) extractCharts(cs *xlsxChartSpace, rawXML []byte) []*Chart {
 		}
 	}
 	return charts
+}
+
+func extractChartAxisTitles(chartXML []byte, chart *Chart) {
+	if len(chartXML) == 0 || chart == nil {
+		return
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(chartXML))
+	var axis, titleAxis string
+	var runs []RichTextRun
+	var inTitle, inTx, inRich, inR bool
+	var titleDepth int
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "catAx", "dateAx", "valAx":
+				axis = t.Name.Local
+			case "title":
+				if axis != "" {
+					inTitle = true
+					titleAxis = axis
+					titleDepth = 1
+					runs = nil
+				}
+			default:
+				if inTitle {
+					titleDepth++
+				}
+			}
+			switch t.Name.Local {
+			case "tx":
+				if inTitle {
+					inTx = true
+				}
+			case "rich":
+				if inTx {
+					inRich = true
+				}
+			case "r":
+				if inRich {
+					inR = true
+				}
+			case "t":
+				if inR {
+					var text string
+					if err := decoder.DecodeElement(&text, &t); err == nil && text != "" {
+						runs = append(runs, RichTextRun{Text: text})
+					}
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "catAx", "dateAx", "valAx":
+				if axis == t.Name.Local {
+					axis = ""
+				}
+			case "title":
+				if inTitle {
+					switch titleAxis {
+					case "catAx", "dateAx":
+						if len(chart.XAxis.Title) == 0 {
+							chart.XAxis.Title = append([]RichTextRun(nil), runs...)
+						}
+					case "valAx":
+						if len(chart.YAxis.Title) == 0 {
+							chart.YAxis.Title = append([]RichTextRun(nil), runs...)
+						}
+					}
+					inTitle = false
+					inTx = false
+					inRich = false
+					inR = false
+					titleAxis = ""
+					runs = nil
+					titleDepth = 0
+				}
+			case "tx":
+				inTx = false
+			case "rich":
+				inRich = false
+			case "r":
+				inR = false
+			default:
+				if inTitle && titleDepth > 0 {
+					titleDepth--
+				}
+			}
+			if inTitle && titleDepth == 0 {
+				inTitle = false
+				inTx = false
+				inRich = false
+				inR = false
+				titleAxis = ""
+				runs = nil
+			}
+		}
+	}
 }
 
 // chartTypeInfo holds the chart type and associated chart data for a single
