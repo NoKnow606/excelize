@@ -87,10 +87,13 @@ func (f *File) SaveAs(name string, opts ...Options) error {
 // Close closes and cleanup the open temporary file for the spreadsheet.
 func (f *File) Close() error {
 	var firstErr error
+	f.sharedStringItemMu.Lock()
 	if f.sharedStringTemp != nil {
 		firstErr = f.sharedStringTemp.Close()
 		f.sharedStringTemp = nil
 	}
+	f.sharedStringItem = nil
+	f.sharedStringItemMu.Unlock()
 	for _, stream := range f.streams {
 		_ = stream.rawData.Close()
 	}
