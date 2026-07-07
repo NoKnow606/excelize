@@ -517,6 +517,8 @@ func (f *File) sharedStringsLoader() (err error) {
 		}
 		f.SharedStrings = nil
 	}
+	f.sharedStringItemMu.Lock()
+	defer f.sharedStringItemMu.Unlock()
 	if f.sharedStringTemp != nil {
 		if err := f.sharedStringTemp.Close(); err != nil {
 			return err

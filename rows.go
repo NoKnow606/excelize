@@ -491,54 +491,104 @@ func (f *File) Rows(sheet string) (*Rows, error) {
 // getFromStringItem build shared string item offset list from system temporary
 // file at one time, and return value by given to string index.
 func (f *File) getFromStringItem(index int) string {
-	if f.sharedStringTemp != nil {
-		if len(f.sharedStringItem) <= index {
-			return strconv.Itoa(index)
-		}
-		offsetRange := f.sharedStringItem[index]
-		if len(offsetRange) != 2 || offsetRange[0] >= offsetRange[1] {
-			return strconv.Itoa(index)
-		}
-		buf := make([]byte, offsetRange[1]-offsetRange[0])
-		if _, err := f.sharedStringTemp.ReadAt(buf, int64(offsetRange[0])); err != nil {
-			return strconv.Itoa(index)
-		}
-		return string(buf)
+	if index < 0 {
+		return strconv.Itoa(index)
 	}
+	if _, ok := f.tempFiles.Load(defaultXMLPathSharedStrings); !ok {
+		return strconv.Itoa(index)
+	}
+
+	f.sharedStringItemMu.Lock()
+	defer f.sharedStringItemMu.Unlock()
+
+	if f.sharedStringTemp == nil {
+		if err := f.buildSharedStringItemCacheLocked(); err != nil {
+			return strconv.Itoa(index)
+		}
+	}
+	if len(f.sharedStringItem) <= index {
+		return strconv.Itoa(index)
+	}
+	offsetRange := f.sharedStringItem[index]
+	if len(offsetRange) != 2 || offsetRange[0] >= offsetRange[1] {
+		return strconv.Itoa(index)
+	}
+	buf := make([]byte, offsetRange[1]-offsetRange[0])
+	if _, err := f.sharedStringTemp.ReadAt(buf, int64(offsetRange[0])); err != nil {
+		return strconv.Itoa(index)
+	}
+	return string(buf)
+}
+
+// buildSharedStringItemCacheLocked materializes the shared string offset table
+// for workbooks whose sharedStrings.xml was extracted to a temp file. Callers
+// must hold sharedStringItemMu. The cache is only published after it is
+// complete so concurrent readers cannot observe a partially initialized table.
+func (f *File) buildSharedStringItemCacheLocked() error {
+	if f.sharedStringTemp != nil {
+		return nil
+	}
+	if _, ok := f.tempFiles.Load(defaultXMLPathSharedStrings); !ok {
+		return nil
+	}
+
 	needClose, decoder, tempFile, err := f.xmlDecoder(defaultXMLPathSharedStrings)
 	if needClose && err == nil {
 		defer func() {
-			err = tempFile.Close()
+			_ = tempFile.Close()
 		}()
 	}
-	f.sharedStringItem = [][]uint{}
-	f.sharedStringTemp, _ = os.CreateTemp(f.options.TmpDir, "excelize-")
-	f.tempFiles.Store(defaultTempFileSST, f.sharedStringTemp.Name())
-	var (
-		inElement string
-		i, offset uint
-	)
+	if err != nil {
+		return err
+	}
+
+	sharedStringTemp, err := os.CreateTemp(f.options.TmpDir, "excelize-")
+	if err != nil {
+		return err
+	}
+	published := false
+	defer func() {
+		if !published {
+			name := sharedStringTemp.Name()
+			_ = sharedStringTemp.Close()
+			_ = os.Remove(name)
+		}
+	}()
+
+	sharedStringItem := make([][]uint, 0, 1024)
+	var offset uint
 	for {
-		token, _ := decoder.Token()
+		token, err := decoder.Token()
 		if token == nil {
 			break
 		}
+		if err != nil {
+			return err
+		}
 		switch xmlElement := token.(type) {
 		case xml.StartElement:
-			inElement = xmlElement.Name.Local
-			if inElement == "si" {
+			if xmlElement.Name.Local == "si" {
 				si := xlsxSI{}
-				_ = decoder.DecodeElement(&si, &xmlElement)
+				if err := decoder.DecodeElement(&si, &xmlElement); err != nil {
+					return err
+				}
 
 				startIdx := offset
-				n, _ := f.sharedStringTemp.WriteString(si.String())
+				n, err := sharedStringTemp.WriteString(si.String())
+				if err != nil {
+					return err
+				}
 				offset += uint(n)
-				f.sharedStringItem = append(f.sharedStringItem, []uint{startIdx, offset})
-				i++
+				sharedStringItem = append(sharedStringItem, []uint{startIdx, offset})
 			}
 		}
 	}
-	return f.getFromStringItem(index)
+
+	f.sharedStringItem = sharedStringItem
+	f.sharedStringTemp = sharedStringTemp
+	f.tempFiles.Store(defaultTempFileSST, sharedStringTemp.Name())
+	published = true
+	return nil
 }
 
 // xmlDecoder creates XML decoder by given path in the zip from memory data
