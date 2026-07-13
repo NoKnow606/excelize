@@ -664,15 +664,29 @@ func (c *xlsxC) getValueFrom(f *File, d *xlsxSST, raw bool) (string, error) {
 		return c.getCellDate(f, raw)
 	case "s":
 		if c.V != "" {
-			xlsxSI, _ := strconv.Atoi(strings.TrimSpace(c.V))
+			xlsxSI, err := strconv.Atoi(strings.TrimSpace(c.V))
+			if err != nil {
+				return "", fmt.Errorf("invalid shared string index %q: %w", c.V, err)
+			}
+			if xlsxSI < 0 {
+				return "", fmt.Errorf("invalid shared string index %d", xlsxSI)
+			}
 			if _, ok := f.tempFiles.Load(defaultXMLPathSharedStrings); ok {
-				return f.formattedValue(&xlsxC{S: c.S, V: f.getFromStringItem(xlsxSI)}, raw, CellTypeSharedString)
+				val, err := f.getFromStringItem(xlsxSI)
+				if err != nil {
+					return "", err
+				}
+				return f.formattedValue(&xlsxC{S: c.S, V: val}, raw, CellTypeSharedString)
+			}
+			if d == nil {
+				return "", fmt.Errorf("shared string table is not available for index %d", xlsxSI)
 			}
 			d.mu.Lock()
 			defer d.mu.Unlock()
 			if len(d.SI) > xlsxSI {
 				return f.formattedValue(&xlsxC{S: c.S, V: d.SI[xlsxSI].String()}, raw, CellTypeSharedString)
 			}
+			return "", fmt.Errorf("shared string index %d out of range %d", xlsxSI, len(d.SI))
 		}
 		return f.formattedValue(c, raw, CellTypeSharedString)
 	case "str":

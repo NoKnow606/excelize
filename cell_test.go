@@ -1178,10 +1178,8 @@ func TestSharedStringsError(t *testing.T) {
 	tempFile, ok := f.tempFiles.Load(defaultXMLPathSharedStrings)
 	assert.True(t, ok)
 	f.tempFiles.Store(defaultXMLPathSharedStrings, "")
-	assert.Equal(t, "1", f.getFromStringItem(1))
-	// Test get from string item with invalid offset range
-	f.sharedStringItem = [][]uint{{0}}
-	assert.Equal(t, "0", f.getFromStringItem(0))
+	_, err = f.getFromStringItem(1)
+	assert.Error(t, err)
 	// Cleanup undelete temporary files
 	assert.NoError(t, os.Remove(tempFile.(string)))
 	// Test reload the file error on set cell value and rich text. The error message was different between macOS and Windows
@@ -1206,7 +1204,8 @@ func TestSharedStringsError(t *testing.T) {
 			assert.NoError(t, err)
 			// Test get cell value from string item with invalid offset
 			f.sharedStringItem[1] = []uint{maxUint16 - 1, maxUint16}
-			assert.Equal(t, "1", f.getFromStringItem(1))
+			_, err = f.getFromStringItem(1)
+			assert.Error(t, err)
 			break
 		}
 	}
@@ -1241,6 +1240,97 @@ func TestSharedStringsError(t *testing.T) {
 	f.tempFiles.Range(func(k, v interface{}) bool {
 		return assert.NoError(t, os.Remove(v.(string)))
 	})
+}
+
+func TestSharedStringItemEmptyTempRange(t *testing.T) {
+	f := NewFile()
+	tmp, err := os.CreateTemp("", "excelize-shared-string-empty-*")
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, tmp.Close())
+		assert.NoError(t, os.Remove(tmp.Name()))
+	}()
+	_, err = tmp.WriteString("abc30")
+	assert.NoError(t, err)
+
+	f.tempFiles.Store(defaultXMLPathSharedStrings, "test-shared-strings.xml")
+	f.sharedStringTemp = tmp
+	f.sharedStringItem = [][]uint{
+		{0, 3},
+		{3, 3},
+		{3, 5},
+	}
+
+	got, err := f.getFromStringItem(0)
+	assert.NoError(t, err)
+	assert.Equal(t, "abc", got)
+
+	got, err = f.getFromStringItem(1)
+	assert.NoError(t, err)
+	assert.Empty(t, got)
+
+	got, err = f.getFromStringItem(2)
+	assert.NoError(t, err)
+	assert.Equal(t, "30", got)
+
+	_, err = f.getFromStringItem(3)
+	assert.Error(t, err)
+}
+
+func TestTempSharedStringEmptyValueViaCellReaders(t *testing.T) {
+	f := NewFile()
+	defer func() {
+		assert.NoError(t, f.Close())
+	}()
+
+	var sharedStrings strings.Builder
+	sharedStrings.WriteString(`<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="33" uniqueCount="33">`)
+	sharedStrings.WriteString(`<si><t>header</t></si>`)
+	for i := 1; i < 30; i++ {
+		sharedStrings.WriteString(fmt.Sprintf(`<si><t>filler-%d</t></si>`, i))
+	}
+	sharedStrings.WriteString(`<si><t></t></si>`)
+	sharedStrings.WriteString(`<si><t>left</t></si>`)
+	sharedStrings.WriteString(`<si><t>right</t></si>`)
+	sharedStrings.WriteString(`</sst>`)
+
+	tmp, err := os.CreateTemp("", "excelize-shared-strings-*.xml")
+	assert.NoError(t, err)
+	_, err = tmp.WriteString(sharedStrings.String())
+	assert.NoError(t, err)
+	assert.NoError(t, tmp.Close())
+	f.tempFiles.Store(defaultXMLPathSharedStrings, tmp.Name())
+
+	sheetXMLPath, ok := f.getSheetXMLPath("Sheet1")
+	assert.True(t, ok)
+	f.Sheet.Store(sheetXMLPath, &xlsxWorksheet{
+		SheetData: xlsxSheetData{Row: []xlsxRow{
+			{R: 1, C: []xlsxC{{R: "A1", T: "s", V: "0"}}},
+			{R: 2, C: []xlsxC{
+				{R: "A2", T: "s", V: "31"},
+				{R: "B2", T: "s", V: "30"},
+				{R: "C2", T: "s", V: "32"},
+			}},
+		}},
+	})
+
+	got, err := f.GetCellValue("Sheet1", "B2", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Empty(t, got)
+
+	got, err = f.GetCellValue("Sheet1", "C2", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Equal(t, "right", got)
+
+	rows, err := f.GetRows("Sheet1", Options{RawCellValue: true})
+	assert.NoError(t, err)
+	assert.Equal(t, [][]string{{"header"}, {"left", "", "right"}}, rows)
+
+	f.sharedStringItem[30] = []uint{2, 1}
+	_, err = f.GetCellValue("Sheet1", "B2", Options{RawCellValue: true})
+	assert.Error(t, err)
+	_, err = f.GetRows("Sheet1", Options{RawCellValue: true})
+	assert.Error(t, err)
 }
 
 func TestSetCellIntFunc(t *testing.T) {

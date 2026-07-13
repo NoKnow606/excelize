@@ -14,6 +14,7 @@ package excelize
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -69,7 +70,10 @@ func (f *File) GetRows(sheet string, opts ...Options) ([][]string, error) {
 		cur++
 		row, err := rows.Columns(opts...)
 		if err != nil {
-			break
+			if closeErr := rows.Close(); closeErr != nil {
+				return results[:maxVal], fmt.Errorf("%w; close rows: %v", err, closeErr)
+			}
+			return results[:maxVal], err
 		}
 		if len(row) > 0 {
 			if emptyRows := cur - maxVal - 1; emptyRows > 0 {
@@ -338,7 +342,12 @@ func (rows *Rows) rowXMLHandler(rowIterator *rowXMLIterator, xmlElement *xml.Sta
 			}
 		}
 		blank := rowIterator.cellCol - len(rowIterator.cells)
-		if val, _ := colCell.getValueFrom(rows.f, rows.sst, raw); val != "" || colCell.F != nil {
+		val, err := colCell.getValueFrom(rows.f, rows.sst, raw)
+		if err != nil {
+			rowIterator.err = err
+			return
+		}
+		if val != "" || colCell.F != nil {
 			rowIterator.cells = append(appendSpace(blank, rowIterator.cells), val)
 		}
 	}
@@ -490,12 +499,12 @@ func (f *File) Rows(sheet string) (*Rows, error) {
 
 // getFromStringItem build shared string item offset list from system temporary
 // file at one time, and return value by given to string index.
-func (f *File) getFromStringItem(index int) string {
+func (f *File) getFromStringItem(index int) (string, error) {
 	if index < 0 {
-		return strconv.Itoa(index)
+		return "", fmt.Errorf("invalid shared string index %d", index)
 	}
 	if _, ok := f.tempFiles.Load(defaultXMLPathSharedStrings); !ok {
-		return strconv.Itoa(index)
+		return "", fmt.Errorf("shared strings temp XML is not available for index %d", index)
 	}
 
 	f.sharedStringItemMu.Lock()
@@ -503,21 +512,27 @@ func (f *File) getFromStringItem(index int) string {
 
 	if f.sharedStringTemp == nil {
 		if err := f.buildSharedStringItemCacheLocked(); err != nil {
-			return strconv.Itoa(index)
+			return "", fmt.Errorf("build shared string temp index for item %d: %w", index, err)
 		}
 	}
 	if len(f.sharedStringItem) <= index {
-		return strconv.Itoa(index)
+		return "", fmt.Errorf("shared string index %d out of range %d", index, len(f.sharedStringItem))
 	}
 	offsetRange := f.sharedStringItem[index]
-	if len(offsetRange) != 2 || offsetRange[0] >= offsetRange[1] {
-		return strconv.Itoa(index)
+	if len(offsetRange) != 2 {
+		return "", fmt.Errorf("invalid shared string offset range for index %d: %v", index, offsetRange)
+	}
+	if offsetRange[0] > offsetRange[1] {
+		return "", fmt.Errorf("invalid shared string offset range for index %d: %v", index, offsetRange)
+	}
+	if offsetRange[0] == offsetRange[1] {
+		return "", nil
 	}
 	buf := make([]byte, offsetRange[1]-offsetRange[0])
 	if _, err := f.sharedStringTemp.ReadAt(buf, int64(offsetRange[0])); err != nil {
-		return strconv.Itoa(index)
+		return "", fmt.Errorf("read shared string item %d: %w", index, err)
 	}
-	return string(buf)
+	return string(buf), nil
 }
 
 // buildSharedStringItemCacheLocked materializes the shared string offset table
