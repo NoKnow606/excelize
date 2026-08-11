@@ -256,6 +256,9 @@ func (f *File) extractINDEXMATCH2DPattern(sheet, cell, formula string) *indexMat
 		// Not a 2D INDEX-MATCH pattern
 		return nil
 	}
+	if !isWholeColumnRange(arrayRange) || extractColumnFromRange(matchRange1) == "" || !isWholeColumnRange(matchRange2) {
+		return nil
+	}
 
 	// Create pattern
 	pattern := &indexMatch2DPattern{
@@ -660,6 +663,9 @@ func (f *File) extractINDEXMATCH1DPattern(sheet, cell, formula string) *indexMat
 
 	lookupCell := strings.TrimSpace(matchArgs[0])
 	matchRange := strings.TrimSpace(matchArgs[1])
+	if extractColumnFromRange(arrayRange) == "" || extractColumnFromRange(matchRange) == "" {
+		return nil
+	}
 
 	// Create pattern
 	pattern := &indexMatch1DPattern{
@@ -839,6 +845,9 @@ func (f *File) extractAverageIndexMatchPattern(sheet, cell, formula string) *ave
 
 	lookupCell := strings.TrimSpace(matchArgs[0])
 	matchRange := strings.TrimSpace(matchArgs[1])
+	if !isWholeColumnRange(arrayRange) || extractColumnFromRange(matchRange) == "" {
+		return nil
+	}
 
 	// Create pattern
 	pattern := &averageIndexMatchPattern{

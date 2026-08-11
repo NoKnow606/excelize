@@ -259,3 +259,123 @@ func TestGetCellValueOrCalcCache(t *testing.T) {
 		t.Fatalf("expected cached numeric string, got %s", got)
 	}
 }
+
+func TestExtractColumnFromRangeOnlyAcceptsWholeColumnRanges(t *testing.T) {
+	if got := extractColumnFromRange("Data!$C:$C"); got != "C" {
+		t.Fatalf("whole-column range = %q, want C", got)
+	}
+
+	for _, rangeRef := range []string{
+		"Data!$C$2:$C$29",
+		"Data!$C:$D",
+		"Data!$C$2",
+	} {
+		if got := extractColumnFromRange(rangeRef); got != "" {
+			t.Fatalf("ineligible batch range %q = %q, want empty", rangeRef, got)
+		}
+	}
+}
+
+func TestBatchScannersRejectInvalidColumnNames(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	rows := [][]string{{"sku", "north", "10"}}
+
+	if got := f.scanRowsAndBuild1DResultMap("Data", rows, "C2", "A"); len(got) != 0 {
+		t.Fatalf("1D scanner returned %v for invalid column", got)
+	}
+	if got := f.scanRowsAndBuildResultMap("Data", rows, "C2", "A", "B"); len(got) != 0 {
+		t.Fatalf("2D scanner returned %v for invalid column", got)
+	}
+	if got := f.scanRowsAndBuildAverageMap("Data", rows, "C2", "A", "B"); len(got) != 0 {
+		t.Fatalf("average scanner returned %v for invalid column", got)
+	}
+}
+
+func TestBatchINDEXMATCHSkipsBoundedRanges(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	if err := f.SetSheetName("Sheet1", "Summary"); err != nil {
+		t.Fatalf("rename summary sheet: %v", err)
+	}
+	if _, err := f.NewSheet("Data"); err != nil {
+		t.Fatalf("create data sheet: %v", err)
+	}
+
+	for cell, value := range map[string]interface{}{
+		"A2": "SKU-1",
+		"A3": "SKU-2",
+		"B2": 10,
+		"B3": 20,
+	} {
+		if err := f.SetCellValue("Data", cell, value); err != nil {
+			t.Fatalf("set Data!%s: %v", cell, err)
+		}
+	}
+	if err := f.SetCellValue("Summary", "A1", "SKU-2"); err != nil {
+		t.Fatalf("set lookup value: %v", err)
+	}
+
+	formula := "=INDEX(Data!$B$2:$B$3,MATCH($A1,Data!$A$2:$A$3,0))"
+	if err := f.SetCellFormula("Summary", "B1", formula); err != nil {
+		t.Fatalf("set formula: %v", err)
+	}
+
+	if got, err := f.CalcCellValue("Summary", "B1"); err != nil || got != "20" {
+		t.Fatalf("ordinary calculation = %q, %v; want 20, nil", got, err)
+	}
+
+	formulas := map[string]string{"Summary!B1": formula}
+	if results := f.batchCalculateINDEXMATCH(formulas); len(results) != 0 {
+		t.Fatalf("legacy batch result = %v, want no result", results)
+	}
+	if results := f.batchCalculateINDEXMATCHWithCache(formulas, NewWorksheetCache()); len(results) != 0 {
+		t.Fatalf("cached batch result = %v, want no result", results)
+	}
+}
+
+func TestRecalculateSheetWithDependencyFallsBackForBoundedSUMIFS(t *testing.T) {
+	f := NewFile()
+	t.Cleanup(func() { _ = f.Close() })
+
+	if err := f.SetSheetName("Sheet1", "Summary"); err != nil {
+		t.Fatalf("rename summary sheet: %v", err)
+	}
+	if _, err := f.NewSheet("Data"); err != nil {
+		t.Fatalf("create data sheet: %v", err)
+	}
+
+	for cell, value := range map[string]interface{}{
+		"A2": "SKU-1", "B2": "North", "C2": 10,
+		"A3": "SKU-1", "B3": "North", "C3": 20,
+		"A4": "SKU-2", "B4": "South", "C4": 40,
+	} {
+		if err := f.SetCellValue("Data", cell, value); err != nil {
+			t.Fatalf("set Data!%s: %v", cell, err)
+		}
+	}
+	if err := f.SetCellValue("Summary", "A1", "SKU-1"); err != nil {
+		t.Fatalf("set SKU criterion: %v", err)
+	}
+	if err := f.SetCellValue("Summary", "B1", "North"); err != nil {
+		t.Fatalf("set region criterion: %v", err)
+	}
+
+	formula := "SUMIFS(Data!$C$2:$C$4,Data!$A$2:$A$4,$A$1,Data!$B$2:$B$4,$B$1)+0"
+	for _, cell := range []string{"C1", "D1", "E1", "F1", "G1"} {
+		if err := f.SetCellFormula("Summary", cell, formula); err != nil {
+			t.Fatalf("set Summary!%s formula: %v", cell, err)
+		}
+	}
+
+	if err := f.RecalculateSheetWithDependency("Summary"); err != nil {
+		t.Fatalf("recalculate summary: %v", err)
+	}
+	for _, cell := range []string{"C1", "D1", "E1", "F1", "G1"} {
+		if got, err := f.GetCellValue("Summary", cell); err != nil || got != "30" {
+			t.Fatalf("Summary!%s = %q, %v; want 30, nil", cell, got, err)
+		}
+	}
+}

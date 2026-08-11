@@ -378,14 +378,20 @@ func (f *File) calculateSUMIFS1DPatternWithCache(pattern *sumifs1DPattern, works
 	}
 
 	// Build 1D result map: criteria1Value -> sum
-	sumColIdx, _ := ColumnNameToNumber(sumCol)
+	sumColIdx, err := ColumnNameToNumber(sumCol)
+	if err != nil {
+		return map[string]float64{}
+	}
+	criteria1ColIdx, err := ColumnNameToNumber(criteria1Col)
+	if err != nil {
+		return map[string]float64{}
+	}
 	sumColIdx--
-	criteria1ColIdx, _ := ColumnNameToNumber(criteria1Col)
 	criteria1ColIdx--
 
 	resultMap := make(map[string]float64)
 	for _, row := range rows {
-		if criteria1ColIdx >= len(row) || sumColIdx >= len(row) {
+		if criteria1ColIdx < 0 || sumColIdx < 0 || criteria1ColIdx >= len(row) || sumColIdx >= len(row) {
 			continue
 		}
 
@@ -629,8 +635,14 @@ func (f *File) scanRowsAndBuild1DResultMap(
 	}
 
 	// Convert column letters to indices
-	sumColIdx, _ := ColumnNameToNumber(sumCol)
-	criteria1ColIdx, _ := ColumnNameToNumber(criteria1Col)
+	sumColIdx, err := ColumnNameToNumber(sumCol)
+	if err != nil {
+		return nil
+	}
+	criteria1ColIdx, err := ColumnNameToNumber(criteria1Col)
+	if err != nil {
+		return nil
+	}
 
 	sumColIdx--       // Convert to 0-based
 	criteria1ColIdx-- // Convert to 0-based
@@ -673,10 +685,10 @@ func (f *File) scanRowsAndBuild1DResultMap(
 				// Extract values from columns
 				var c1, sumVal string
 
-				if criteria1ColIdx < len(row) {
+				if criteria1ColIdx >= 0 && criteria1ColIdx < len(row) {
 					c1 = row[criteria1ColIdx]
 				}
-				if sumColIdx < len(row) {
+				if sumColIdx >= 0 && sumColIdx < len(row) {
 					sumVal = row[sumColIdx]
 				}
 
@@ -918,22 +930,48 @@ func extractSheetName(rangeRef string) string {
 	return strings.Trim(parts[0], "'")
 }
 
-// extractColumnFromRange extracts column letter from range reference
-// e.g., 'sheet'!$H:$H -> H
-func extractColumnFromRange(rangeRef string) string {
+func wholeColumnRangeColumns(rangeRef string) (string, string, bool) {
 	parts := strings.Split(rangeRef, "!")
-	if len(parts) != 2 {
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+		return "", "", false
+	}
+
+	rangeParts := strings.Split(strings.ReplaceAll(parts[1], "$", ""), ":")
+	if len(rangeParts) != 2 {
+		return "", "", false
+	}
+
+	startColumn := strings.ToUpper(strings.TrimSpace(rangeParts[0]))
+	endColumn := strings.ToUpper(strings.TrimSpace(rangeParts[1]))
+	if startColumn == "" || endColumn == "" {
+		return "", "", false
+	}
+	if _, err := ColumnNameToNumber(startColumn); err != nil {
+		return "", "", false
+	}
+	if _, err := ColumnNameToNumber(endColumn); err != nil {
+		return "", "", false
+	}
+
+	return startColumn, endColumn, true
+}
+
+// isWholeColumnRange reports whether a range contains only column references.
+// Batch scanners do not preserve row bounds, so bounded ranges must use the
+// regular formula evaluator instead.
+func isWholeColumnRange(rangeRef string) bool {
+	_, _, ok := wholeColumnRangeColumns(rangeRef)
+	return ok
+}
+
+// extractColumnFromRange returns a column only for a single whole-column range.
+func extractColumnFromRange(rangeRef string) string {
+	startColumn, endColumn, ok := wholeColumnRangeColumns(rangeRef)
+	if !ok || startColumn != endColumn {
 		return ""
 	}
 
-	ref := parts[1]
-	// Remove $ and :$H part
-	ref = strings.ReplaceAll(ref, "$", "")
-	if idx := strings.Index(ref, ":"); idx != -1 {
-		ref = ref[:idx]
-	}
-
-	return ref
+	return startColumn
 }
 
 // scanRowsAndBuildResultMap scans rows and builds result map concurrently
@@ -948,9 +986,18 @@ func (f *File) scanRowsAndBuildResultMap(
 	}
 
 	// Convert column letters to indices
-	sumColIdx, _ := ColumnNameToNumber(sumCol)
-	criteria1ColIdx, _ := ColumnNameToNumber(criteria1Col)
-	criteria2ColIdx, _ := ColumnNameToNumber(criteria2Col)
+	sumColIdx, err := ColumnNameToNumber(sumCol)
+	if err != nil {
+		return nil
+	}
+	criteria1ColIdx, err := ColumnNameToNumber(criteria1Col)
+	if err != nil {
+		return nil
+	}
+	criteria2ColIdx, err := ColumnNameToNumber(criteria2Col)
+	if err != nil {
+		return nil
+	}
 
 	sumColIdx--       // Convert to 0-based
 	criteria1ColIdx-- // Convert to 0-based
@@ -994,13 +1041,13 @@ func (f *File) scanRowsAndBuildResultMap(
 				// Extract values from columns
 				var c1, c2, sumVal string
 
-				if criteria1ColIdx < len(row) {
+				if criteria1ColIdx >= 0 && criteria1ColIdx < len(row) {
 					c1 = row[criteria1ColIdx]
 				}
-				if criteria2ColIdx < len(row) {
+				if criteria2ColIdx >= 0 && criteria2ColIdx < len(row) {
 					c2 = row[criteria2ColIdx]
 				}
-				if sumColIdx < len(row) {
+				if sumColIdx >= 0 && sumColIdx < len(row) {
 					sumVal = row[sumColIdx]
 				}
 
@@ -1306,9 +1353,18 @@ func (f *File) scanRowsAndBuildAverageMap(
 	}
 
 	// Convert column letters to indices
-	averageColIdx, _ := ColumnNameToNumber(averageCol)
-	criteria1ColIdx, _ := ColumnNameToNumber(criteria1Col)
-	criteria2ColIdx, _ := ColumnNameToNumber(criteria2Col)
+	averageColIdx, err := ColumnNameToNumber(averageCol)
+	if err != nil {
+		return nil
+	}
+	criteria1ColIdx, err := ColumnNameToNumber(criteria1Col)
+	if err != nil {
+		return nil
+	}
+	criteria2ColIdx, err := ColumnNameToNumber(criteria2Col)
+	if err != nil {
+		return nil
+	}
 
 	averageColIdx--   // Convert to 0-based
 	criteria1ColIdx-- // Convert to 0-based
@@ -1352,13 +1408,13 @@ func (f *File) scanRowsAndBuildAverageMap(
 				// Extract values from columns
 				var c1, c2, avgVal string
 
-				if criteria1ColIdx < len(row) {
+				if criteria1ColIdx >= 0 && criteria1ColIdx < len(row) {
 					c1 = row[criteria1ColIdx]
 				}
-				if criteria2ColIdx < len(row) {
+				if criteria2ColIdx >= 0 && criteria2ColIdx < len(row) {
 					c2 = row[criteria2ColIdx]
 				}
-				if averageColIdx < len(row) {
+				if averageColIdx >= 0 && averageColIdx < len(row) {
 					avgVal = row[averageColIdx]
 				}
 

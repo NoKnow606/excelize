@@ -124,6 +124,14 @@ func (f *File) extractIndexMatchMultiCondPattern(sheet, cell, formula string) *i
 	if len(conditions) == 0 {
 		return nil
 	}
+	if !isWholeColumnRange(resultRange) {
+		return nil
+	}
+	for _, condition := range conditions {
+		if !isWholeColumnRange(condition.sourceRange) {
+			return nil
+		}
+	}
 
 	// Get source sheet from result range
 	sourceSheet := extractSheetName(resultRange)
