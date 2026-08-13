@@ -1082,26 +1082,126 @@ func (f *File) adjustAutoFilter(ws *xlsxWorksheet, sheet string, dir adjustDirec
 
 	coordinates, err := rangeRefToCoordinates(ws.AutoFilter.Ref)
 	if err != nil {
-		return err
+		return f.RemoveAutoFilterFull(sheet)
 	}
 	x1, y1, x2, y2 := coordinates[0], coordinates[1], coordinates[2], coordinates[3]
 
-	if (dir == rows && y1 == num && offset < 0) || (dir == columns && x1 == num && x2 == num) {
-		ws.AutoFilter = nil
-		for rowIdx := range ws.SheetData.Row {
-			rowData := &ws.SheetData.Row[rowIdx]
-			if rowData.R > y1 && rowData.R <= y2 {
-				rowData.Hidden = false
-			}
-		}
-		return err
+	if dir == rows && autoFilterHeaderDeleted(y1, num, offset) {
+		return f.RemoveAutoFilterFull(sheet)
 	}
 
-	coordinates = f.adjustAutoFilterHelper(dir, coordinates, num, offset)
+	originalX1 := x1
+	coordinates = adjustAutoFilterCoordinates(dir, coordinates, num, offset)
 	x1, y1, x2, y2 = coordinates[0], coordinates[1], coordinates[2], coordinates[3]
+	if x1 < 1 || y1 < 1 || x2 < x1 || y2 < y1 {
+		return f.RemoveAutoFilterFull(sheet)
+	}
+	if dir == columns {
+		ws.AutoFilter.FilterColumn = adjustAutoFilterColumns(ws.AutoFilter.FilterColumn, originalX1, x1, num, offset)
+	}
 
 	ws.AutoFilter.Ref, err = coordinatesToRangeRef([]int{x1, y1, x2, y2})
+	if err != nil {
+		return err
+	}
+	if ws.SortState != nil {
+		if sortCoordinates, sortErr := rangeRefToCoordinates(ws.SortState.Ref); sortErr == nil {
+			sortCoordinates = adjustAutoFilterCoordinates(dir, sortCoordinates, num, offset)
+			if sortCoordinates[0] < 1 || sortCoordinates[1] < 1 || sortCoordinates[2] < sortCoordinates[0] || sortCoordinates[3] < sortCoordinates[1] {
+				ws.SortState = nil
+			} else {
+				ws.SortState.Ref, err = coordinatesToRangeRef(sortCoordinates)
+			}
+		}
+	}
 	return err
+}
+
+// adjustAutoFilterCoordinates preserves the remaining portion of an
+// AutoFilter when a multi-row or multi-column deletion overlaps its boundary.
+func adjustAutoFilterCoordinates(dir adjustDirection, coordinates []int, num, offset int) []int {
+	if offset >= 0 {
+		if dir == rows {
+			if coordinates[1] >= num {
+				coordinates[1] += offset
+			}
+			if coordinates[3] >= num {
+				coordinates[3] += offset
+			}
+		} else {
+			if coordinates[0] >= num {
+				coordinates[0] += offset
+			}
+			if coordinates[2] >= num {
+				coordinates[2] += offset
+			}
+		}
+		return coordinates
+	}
+	deletedEnd := num - offset - 1
+	if dir == rows {
+		coordinates[1] = adjustAutoFilterStartBoundary(coordinates[1], num, deletedEnd, offset)
+		coordinates[3] = adjustAutoFilterEndBoundary(coordinates[3], num, deletedEnd, offset)
+	} else {
+		coordinates[0] = adjustAutoFilterStartBoundary(coordinates[0], num, deletedEnd, offset)
+		coordinates[2] = adjustAutoFilterEndBoundary(coordinates[2], num, deletedEnd, offset)
+	}
+	return coordinates
+}
+
+func adjustAutoFilterStartBoundary(boundary, deletedStart, deletedEnd, offset int) int {
+	if boundary < deletedStart {
+		return boundary
+	}
+	if boundary > deletedEnd {
+		return boundary + offset
+	}
+	return deletedStart
+}
+
+func adjustAutoFilterEndBoundary(boundary, deletedStart, deletedEnd, offset int) int {
+	if boundary < deletedStart {
+		return boundary
+	}
+	if boundary > deletedEnd {
+		return boundary + offset
+	}
+	return deletedStart - 1
+}
+
+func autoFilterHeaderDeleted(y1, num, offset int) bool {
+	if offset >= 0 {
+		return false
+	}
+	deletedEnd := num - offset - 1
+	return num <= y1 && deletedEnd >= y1
+}
+
+func adjustAutoFilterColumns(columns []*xlsxFilterColumn, originalX1, adjustedX1, num, offset int) []*xlsxFilterColumn {
+	if len(columns) == 0 {
+		return columns
+	}
+	adjusted := make([]*xlsxFilterColumn, 0, len(columns))
+	deletedEnd := num - offset - 1
+	for _, column := range columns {
+		oldAbsoluteColumn := originalX1 + column.ColID
+		newAbsoluteColumn := oldAbsoluteColumn
+		if offset > 0 {
+			if oldAbsoluteColumn >= num {
+				newAbsoluteColumn += offset
+			}
+		} else {
+			if oldAbsoluteColumn >= num && oldAbsoluteColumn <= deletedEnd {
+				continue
+			}
+			if oldAbsoluteColumn > deletedEnd {
+				newAbsoluteColumn += offset
+			}
+		}
+		column.ColID = newAbsoluteColumn - adjustedX1
+		adjusted = append(adjusted, column)
+	}
+	return adjusted
 }
 
 // adjustAutoFilterHelper provides a function for adjusting auto filter to

@@ -208,15 +208,16 @@ func (f *File) SetAutoFilterFull(sheet, ref string, columns []AutoFilterColumnRe
 }
 
 // RemoveAutoFilterFull removes the AutoFilter from a worksheet, clearing the
-// filter, filterMode, and the corresponding DefinedName entry.
+// filter, sort state, filterMode, and the corresponding DefinedName entry.
 func (f *File) RemoveAutoFilterFull(sheet string) error {
 	ws, err := f.workSheetReader(sheet)
 	if err != nil {
 		return err
 	}
 
-	// Clear AutoFilter
+	// Clear AutoFilter and its dependent worksheet state.
 	ws.AutoFilter = nil
+	ws.SortState = nil
 
 	// Clear filterMode
 	if ws.SheetPr != nil {
