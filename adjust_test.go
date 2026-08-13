@@ -10,6 +10,7 @@ import (
 	_ "image/jpeg"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAdjustMergeCells(t *testing.T) {
@@ -296,17 +297,233 @@ func TestAdjustAutoFilter(t *testing.T) {
 			Ref: "A1:A3",
 		},
 	}, "Sheet1", rows, 1, -1, 1))
-	// Test adjustAutoFilter with illegal cell reference
-	assert.Equal(t, f.adjustAutoFilter(&xlsxWorksheet{
-		AutoFilter: &xlsxAutoFilter{
-			Ref: "A:B1",
-		},
-	}, "Sheet1", rows, 0, 0, 1), newCellNameToCoordinatesError("A", newInvalidCellNameError("A")))
-	assert.Equal(t, f.adjustAutoFilter(&xlsxWorksheet{
-		AutoFilter: &xlsxAutoFilter{
-			Ref: "A1:B",
-		},
-	}, "Sheet1", rows, 0, 0, 1), newCellNameToCoordinatesError("B", newInvalidCellNameError("B")))
+	// Malformed legacy filters must not block unrelated structural operations.
+	worksheet, err := f.workSheetReader("Sheet1")
+	require.NoError(t, err)
+	worksheet.AutoFilter = &xlsxAutoFilter{Ref: "A:B1"}
+	assert.NoError(t, f.adjustAutoFilter(worksheet, "Sheet1", rows, 0, 0, 1))
+	assert.Nil(t, worksheet.AutoFilter)
+	worksheet.AutoFilter = &xlsxAutoFilter{Ref: "A1:B"}
+	assert.NoError(t, f.adjustAutoFilter(worksheet, "Sheet1", rows, 0, 0, 1))
+	assert.Nil(t, worksheet.AutoFilter)
+
+	t.Run("preserves advanced criteria", func(t *testing.T) {
+		worksheet := &xlsxWorksheet{AutoFilter: &xlsxAutoFilter{
+			Ref: "E1:G4",
+			FilterColumn: []*xlsxFilterColumn{{
+				ColID:         1,
+				HiddenButton:  true,
+				ShowButton:    true,
+				DynamicFilter: &xlsxDynamicFilter{Type: "aboveAverage"},
+				IconFilter:    &xlsxIconFilter{IconID: 2, IconSet: "3Arrows"},
+				Top10:         &xlsxTop10{Top: true, Val: 10},
+				Filters: &xlsxFilters{
+					CalendarType:  "gregorian",
+					DateGroupItem: []*xlsxDateGroupItem{{Year: 2026, Month: 8, DateTimeGrouping: "month"}},
+				},
+			}},
+		}}
+		assert.NoError(t, f.adjustAutoFilter(worksheet, "Sheet1", columns, 2, -2, 1))
+		assert.Equal(t, "C1:E4", worksheet.AutoFilter.Ref)
+		column := worksheet.AutoFilter.FilterColumn[0]
+		assert.Equal(t, 1, column.ColID)
+		assert.True(t, column.HiddenButton)
+		assert.True(t, column.ShowButton)
+		assert.Equal(t, "aboveAverage", column.DynamicFilter.Type)
+		assert.Equal(t, "3Arrows", column.IconFilter.IconSet)
+		assert.Equal(t, float64(10), column.Top10.Val)
+		assert.Equal(t, "gregorian", column.Filters.CalendarType)
+	})
+
+	t.Run("removes filter metadata when header row is deleted", func(t *testing.T) {
+		file := NewFile()
+		require.NoError(t, file.AutoFilter("Sheet1", "A1:A3", nil))
+		worksheet, err := file.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		worksheet.SheetData.Row = []xlsxRow{{R: 1}, {R: 2, Hidden: true}, {R: 3}}
+		require.NoError(t, file.RemoveRows("Sheet1", 1, 1))
+		assert.Nil(t, worksheet.AutoFilter)
+		assert.True(t, worksheet.SheetData.Row[0].Hidden)
+		workbook, err := file.workbookReader()
+		require.NoError(t, err)
+		for _, name := range workbook.DefinedNames.DefinedName {
+			assert.NotEqual(t, builtInDefinedNames[3], name.Name)
+		}
+	})
+
+	t.Run("keeps filter when its first column is deleted", func(t *testing.T) {
+		worksheet := &xlsxWorksheet{AutoFilter: &xlsxAutoFilter{Ref: "E1:G4", FilterColumn: []*xlsxFilterColumn{{ColID: 1}}}}
+		assert.NoError(t, f.adjustAutoFilter(worksheet, "Sheet1", columns, 5, -1, 1))
+		assert.Equal(t, "E1:F4", worksheet.AutoFilter.Ref)
+		assert.Equal(t, 0, worksheet.AutoFilter.FilterColumn[0].ColID)
+	})
+
+	t.Run("updates sort state with filter", func(t *testing.T) {
+		worksheet := &xlsxWorksheet{AutoFilter: &xlsxAutoFilter{Ref: "A1:C4"}, SortState: &xlsxSortState{Ref: "A1:C4"}}
+		assert.NoError(t, f.adjustAutoFilter(worksheet, "Sheet1", rows, 2, 2, 1))
+		assert.Equal(t, "A1:C6", worksheet.AutoFilter.Ref)
+		assert.Equal(t, "A1:C6", worksheet.SortState.Ref)
+	})
+}
+
+func TestAdjustAutoFilterStructuralOperations(t *testing.T) {
+	newFilteredFile := func(t *testing.T) *File {
+		t.Helper()
+		file := NewFile()
+		for row := 1; row <= 4; row++ {
+			for col := 5; col <= 7; col++ {
+				cell, err := CoordinatesToCellName(col, row)
+				require.NoError(t, err)
+				require.NoError(t, file.SetCellValue("Sheet1", cell, cell))
+			}
+		}
+		require.NoError(t, file.AutoFilter("Sheet1", "E1:G4", nil))
+		worksheet, err := file.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		worksheet.AutoFilter.FilterColumn = []*xlsxFilterColumn{{
+			ColID:         1,
+			HiddenButton:  true,
+			ShowButton:    true,
+			DynamicFilter: &xlsxDynamicFilter{Type: "aboveAverage"},
+			IconFilter:    &xlsxIconFilter{IconID: 2, IconSet: "3Arrows"},
+			Top10:         &xlsxTop10{Top: true, Val: 10},
+			Filters: &xlsxFilters{
+				CalendarType:  "gregorian",
+				DateGroupItem: []*xlsxDateGroupItem{{Year: 2026, Month: 8, DateTimeGrouping: "month"}},
+			},
+		}}
+		worksheet.SortState = &xlsxSortState{Ref: "E1:G4"}
+		return file
+	}
+
+	assertSavedFilter := func(t *testing.T, file *File, ref, sortRef string, colID int) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "autofilter.xlsx")
+		require.NoError(t, file.SaveAs(path))
+		reopened, err := OpenFile(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = reopened.Close() })
+		worksheet, err := reopened.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		require.NotNil(t, worksheet.AutoFilter)
+		assert.Equal(t, ref, worksheet.AutoFilter.Ref)
+		require.Len(t, worksheet.AutoFilter.FilterColumn, 1)
+		column := worksheet.AutoFilter.FilterColumn[0]
+		assert.Equal(t, colID, column.ColID)
+		assert.True(t, column.HiddenButton)
+		assert.True(t, column.ShowButton)
+		assert.Equal(t, "aboveAverage", column.DynamicFilter.Type)
+		assert.Equal(t, "3Arrows", column.IconFilter.IconSet)
+		assert.Equal(t, float64(10), column.Top10.Val)
+		assert.Equal(t, "gregorian", column.Filters.CalendarType)
+		require.NotNil(t, worksheet.SortState)
+		assert.Equal(t, sortRef, worksheet.SortState.Ref)
+	}
+
+	t.Run("insert rows", func(t *testing.T) {
+		file := newFilteredFile(t)
+		t.Cleanup(func() { _ = file.Close() })
+		require.NoError(t, file.InsertRows("Sheet1", 2, 2))
+		assertSavedFilter(t, file, "E1:G6", "E1:G6", 1)
+	})
+
+	t.Run("remove rows including header", func(t *testing.T) {
+		file := newFilteredFile(t)
+		t.Cleanup(func() { _ = file.Close() })
+		worksheet, err := file.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		worksheet.SheetData.Row[1].Hidden = true
+		require.NoError(t, file.RemoveRows("Sheet1", 1, 1))
+		path := filepath.Join(t.TempDir(), "autofilter-removed.xlsx")
+		require.NoError(t, file.SaveAs(path))
+		reopened, err := OpenFile(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = reopened.Close() })
+		worksheet, err = reopened.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		assert.Nil(t, worksheet.AutoFilter)
+		assert.Nil(t, worksheet.SortState)
+		assert.True(t, worksheet.SheetData.Row[0].Hidden)
+		workbook, err := reopened.workbookReader()
+		require.NoError(t, err)
+		for _, name := range workbook.DefinedNames.DefinedName {
+			assert.NotEqual(t, builtInDefinedNames[3], name.Name)
+		}
+	})
+
+	t.Run("remove only filter column clears sort state and preserves hidden rows", func(t *testing.T) {
+		file := NewFile()
+		t.Cleanup(func() { _ = file.Close() })
+		for row := 1; row <= 3; row++ {
+			require.NoError(t, file.SetCellValue("Sheet1", fmt.Sprintf("A%d", row), row))
+			require.NoError(t, file.SetCellValue("Sheet1", fmt.Sprintf("B%d", row), row))
+		}
+		require.NoError(t, file.AutoFilter("Sheet1", "A1:A3", nil))
+		worksheet, err := file.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		worksheet.SortState = &xlsxSortState{Ref: "A1:A3"}
+		worksheet.SheetData.Row[1].Hidden = true
+		require.NoError(t, file.RemoveCols("Sheet1", "A", 1))
+		path := filepath.Join(t.TempDir(), "autofilter-column-removed.xlsx")
+		require.NoError(t, file.SaveAs(path))
+		reopened, err := OpenFile(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = reopened.Close() })
+		worksheet, err = reopened.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		assert.Nil(t, worksheet.AutoFilter)
+		assert.Nil(t, worksheet.SortState)
+		assert.True(t, worksheet.SheetData.Row[1].Hidden)
+	})
+
+	t.Run("insert columns", func(t *testing.T) {
+		file := newFilteredFile(t)
+		t.Cleanup(func() { _ = file.Close() })
+		require.NoError(t, file.InsertCols("Sheet1", "F", 2))
+		assertSavedFilter(t, file, "E1:I4", "E1:I4", 3)
+	})
+
+	t.Run("remove leftmost column", func(t *testing.T) {
+		file := newFilteredFile(t)
+		t.Cleanup(func() { _ = file.Close() })
+		require.NoError(t, file.RemoveCols("Sheet1", "E", 1))
+		assertSavedFilter(t, file, "E1:F4", "E1:F4", 0)
+	})
+
+	t.Run("remove rightmost column", func(t *testing.T) {
+		file := newFilteredFile(t)
+		t.Cleanup(func() { _ = file.Close() })
+		require.NoError(t, file.RemoveCols("Sheet1", "G", 1))
+		assertSavedFilter(t, file, "E1:F4", "E1:F4", 1)
+	})
+
+	t.Run("remove final data row", func(t *testing.T) {
+		file := newFilteredFile(t)
+		t.Cleanup(func() { _ = file.Close() })
+		require.NoError(t, file.RemoveRows("Sheet1", 4, 1))
+		assertSavedFilter(t, file, "E1:G3", "E1:G3", 1)
+	})
+
+	t.Run("malformed filter does not block insert", func(t *testing.T) {
+		file := NewFile()
+		t.Cleanup(func() { _ = file.Close() })
+		worksheet, err := file.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		worksheet.AutoFilter = &xlsxAutoFilter{Ref: "A:B1"}
+		worksheet.SortState = &xlsxSortState{Ref: "A1:B3"}
+		require.NoError(t, file.InsertRows("Sheet1", 2, 1))
+		path := filepath.Join(t.TempDir(), "malformed-filter.xlsx")
+		require.NoError(t, file.SaveAs(path))
+		reopened, err := OpenFile(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = reopened.Close() })
+		result, err := reopened.GetAutoFilter("Sheet1")
+		require.NoError(t, err)
+		assert.Nil(t, result)
+		worksheet, err = reopened.workSheetReader("Sheet1")
+		require.NoError(t, err)
+		assert.Nil(t, worksheet.SortState)
+	})
 }
 
 func TestAdjustTable(t *testing.T) {
@@ -351,9 +568,13 @@ func TestAdjustHelper(t *testing.T) {
 	f.Sheet.Store("xl/worksheets/sheet2.xml", &xlsxWorksheet{
 		AutoFilter: &xlsxAutoFilter{Ref: "A1:B"},
 	})
-	// Test adjustHelper with illegal cell reference
+	// Invalid merge references still fail, while legacy AutoFilter references
+	// are cleared so structural edits can proceed.
 	assert.Equal(t, f.adjustHelper("Sheet1", rows, 0, 0), newCellNameToCoordinatesError("A", newInvalidCellNameError("A")))
-	assert.Equal(t, f.adjustHelper("Sheet2", rows, 0, 0), newCellNameToCoordinatesError("B", newInvalidCellNameError("B")))
+	assert.NoError(t, f.adjustHelper("Sheet2", rows, 0, 0))
+	worksheet, err := f.workSheetReader("Sheet2")
+	require.NoError(t, err)
+	assert.Nil(t, worksheet.AutoFilter)
 	// Test adjustHelper on not exists worksheet
 	assert.EqualError(t, f.adjustHelper("SheetN", rows, 0, 0), "sheet SheetN does not exist")
 }
