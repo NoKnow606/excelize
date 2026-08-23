@@ -2577,7 +2577,8 @@ func (f *File) clearCellCache(sheet, cell string) {
 	ref := fmt.Sprintf("%s!%s", sheet, cell)
 
 	// Clear calcCache for this cell
-	// Need to clear both raw and formatted cache entries
+	// Need to clear the formulaArg entry and both raw/formatted string entries.
+	f.calcCache.Delete(ref)
 	f.calcCache.Delete(fmt.Sprintf("%s!raw=true", ref))
 	f.calcCache.Delete(fmt.Sprintf("%s!raw=false", ref))
 
