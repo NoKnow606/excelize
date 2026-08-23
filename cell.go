@@ -730,13 +730,18 @@ func (f *File) getCellFormula(sheet, cell string, transformed bool) (string, err
 // RLock for better concurrency. It should be used when multiple goroutines
 // need to read cell formulas simultaneously (e.g., in batch calculation).
 func (f *File) getCellFormulaReadOnly(sheet, cell string, transformed bool) (string, error) {
-	return f.getCellStringFuncReadOnly(sheet, cell, func(x *xlsxWorksheet, c *xlsxC) (string, bool, error) {
-		if transformed && !f.formulaChecked {
+	if transformed {
+		f.formulaCheckMu.Lock()
+		if !f.formulaChecked {
 			if err := f.setArrayFormulaCells(); err != nil {
-				return "", false, err
+				f.formulaCheckMu.Unlock()
+				return "", err
 			}
 			f.formulaChecked = true
 		}
+		f.formulaCheckMu.Unlock()
+	}
+	return f.getCellStringFuncReadOnly(sheet, cell, func(x *xlsxWorksheet, c *xlsxC) (string, bool, error) {
 		if transformed && c.f != "" {
 			return c.f, true, nil
 		}

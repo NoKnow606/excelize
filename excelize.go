@@ -31,6 +31,7 @@ import (
 type File struct {
 	mu                 sync.Mutex
 	formulaMu          sync.Mutex // Mutex for temporary formula calculations and cell writes
+	formulaCheckMu     sync.Mutex // Mutex for one-time array formula normalization
 	recalcMu           sync.Mutex // Mutex for RecalculateAllWithDependency to prevent concurrent recalculation
 	checked            sync.Map
 	formulaChecked     bool

@@ -2,12 +2,17 @@ package excelize
 
 import (
 	"fmt"
+	"os"
 	"testing"
 )
 
 // TestListSheets 列出文件中的所有表
 func TestListSheets(t *testing.T) {
-	f, err := OpenFile("/Users/zhoujielun/Downloads/跨境电商-补货计划demo-8.xlsx")
+	path := os.Getenv("EXCELIZE_LIST_SHEETS_FILE")
+	if path == "" {
+		t.Skip("set EXCELIZE_LIST_SHEETS_FILE to run this fixture-based test")
+	}
+	f, err := OpenFile(path)
 	if err != nil {
 		t.Fatalf("打开文件失败: %v", err)
 	}
