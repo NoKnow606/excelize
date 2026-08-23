@@ -50,6 +50,9 @@ import (
 //   - Calculate temporary/derived values
 //   - What-if analysis scenarios
 func (f *File) CalcFormulaValue(sheet, cell, formula string, opts ...Options) (string, error) {
+	f.formulaMu.Lock()
+	defer f.formulaMu.Unlock()
+
 	ws, err := f.workSheetReader(sheet)
 	if err != nil {
 		return "", err
@@ -62,6 +65,7 @@ func (f *File) CalcFormulaValue(sheet, cell, formula string, opts ...Options) (s
 	}
 
 	// Try to get existing cell WITHOUT creating it (read-only approach)
+	ws.mu.Lock()
 	var c *xlsxC
 	var isTemporaryCell bool
 	var originalRowCount int
@@ -130,21 +134,28 @@ func (f *File) CalcFormulaValue(sheet, cell, formula string, opts ...Options) (s
 		}
 		rowData.C[col-1] = *c
 	}
+	ws.mu.Unlock()
 
 	// Calculate the result using the temporary formula
 	result, calcErr := f.CalcCellValue(sheet, cell, opts...)
 
 	// Clean up: restore original state
+	ws.mu.Lock()
 	if isTemporaryCell {
 		// Remove all temporarily created rows
 		ws.SheetData.Row = ws.SheetData.Row[:originalRowCount]
-	} else if !hadFormula {
-		// Cell existed but didn't have a formula before, remove temporary one
-		c.F = nil
 	} else {
-		// Restore original formula
-		c.F = originalFormula
+		// Reacquire the cell in case another operation resized the row slice.
+		c = &ws.SheetData.Row[row-1].C[col-1]
+		if !hadFormula {
+			// Cell existed but didn't have a formula before, remove temporary one
+			c.F = nil
+		} else {
+			// Restore original formula
+			c.F = originalFormula
+		}
 	}
+	ws.mu.Unlock()
 
 	// Clear cache for this cell only to prevent stale results
 	// Need to clear both raw and formatted cache entries

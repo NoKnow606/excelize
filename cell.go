@@ -128,6 +128,8 @@ func (f *File) GetCellType(sheet, cell string) (CellType, error) {
 // the cell value as number 0 or 60, then create and bind the date-time number
 // format style for the cell.
 func (f *File) SetCellValue(sheet, cell string, value interface{}) error {
+	f.formulaMu.Lock()
+	defer f.formulaMu.Unlock()
 	var err error
 	switch v := value.(type) {
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:

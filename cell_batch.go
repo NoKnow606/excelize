@@ -42,6 +42,8 @@ import (
 // Performance: For 40k cells, this function is ~13x faster than calling SetCellValue
 // in a loop, as it only clears the calculation cache once instead of 40k times.
 func (f *File) SetCellValues(sheet string, values map[string]interface{}) (err error) {
+	f.formulaMu.Lock()
+	defer f.formulaMu.Unlock()
 	if len(values) == 0 {
 		return nil
 	}
