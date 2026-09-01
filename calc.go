@@ -1049,10 +1049,17 @@ func (f *File) CalcCellValues(sheet string, cells []string, opts ...Options) (ma
 	results := make(map[string]string, len(cells))
 	var errors []error
 
-	// Calculate all cells, benefiting from cache
-	// Skip cells that fail to calculate and collect errors
+	// Calculate all cells, benefiting from cache.
+	// SQL formulas are persisted back to the worksheet so spill ranges and cached
+	// values survive subsequent reads and saves.
 	for _, cell := range cells {
+		formula, ferr := f.GetCellFormula(sheet, cell)
+		isSQLFormula := ferr == nil && IsSQLFormula(formula)
+
 		result, err := f.CalcCellValue(sheet, cell, opts...)
+		if isSQLFormula {
+			f.persistFormulaResult(sheet, cell, result, nil, false, false)
+		}
 		if err != nil {
 			errors = append(errors, fmt.Errorf("failed to calculate %s: %w", cell, err))
 			continue

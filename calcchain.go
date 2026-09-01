@@ -31,9 +31,77 @@ func (f *File) calcChainReader() (*xlsxCalcChain, error) {
 	return f.CalcChain, nil
 }
 
+func (f *File) sanitizeCalcChain() {
+	if f.CalcChain == nil {
+		return
+	}
+	if len(f.CalcChain.C) == 0 {
+		f.Pkg.Delete(defaultXMLPathCalcChain)
+		if content, err := f.contentTypesReader(); err == nil {
+			content.mu.Lock()
+			defer content.mu.Unlock()
+			for k, v := range content.Overrides {
+				if v.PartName == "/xl/calcChain.xml" {
+					content.Overrides = append(content.Overrides[:k], content.Overrides[k+1:]...)
+					break
+				}
+			}
+		}
+		f.CalcChain = nil
+		return
+	}
+
+	sheetMap := f.GetSheetMap()
+	filtered := make([]xlsxCalcChainC, 0, len(f.CalcChain.C))
+	currentSheetID := 0
+	lastWrittenSheetID := 0
+
+	for _, entry := range f.CalcChain.C {
+		if entry.I != 0 {
+			currentSheetID = entry.I
+		}
+
+		sheetName := sheetMap[currentSheetID]
+		if sheetName != "" {
+			formula, err := f.GetCellFormula(sheetName, entry.R)
+			if err == nil && isExternalCachedFormula(formula) {
+				continue
+			}
+		}
+
+		normalized := entry
+		if currentSheetID != 0 {
+			if currentSheetID != lastWrittenSheetID {
+				normalized.I = currentSheetID
+				lastWrittenSheetID = currentSheetID
+			} else {
+				normalized.I = 0
+			}
+		}
+		filtered = append(filtered, normalized)
+	}
+
+	f.CalcChain.C = filtered
+	if len(filtered) == 0 {
+		f.Pkg.Delete(defaultXMLPathCalcChain)
+		if content, err := f.contentTypesReader(); err == nil {
+			content.mu.Lock()
+			defer content.mu.Unlock()
+			for k, v := range content.Overrides {
+				if v.PartName == "/xl/calcChain.xml" {
+					content.Overrides = append(content.Overrides[:k], content.Overrides[k+1:]...)
+					break
+				}
+			}
+		}
+		f.CalcChain = nil
+	}
+}
+
 // calcChainWriter provides a function to save xl/calcChain.xml after
 // serialize structure.
 func (f *File) calcChainWriter() {
+	f.sanitizeCalcChain()
 	if f.CalcChain != nil && f.CalcChain.C != nil {
 		output, _ := xml.Marshal(f.CalcChain)
 		f.saveFileList(defaultXMLPathCalcChain, output)
@@ -249,10 +317,17 @@ func (f *File) clearCellFormulaCacheInWorksheet(ws *xlsxWorksheet, cell string) 
 		if ws.SheetData.Row[i].R == row {
 			for j := range ws.SheetData.Row[i].C {
 				if ws.SheetData.Row[i].C[j].R == cell {
-					// Clear cache if cell has a formula
+					// External cached formulas keep their worksheet cache and are not
+					// invalidated by dependency cache clearing.
 					if ws.SheetData.Row[i].C[j].F != nil {
-						ws.SheetData.Row[i].C[j].V = ""
-						ws.SheetData.Row[i].C[j].T = ""
+						formula := ws.SheetData.Row[i].C[j].F.Content
+						if formula == "" && ws.SheetData.Row[i].C[j].F.T == STCellFormulaTypeShared && ws.SheetData.Row[i].C[j].F.Si != nil {
+							formula, _ = getSharedFormula(ws, *ws.SheetData.Row[i].C[j].F.Si, cell)
+						}
+						if !isExternalCachedFormula(formula) {
+							ws.SheetData.Row[i].C[j].V = ""
+							ws.SheetData.Row[i].C[j].T = ""
+						}
 					}
 					return nil
 				}
@@ -439,6 +514,10 @@ func (f *File) recalculateCell(sheet, cell string) error {
 
 	// 记录统计
 	recordCellCalc(sheet, cell, formula, result, calcDuration, cacheHit)
+
+	if isExternalCachedFormula(formula) {
+		return nil
+	}
 
 	if err != nil {
 		// SQL formulas may have spilled values that need to be cleared even when

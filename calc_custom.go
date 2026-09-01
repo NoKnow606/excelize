@@ -2,6 +2,7 @@ package excelize
 
 import (
 	"container/list"
+	"strings"
 )
 
 // Custom formula stubs for functions handled externally (MCP tools, frontend rendering, etc.).
@@ -9,6 +10,27 @@ import (
 //
 // Note: excelize strips underscores from function names before lookup, so:
 //   AI_IMAGE -> AIIMAGE, FORMULA_BUTTON -> FORMULABUTTON, etc.
+
+func isExternalCachedFormula(formula string) bool {
+	formula = strings.TrimSpace(formula)
+	if formula == "" {
+		return false
+	}
+	if formula[0] == '=' {
+		formula = strings.TrimSpace(formula[1:])
+	}
+	idx := strings.IndexByte(formula, '(')
+	if idx <= 0 {
+		return false
+	}
+	name := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(formula[:idx]), "_", ""))
+	switch name {
+	case "AI", "AIIMAGE", "HTML", "FORMULABUTTON", "REFRESHBUTTON", "SKILLGENERATE":
+		return true
+	default:
+		return false
+	}
+}
 
 func cachedCellValue(fn *formulaFuncs) formulaArg {
 	val, err := fn.f.GetCellValue(fn.sheet, fn.cell)

@@ -93,6 +93,9 @@ func (f *File) buildDependencyGraph() *dependencyGraph {
 					}
 
 					if formula != "" {
+						if isExternalCachedFormula(formula) {
+							continue
+						}
 						fullCell := sheet + "!" + cell.R
 						formulasToProcess = append(formulasToProcess, struct {
 							fullCell string
@@ -1572,6 +1575,9 @@ func (f *File) buildDependencyGraphForSheet(targetSheet string) *dependencyGraph
 					}
 
 					if formula != "" {
+						if isExternalCachedFormula(formula) {
+							continue
+						}
 						fullCell := sheet + "!" + cell.R
 						formulasToProcess = append(formulasToProcess, struct {
 							fullCell string
@@ -3000,6 +3006,9 @@ func (f *File) RecalculateAffectedByCellsWithExclusion(updatedCells map[string]b
 					formula, _ = getSharedFormula(ws, *cell.F.Si, cell.R)
 				}
 				if formula == "" {
+					continue
+				}
+				if isExternalCachedFormula(formula) {
 					continue
 				}
 

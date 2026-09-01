@@ -93,6 +93,10 @@ type CellUpdate struct {
 	Value interface{} // 单元格值
 }
 
+func stringifyCellUpdateValue(value interface{}) string {
+	return stringifyInterfaceValue(value)
+}
+
 // FormulaUpdate 表示一个公式更新操作
 type FormulaUpdate struct {
 	Sheet   string // 工作表名称
@@ -804,7 +808,7 @@ func (f *File) BatchUpdateAndRecalculate(updates []CellUpdate) error {
 	//    即使依赖计算失败，缓存中也保留了正确的更新值
 	for _, update := range updates {
 		cacheKey := update.Sheet + "!" + update.Cell
-		valueStr := fmt.Sprintf("%v", update.Value)
+		valueStr := stringifyCellUpdateValue(update.Value)
 		f.calcCache.Store(cacheKey+"!raw=false", valueStr)
 		f.calcCache.Store(cacheKey+"!raw=true", valueStr)
 	}
@@ -1085,6 +1089,9 @@ func (f *File) updateCalcChainForFormulas(formulas []FormulaUpdate) error {
 
 	// 添加新的公式到 calcChain
 	for _, formula := range formulas {
+		if isExternalCachedFormula(formula.Formula) {
+			continue
+		}
 		// 检查是否已存在
 		if existingEntries[formula.Sheet] != nil && existingEntries[formula.Sheet][formula.Cell] {
 			continue // 已存在，跳过
@@ -1702,7 +1709,7 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalc(valueUpdates []CellUpdate,
 	//    即使依赖计算失败，缓存中也保留了正确的更新值
 	for _, update := range valueUpdates {
 		cacheKey := update.Sheet + "!" + update.Cell
-		valueStr := fmt.Sprintf("%v", update.Value)
+		valueStr := stringifyCellUpdateValue(update.Value)
 		// 存储 formulaArg 类型到缓存（供 rangeResolver 使用）
 		arg := inferFormulaResultType(valueStr)
 		f.calcCache.Store(cacheKey, arg)
@@ -1777,7 +1784,7 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalc(valueUpdates []CellUpdate,
 	// 8. 恢复更新的值到缓存
 	for _, update := range valueUpdates {
 		cacheKey := update.Sheet + "!" + update.Cell
-		valueStr := fmt.Sprintf("%v", update.Value)
+		valueStr := stringifyCellUpdateValue(update.Value)
 		// 存储 formulaArg 类型到缓存（供 rangeResolver 使用）
 		arg := inferFormulaResultType(valueStr)
 		f.calcCache.Store(cacheKey, arg)
@@ -1841,7 +1848,7 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 	valueMap := make(map[string]string) // "Sheet!Cell" -> value string
 	for _, update := range valueUpdates {
 		cacheKey := update.Sheet + "!" + update.Cell
-		valueStr := fmt.Sprintf("%v", update.Value)
+		valueStr := stringifyCellUpdateValue(update.Value)
 		arg := inferFormulaResultType(valueStr)
 		f.calcCache.Store(cacheKey, arg)
 		f.calcCache.Store(cacheKey+"!raw=false", valueStr)
@@ -1980,7 +1987,7 @@ func (f *File) BatchUpdateValuesAndFormulasWithRecalcV2(valueUpdates []CellUpdat
 	// 10. 恢复更新的值到缓存（增量重算可能清除了依赖于这些值的公式的缓存，但不会清除值本身）
 	for _, update := range valueUpdates {
 		cacheKey := update.Sheet + "!" + update.Cell
-		valueStr := fmt.Sprintf("%v", update.Value)
+		valueStr := stringifyCellUpdateValue(update.Value)
 		arg := inferFormulaResultType(valueStr)
 		f.calcCache.Store(cacheKey, arg)
 		f.calcCache.Store(cacheKey+"!raw=false", valueStr)
@@ -2377,6 +2384,9 @@ func (f *File) RebuildCalcChain() error {
 						formula, _ = getSharedFormula(ws, *cell.F.Si, cell.R)
 					}
 					if formula != "" {
+						if isExternalCachedFormula(formula) {
+							continue
+						}
 						calcChain.C = append(calcChain.C, xlsxCalcChainC{
 							R: cell.R,
 							I: sheetID,

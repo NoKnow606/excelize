@@ -2,6 +2,7 @@ package excelize
 
 import (
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -429,6 +430,12 @@ func (f *File) setFormulaValue(sheet, cellName, value string) {
 }
 
 func (f *File) persistFormulaResult(sheet, cellName, value string, worksheetCache *WorksheetCache, updateCaches, notify bool) {
+	if notify {
+		formula, err := f.GetCellFormula(sheet, cellName)
+		if err == nil && isExternalCachedFormula(formula) {
+			notify = false
+		}
+	}
 	if handled := f.persistSQLFormulaResult(sheet, cellName, value, worksheetCache, updateCaches, notify); handled {
 		return
 	}
@@ -450,10 +457,10 @@ func (f *File) persistScalarFormulaResult(sheet, cellName, value string, workshe
 	}
 
 	ws.mu.Lock()
-	c, _, _, err := ws.prepareCell(cellName)
+	c, err := prepareWorksheetCell(ws, cellName)
 	if err != nil {
 		ws.mu.Unlock()
-		log.Printf("  ⚠️  [persistScalarFormulaResult] prepareCell failed for %s!%s: %v", sheet, cellName, err)
+		log.Printf("  ⚠️  [persistScalarFormulaResult] prepareWorksheetCell failed for %s!%s: %v", sheet, cellName, err)
 		return
 	}
 
@@ -483,10 +490,10 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 	}
 
 	ws.mu.Lock()
-	c, _, _, err := ws.prepareCell(cellName)
+	c, err := prepareWorksheetCell(ws, cellName)
 	if err != nil {
 		ws.mu.Unlock()
-		log.Printf("  ⚠️  [persistSQLFormulaResult] prepareCell failed for %s!%s: %v", sheet, cellName, err)
+		log.Printf("  ⚠️  [persistSQLFormulaResult] prepareWorksheetCell failed for %s!%s: %v", sheet, cellName, err)
 		return true
 	}
 
@@ -533,6 +540,7 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 		return false
 	}
 	newRef := cellName + ":" + ref
+	clearRef := buildSQLResultClearRef(ws, cellName, oldRef, newRef)
 
 	type spillValue struct {
 		cell  string
@@ -561,14 +569,14 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 		}
 	}
 
-	if oldRef != "" {
-		clearWorksheetRangeValues(ws, oldRef, cellName)
+	if clearRef != "" {
+		clearWorksheetRangeValues(ws, clearRef, cellName)
 	}
 	if c.F != nil {
 		c.F.Ref = newRef
 	}
 	for _, item := range values {
-		target, _, _, err := ws.prepareCell(item.cell)
+		target, err := prepareWorksheetCell(ws, item.cell)
 		if err != nil {
 			continue
 		}
@@ -578,10 +586,11 @@ func (f *File) persistSQLFormulaResult(sheet, cellName, fallbackValue string, wo
 		target.V = item.value
 		target.T = inferXMLCellType(item.value)
 	}
+	refreshWorksheetDimension(ws)
 	ws.mu.Unlock()
 
-	if oldRef != "" {
-		clearSpillRangeCache(f, worksheetCache, sheet, oldRef, cellName)
+	if clearRef != "" {
+		clearSpillRangeCache(f, worksheetCache, sheet, clearRef, cellName)
 	}
 	if updateCaches {
 		for _, item := range values {
@@ -601,21 +610,127 @@ func clearWorksheetRangeValues(ws *xlsxWorksheet, ref, anchor string) {
 		return
 	}
 	_ = sortCoordinates(coordinates)
-	for col := coordinates[0]; col <= coordinates[2]; col++ {
-		for row := coordinates[1]; row <= coordinates[3]; row++ {
-			cellRef, err := CoordinatesToCellName(col, row)
-			if err != nil || cellRef == anchor {
+
+	for rowIdx := range ws.SheetData.Row {
+		rowData := &ws.SheetData.Row[rowIdx]
+		if rowData.R < coordinates[1] || rowData.R > coordinates[3] {
+			continue
+		}
+		for cellIdx := range rowData.C {
+			c := &rowData.C[cellIdx]
+			col, row, err := CellNameToCoordinates(c.R)
+			if err != nil {
 				continue
 			}
-			c, _, _, err := ws.prepareCell(cellRef)
-			if err != nil {
+			if row < coordinates[1] || row > coordinates[3] || col < coordinates[0] || col > coordinates[2] {
+				continue
+			}
+			if c.R == anchor {
 				continue
 			}
 			c.F = nil
 			c.V = ""
 			c.T = ""
+			c.IS = nil
 		}
 	}
+	trimWorksheetContiguousEmptyTail(ws)
+	refreshWorksheetDimension(ws)
+}
+
+func trimWorksheetContiguousEmptyTail(ws *xlsxWorksheet) {
+	if ws == nil {
+		return
+	}
+
+	for rowIdx := range ws.SheetData.Row {
+		rowData := &ws.SheetData.Row[rowIdx]
+		lastUsed := -1
+		for cellIdx := range rowData.C {
+			if cellContributesToUsedRange(rowData.C[cellIdx]) {
+				lastUsed = cellIdx
+			}
+		}
+		if lastUsed == -1 {
+			rowData.C = rowData.C[:0]
+			continue
+		}
+		rowData.C = rowData.C[:lastUsed+1]
+	}
+
+	lastUsedRow := len(ws.SheetData.Row) - 1
+	for lastUsedRow >= 0 {
+		row := &ws.SheetData.Row[lastUsedRow]
+		if len(row.C) != 0 || rowHasMeaningfulAttrs(ws, row) {
+			break
+		}
+		lastUsedRow--
+	}
+	ws.SheetData.Row = ws.SheetData.Row[:lastUsedRow+1]
+}
+
+func rowHasMeaningfulAttrs(ws *xlsxWorksheet, row *xlsxRow) bool {
+	if row == nil {
+		return false
+	}
+	if row.Spans != "" || row.S != 0 || row.CustomFormat || row.Hidden ||
+		row.OutlineLevel != 0 || row.Collapsed || row.ThickTop || row.ThickBot || row.Ph {
+		return true
+	}
+	if row.Ht != nil || row.CustomHeight {
+		return !rowUsesDefaultSheetHeight(ws, row)
+	}
+	return false
+}
+
+func rowUsesDefaultSheetHeight(ws *xlsxWorksheet, row *xlsxRow) bool {
+	if ws == nil || row == nil || ws.SheetFormatPr == nil || !ws.SheetFormatPr.CustomHeight {
+		return false
+	}
+	if !row.CustomHeight || row.Ht == nil {
+		return false
+	}
+	return *row.Ht == ws.SheetFormatPr.DefaultRowHeight
+}
+
+func refreshWorksheetDimension(ws *xlsxWorksheet) {
+	maxRow, maxCol := 0, 0
+	for _, row := range ws.SheetData.Row {
+		for _, cell := range row.C {
+			if !cellContributesToUsedRange(cell) {
+				continue
+			}
+			colNum, rowNum, err := CellNameToCoordinates(cell.R)
+			if err != nil {
+				continue
+			}
+			if rowNum > maxRow {
+				maxRow = rowNum
+			}
+			if colNum > maxCol {
+				maxCol = colNum
+			}
+		}
+	}
+
+	if maxRow == 0 || maxCol == 0 {
+		ws.Dimension = &xlsxDimension{Ref: "A1"}
+		return
+	}
+
+	endCell, err := CoordinatesToCellName(maxCol, maxRow)
+	if err != nil {
+		return
+	}
+	if maxRow == 1 && maxCol == 1 {
+		ws.Dimension = &xlsxDimension{Ref: "A1"}
+		return
+	}
+	ws.Dimension = &xlsxDimension{Ref: "A1:" + endCell}
+}
+
+func cellContributesToUsedRange(cell xlsxC) bool {
+	return cell.F != nil || cell.V != "" || cell.T != "" || cell.IS != nil
 }
 
 func clearSpillRangeCache(f *File, worksheetCache *WorksheetCache, sheet, ref, anchor string) {
@@ -639,6 +754,94 @@ func clearSpillRangeCache(f *File, worksheetCache *WorksheetCache, sheet, ref, a
 			}
 		}
 	}
+}
+
+func buildSQLResultClearRef(ws *xlsxWorksheet, anchor, oldRef, newRef string) string {
+	startCol, startRow, err := CellNameToCoordinates(anchor)
+	if err != nil {
+		return oldRef
+	}
+
+	maxCol, maxRow := startCol, startRow
+	extendMax := func(ref string) {
+		if ref == "" {
+			return
+		}
+		coordinates, err := rangeRefToCoordinates(ref)
+		if err != nil {
+			return
+		}
+		_ = sortCoordinates(coordinates)
+		if coordinates[2] > maxCol {
+			maxCol = coordinates[2]
+		}
+		if coordinates[3] > maxRow {
+			maxRow = coordinates[3]
+		}
+	}
+
+	extendMax(oldRef)
+	extendMax(newRef)
+	if ws != nil && ws.Dimension != nil {
+		extendMax(ws.Dimension.Ref)
+	}
+
+	endCell, err := CoordinatesToCellName(maxCol, maxRow)
+	if err != nil {
+		return oldRef
+	}
+	if anchor == endCell {
+		return anchor
+	}
+	return anchor + ":" + endCell
+}
+
+func prepareWorksheetCell(ws *xlsxWorksheet, cell string) (*xlsxC, error) {
+	var err error
+	cell, err = ws.mergeCellsParser(cell)
+	if err != nil {
+		return nil, err
+	}
+
+	col, row, err := CellNameToCoordinates(cell)
+	if err != nil {
+		return nil, err
+	}
+	if col < 1 || row < 1 {
+		return nil, newCellNameToCoordinatesError(cell, newInvalidCellNameError(cell))
+	}
+
+	sizeHint := 0
+	if rowCount := len(ws.SheetData.Row); rowCount > 0 {
+		sizeHint = len(ws.SheetData.Row[rowCount-1].C)
+	}
+
+	var ht *float64
+	var customHeight bool
+	if ws.SheetFormatPr != nil && ws.SheetFormatPr.CustomHeight {
+		ht = float64Ptr(ws.SheetFormatPr.DefaultRowHeight)
+		customHeight = true
+	}
+
+	rowIdx := sort.Search(len(ws.SheetData.Row), func(i int) bool {
+		return ws.SheetData.Row[i].R >= row
+	})
+	if rowIdx == len(ws.SheetData.Row) || ws.SheetData.Row[rowIdx].R != row {
+		ws.SheetData.Row = append(ws.SheetData.Row, xlsxRow{})
+		copy(ws.SheetData.Row[rowIdx+1:], ws.SheetData.Row[rowIdx:])
+		ws.SheetData.Row[rowIdx] = xlsxRow{
+			R:            row,
+			CustomHeight: customHeight,
+			Ht:           ht,
+			C:            make([]xlsxC, 0, sizeHint),
+		}
+	}
+
+	rowData := &ws.SheetData.Row[rowIdx]
+	if col > len(rowData.C) {
+		fillColumns(rowData, col, row)
+	}
+	return &rowData.C[col-1], nil
 }
 
 func (f *File) storeFormulaResultCache(sheet, cellName, value string, arg formulaArg, worksheetCache *WorksheetCache) {

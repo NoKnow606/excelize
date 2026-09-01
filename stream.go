@@ -570,7 +570,7 @@ func (sw *StreamWriter) setCellValFunc(c *xlsxC, val interface{}) error {
 		c.T, c.IS = "inlineStr", &xlsxSI{}
 		c.IS.R, err = setRichText(val)
 	default:
-		c.setCellValue(fmt.Sprint(val))
+		c.setCellValue(stringifyInterfaceValue(val))
 	}
 	return err
 }

@@ -500,3 +500,29 @@ func TestStreamWriterGetRowElement(t *testing.T) {
 		assert.False(t, ok)
 	}
 }
+
+func TestStreamWriterTypedNilDoesNotBecomeNilString(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	sw, err := f.NewStreamWriter("Sheet1")
+	if err != nil {
+		t.Fatalf("NewStreamWriter: %v", err)
+	}
+
+	var ptr *string
+	if err := sw.SetRow("A1", []interface{}{ptr}); err != nil {
+		t.Fatalf("SetRow: %v", err)
+	}
+	if err := sw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	got, err := f.GetCellValue("Sheet1", "A1", Options{RawCellValue: true})
+	if err != nil {
+		t.Fatalf("GetCellValue: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected empty string, got %q", got)
+	}
+}

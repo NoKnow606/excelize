@@ -26,6 +26,20 @@ import (
 	"github.com/xuri/efp"
 )
 
+func stringifyInterfaceValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if rv.IsNil() {
+			return ""
+		}
+	}
+	return fmt.Sprint(value)
+}
+
 // CellType is the type of cell value type.
 type CellType byte
 
@@ -161,14 +175,21 @@ func (f *File) SetCellValue(sheet, cell string, value interface{}) error {
 		// loses quoting (e.g. []interface{}{"aaaa"} → "[aaaa]" vs `["aaaa"]`).
 		rv := reflect.ValueOf(value)
 		switch rv.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if rv.IsNil() {
+				err = f.SetCellDefault(sheet, cell, "")
+				break
+			}
+		}
+		switch rv.Kind() {
 		case reflect.Slice, reflect.Array, reflect.Map:
 			if b, jsonErr := json.Marshal(value); jsonErr == nil {
 				err = f.SetCellStr(sheet, cell, string(b))
 			} else {
-				err = f.SetCellStr(sheet, cell, fmt.Sprint(value))
+				err = f.SetCellStr(sheet, cell, stringifyInterfaceValue(value))
 			}
 		default:
-			err = f.SetCellStr(sheet, cell, fmt.Sprint(value))
+			err = f.SetCellStr(sheet, cell, stringifyInterfaceValue(value))
 		}
 	}
 	return err
@@ -855,6 +876,7 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 	}
 	// Use fine-grained cache clearing for single cell formula changes
 	f.clearCellCache(sheet, cell)
+	f.clearSQLSpillRangeIfNeeded(sheet, ws, c, cell, formula)
 	if formula == "" {
 		ws.deleteSharedFormula(c)
 		c.F = nil
@@ -889,6 +911,10 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 			c.F.Ref = *opt.Ref
 		}
 	}
+	if isExternalCachedFormula(formula) {
+		return f.deleteCalcChain(f.getSheetID(sheet), cell)
+	}
+
 	// Clear cell value and type when setting formula
 	// The actual type will be determined by the formula calculation result
 	c.T, c.V, c.IS = "", "", nil
@@ -925,6 +951,8 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 		return err
 	}
 
+	f.clearSQLSpillRangeIfNeeded(sheet, ws, c, cell, formula)
+
 	// 设置公式（不清除缓存）
 	if formula == "" {
 		ws.deleteSharedFormula(c)
@@ -954,7 +982,31 @@ func (f *File) SetCellFormulaWithValue(sheet, cell, formula, value string) error
 	f.calcCache.Store(cacheKey+"!raw=false", value)
 	f.calcCache.Store(cacheKey+"!raw=true", value)
 
+	if isExternalCachedFormula(formula) {
+		return f.deleteCalcChain(f.getSheetID(sheet), cell)
+	}
+
 	return nil
+}
+
+func (f *File) clearSQLSpillRangeIfNeeded(sheet string, ws *xlsxWorksheet, c *xlsxC, cell, nextFormula string) {
+	if c == nil || c.F == nil || c.F.Ref == "" {
+		return
+	}
+
+	currentFormula := c.F.Content
+	if !IsSQLFormula(currentFormula) {
+		return
+	}
+	if currentFormula == nextFormula {
+		return
+	}
+
+	oldRef := c.F.Ref
+	clearWorksheetRangeValues(ws, oldRef, cell)
+	clearSpillRangeCache(f, nil, sheet, oldRef, cell)
+	c.F.Ref = ""
+	refreshWorksheetDimension(ws)
 }
 
 // setArrayFormula transform the array formula in an array formula range to the

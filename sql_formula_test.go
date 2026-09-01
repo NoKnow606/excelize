@@ -348,6 +348,575 @@ func TestSQLFormulaClearsPreviousSpillOnError(t *testing.T) {
 	}
 }
 
+func TestSQLFormulaShrinksPreviousSpillAfterFormulaChange(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	limitTwo := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 2")`
+	if err := f.SetCellFormula("Report", "A1", limitTwo); err != nil {
+		t.Fatalf("SetCellFormula limitTwo: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitTwo: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "A1:B3" {
+		t.Fatalf("expected initial spill ref A1:B3, got %q", got)
+	}
+	if got, err := f.GetCellValue("Report", "A3", Options{RawCellValue: true}); err != nil || got != "B" {
+		t.Fatalf("expected initial A3 spill value B, got %q err=%v", got, err)
+	}
+	if got, err := f.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "20" {
+		t.Fatalf("expected initial B3 spill value 20, got %q err=%v", got, err)
+	}
+
+	limitOne := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 1")`
+	if err := f.SetCellFormula("Report", "A1", limitOne); err != nil {
+		t.Fatalf("SetCellFormula limitOne: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitOne: %v", err)
+	}
+
+	ws, err = f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader after shrink: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "A1:B2" {
+		t.Fatalf("expected shrunk spill ref A1:B2, got %q", got)
+	}
+	if got, err := f.GetCellValue("Report", "A3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected cleared spill cell A3, got %q err=%v", got, err)
+	}
+	if got, err := f.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected cleared spill cell B3, got %q err=%v", got, err)
+	}
+
+	fileName := "test_sql_formula_shrink.xlsx"
+	if err := f.SaveAs(fileName); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	defer os.Remove(fileName)
+
+	reopened, err := OpenFile(fileName)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer reopened.Close()
+
+	if got, err := reopened.GetCellValue("Report", "A3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected reopened cleared spill cell A3, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected reopened cleared spill cell B3, got %q err=%v", got, err)
+	}
+}
+
+func TestSetCellFormulaWithValueClearsPreviousSQLSpillImmediately(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	limitTwo := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 2")`
+	if err := f.SetCellFormula("Report", "A1", limitTwo); err != nil {
+		t.Fatalf("SetCellFormula limitTwo: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitTwo: %v", err)
+	}
+
+	limitOne := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 1")`
+	if err := f.SetCellFormulaWithValue("Report", "A1", limitOne, "Category"); err != nil {
+		t.Fatalf("SetCellFormulaWithValue limitOne: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader after setter: %v", err)
+	}
+	if got := ws.SheetData.Row[0].C[0].F.Ref; got != "" {
+		t.Fatalf("expected stale spill ref cleared before recalc, got %q", got)
+	}
+	if got, err := f.GetCellValue("Report", "A3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected immediate clear of stale spill cell A3, got %q err=%v", got, err)
+	}
+	if got, err := f.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected immediate clear of stale spill cell B3, got %q err=%v", got, err)
+	}
+
+	fileName := "test_sql_formula_setter_clear.xlsx"
+	if err := f.SaveAs(fileName); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	defer os.Remove(fileName)
+
+	reopened, err := OpenFile(fileName)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer reopened.Close()
+
+	if got, err := reopened.GetCellValue("Report", "A3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected reopened stale spill cell A3 cleared, got %q err=%v", got, err)
+	}
+	if got, err := reopened.GetCellValue("Report", "B3", Options{RawCellValue: true}); err != nil || got != "" {
+		t.Fatalf("expected reopened stale spill cell B3 cleared, got %q err=%v", got, err)
+	}
+}
+
+func TestSQLFormulaShrinkRefreshesUsedRangeForWideSpill(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet: %v", err)
+	}
+
+	headers := make([]interface{}, 23)
+	rowOne := make([]interface{}, 23)
+	rowTwo := make([]interface{}, 23)
+	for i := 0; i < 23; i++ {
+		headers[i] = fmt.Sprintf("col_%02d", i+1)
+		rowOne[i] = fmt.Sprintf("r1c%02d", i+1)
+		rowTwo[i] = fmt.Sprintf("r2c%02d", i+1)
+	}
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		headers,
+		rowOne,
+		rowTwo,
+	})
+
+	limitTwo := `SQL("select * from ""Data"" limit 2")`
+	if err := f.SetCellFormula("Report", "A1", limitTwo); err != nil {
+		t.Fatalf("SetCellFormula limitTwo: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitTwo: %v", err)
+	}
+	if got, err := f.GetSheetDimension("Report"); err != nil || got != "A1:W3" {
+		t.Fatalf("expected wide spill dimension A1:W3, got %q err=%v", got, err)
+	}
+
+	limitOne := `SQL("select * from ""Data"" limit 1")`
+	if err := f.SetCellFormulaWithValue("Report", "A1", limitOne, "col_01"); err != nil {
+		t.Fatalf("SetCellFormulaWithValue limitOne: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitOne: %v", err)
+	}
+	if got, err := f.GetSheetDimension("Report"); err != nil || got != "A1:W2" {
+		t.Fatalf("expected shrunk dimension A1:W2, got %q err=%v", got, err)
+	}
+
+	fileName := "test_sql_formula_wide_shrink.xlsx"
+	if err := f.SaveAs(fileName); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	defer os.Remove(fileName)
+
+	reopened, err := OpenFile(fileName)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer reopened.Close()
+
+	if got, err := reopened.GetSheetDimension("Report"); err != nil || got != "A1:W2" {
+		t.Fatalf("expected reopened dimension A1:W2, got %q err=%v", got, err)
+	}
+	rangeData, err := reopened.GetRangeDataConcurrent("Report", "A1:W2")
+	if err != nil {
+		t.Fatalf("GetRangeDataConcurrent A1:W2: %v", err)
+	}
+	if len(rangeData) != 2 || len(rangeData[0]) != 23 {
+		t.Fatalf("expected 2x23 data after shrink, got %dx%d", len(rangeData), len(rangeData[0]))
+	}
+	if got := rangeData[1][22].Value; got != "r1c23" {
+		t.Fatalf("expected second row last value r1c23, got %q", got)
+	}
+	staleRow, err := reopened.GetRangeDataConcurrent("Report", "A3:W3")
+	if err != nil {
+		t.Fatalf("GetRangeDataConcurrent A3:W3: %v", err)
+	}
+	for _, cell := range staleRow[0] {
+		if cell.Value != "" || cell.Formula != "" {
+			t.Fatalf("expected stale third row to be empty, got value=%q formula=%q", cell.Value, cell.Formula)
+		}
+	}
+}
+
+func TestRefreshWorksheetDimensionIgnoresStyleOnlyPlaceholderCells(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Report"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+
+	if err := f.SetCellValue("Report", "A1", "header"); err != nil {
+		t.Fatalf("SetCellValue A1: %v", err)
+	}
+	if err := f.SetCellValue("Report", "W2", "tail"); err != nil {
+		t.Fatalf("SetCellValue W2: %v", err)
+	}
+
+	styleID, err := f.NewStyle(&Style{})
+	if err != nil {
+		t.Fatalf("NewStyle: %v", err)
+	}
+	if err := f.SetCellStyle("Report", "Z1000", "Z1000", styleID); err != nil {
+		t.Fatalf("SetCellStyle Z1000: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	refreshWorksheetDimension(ws)
+
+	if got, err := f.GetSheetDimension("Report"); err != nil || got != "A1:W2" {
+		t.Fatalf("expected dimension A1:W2 ignoring style-only placeholder, got %q err=%v", got, err)
+	}
+}
+
+func TestClearWorksheetRangeValuesPreservesContiguousCellIndexing(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Report"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+
+	for row := 1; row <= 2; row++ {
+		for col := 1; col <= 26; col++ {
+			cell, _ := CoordinatesToCellName(col, row)
+			c, _, _, err := ws.prepareCell(cell)
+			if err != nil {
+				t.Fatalf("prepareCell %s: %v", cell, err)
+			}
+			c.V = fmt.Sprintf("old-r%dc%d", row, col)
+			c.T = "str"
+		}
+	}
+
+	clearWorksheetRangeValues(ws, "A1:Z2", "A1")
+
+	for row := 1; row <= 2; row++ {
+		for col := 1; col <= 23; col++ {
+			cell, _ := CoordinatesToCellName(col, row)
+			c, _, _, err := ws.prepareCell(cell)
+			if err != nil {
+				t.Fatalf("prepareCell rewrite %s: %v", cell, err)
+			}
+			c.V = fmt.Sprintf("new-r%dc%d", row, col)
+			c.T = "str"
+		}
+	}
+	refreshWorksheetDimension(ws)
+
+	rangeData, err := f.GetRangeDataConcurrent("Report", "A1:Z2")
+	if err != nil {
+		t.Fatalf("GetRangeDataConcurrent: %v", err)
+	}
+	if got := rangeData[0][0].Value; got != "new-r1c1" {
+		t.Fatalf("expected A1 new-r1c1, got %q", got)
+	}
+	if got := rangeData[0][22].Value; got != "new-r1c23" {
+		t.Fatalf("expected W1 new-r1c23, got %q", got)
+	}
+	if got := rangeData[1][0].Value; got != "new-r2c1" {
+		t.Fatalf("expected A2 new-r2c1, got %q", got)
+	}
+	if got := rangeData[1][22].Value; got != "new-r2c23" {
+		t.Fatalf("expected W2 new-r2c23, got %q", got)
+	}
+	for col := 23; col < 26; col++ {
+		if got := rangeData[0][col].Value; got != "" {
+			t.Fatalf("expected cleared tail at row1 col %d, got %q", col+1, got)
+		}
+		if got := rangeData[1][col].Value; got != "" {
+			t.Fatalf("expected cleared tail at row2 col %d, got %q", col+1, got)
+		}
+	}
+}
+
+func TestClearWorksheetRangeValuesDropsDefaultHeightPlaceholderRows(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Report"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+	ws.SheetFormatPr = &xlsxSheetFormatPr{
+		DefaultRowHeight: 18,
+		CustomHeight:     true,
+	}
+
+	cells := []string{"A1", "B1", "A3", "B3", "A6", "B6"}
+	for _, cell := range cells {
+		c, _, _, err := ws.prepareCell(cell)
+		if err != nil {
+			t.Fatalf("prepareCell %s: %v", cell, err)
+		}
+		c.V = cell
+		c.T = "str"
+	}
+
+	clearWorksheetRangeValues(ws, "A1:B6", "A1")
+
+	for _, cell := range []string{"A1", "B1", "A2", "B2"} {
+		c, _, _, err := ws.prepareCell(cell)
+		if err != nil {
+			t.Fatalf("prepareCell rewrite %s: %v", cell, err)
+		}
+		c.V = "new-" + cell
+		c.T = "str"
+	}
+	refreshWorksheetDimension(ws)
+
+	if len(ws.SheetData.Row) != 2 {
+		t.Fatalf("expected only 2 rows after pruning placeholder rows, got %d", len(ws.SheetData.Row))
+	}
+	if ws.SheetData.Row[0].R != 1 || ws.SheetData.Row[1].R != 2 {
+		t.Fatalf("expected rows 1 and 2 after pruning, got %d and %d", ws.SheetData.Row[0].R, ws.SheetData.Row[1].R)
+	}
+	if got, err := f.GetSheetDimension("Report"); err != nil || got != "A1:B2" {
+		t.Fatalf("expected dimension A1:B2, got %q err=%v", got, err)
+	}
+
+	rangeData, err := f.GetRangeDataConcurrent("Report", "A1:B6")
+	if err != nil {
+		t.Fatalf("GetRangeDataConcurrent: %v", err)
+	}
+	if len(rangeData) != 6 {
+		t.Fatalf("expected 6 rows in requested range, got %d", len(rangeData))
+	}
+	if got := rangeData[0][0].Value; got != "new-A1" {
+		t.Fatalf("expected A1 new-A1, got %q", got)
+	}
+	if got := rangeData[1][1].Value; got != "new-B2" {
+		t.Fatalf("expected B2 new-B2, got %q", got)
+	}
+	for row := 2; row < 6; row++ {
+		for col := 0; col < 2; col++ {
+			if got := rangeData[row][col].Value; got != "" {
+				t.Fatalf("expected cleared placeholder row %d col %d, got %q", row+1, col+1, got)
+			}
+		}
+	}
+}
+
+func TestClearWorksheetRangeValuesPreservesInteriorEmptyRowsForLaterWrites(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Report"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader: %v", err)
+	}
+
+	for _, cell := range []string{"A1", "B1", "A3", "B3"} {
+		c, _, _, err := ws.prepareCell(cell)
+		if err != nil {
+			t.Fatalf("prepareCell %s: %v", cell, err)
+		}
+		c.V = "old-" + cell
+		c.T = "str"
+	}
+
+	clearWorksheetRangeValues(ws, "A1:B1", "A1")
+
+	c, _, _, err := ws.prepareCell("A2")
+	if err != nil {
+		t.Fatalf("prepareCell A2: %v", err)
+	}
+	c.V = "new-A2"
+	c.T = "str"
+	refreshWorksheetDimension(ws)
+
+	rangeData, err := f.GetRangeDataConcurrent("Report", "A1:B3")
+	if err != nil {
+		t.Fatalf("GetRangeDataConcurrent: %v", err)
+	}
+	if got := rangeData[1][0].Value; got != "new-A2" {
+		t.Fatalf("expected A2 new-A2, got %q", got)
+	}
+	if got := rangeData[2][0].Value; got != "old-A3" {
+		t.Fatalf("expected A3 old-A3 to stay on row 3, got %q", got)
+	}
+	if got := rangeData[2][1].Value; got != "old-B3" {
+		t.Fatalf("expected B3 old-B3 to stay on row 3, got %q", got)
+	}
+}
+
+func TestSQLFormulaRecalculateRepairsSparseRowSlice(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet Report: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	limitTwo := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 2")`
+	if err := f.SetCellFormula("Report", "A1", limitTwo); err != nil {
+		t.Fatalf("SetCellFormula limitTwo: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitTwo: %v", err)
+	}
+
+	ws, err := f.workSheetReader("Report")
+	if err != nil {
+		t.Fatalf("workSheetReader Report: %v", err)
+	}
+	if len(ws.SheetData.Row) < 3 {
+		t.Fatalf("expected at least 3 rows after initial spill, got %d", len(ws.SheetData.Row))
+	}
+	ws.SheetData.Row = append(ws.SheetData.Row[:1], ws.SheetData.Row[2:]...)
+
+	limitOne := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 1")`
+	if err := f.SetCellFormulaWithValue("Report", "A1", limitOne, "Category"); err != nil {
+		t.Fatalf("SetCellFormulaWithValue limitOne: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitOne: %v", err)
+	}
+
+	rangeData, err := f.GetRangeDataConcurrent("Report", "A1:B3")
+	if err != nil {
+		t.Fatalf("GetRangeDataConcurrent: %v", err)
+	}
+	if got := rangeData[0][0].Value; got != "Category" {
+		t.Fatalf("expected A1 header Category, got %q", got)
+	}
+	if got := rangeData[1][0].Value; got != "A" {
+		t.Fatalf("expected A2 repaired to A, got %q", got)
+	}
+	if got := rangeData[1][1].Value; got != "10" {
+		t.Fatalf("expected B2 repaired to 10, got %q", got)
+	}
+	if got := rangeData[2][0].Value; got != "" {
+		t.Fatalf("expected A3 cleared after shrink, got %q", got)
+	}
+	if got := rangeData[2][1].Value; got != "" {
+		t.Fatalf("expected B3 cleared after shrink, got %q", got)
+	}
+}
+
+func TestSQLFormulaShrinkClearsStaleCellsBeyondStoredSpillRef(t *testing.T) {
+	f := NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	if err := f.SetSheetName(defaultSheet, "Data"); err != nil {
+		t.Fatalf("SetSheetName: %v", err)
+	}
+	if _, err := f.NewSheet("Report"); err != nil {
+		t.Fatalf("NewSheet Report: %v", err)
+	}
+
+	writeSQLSheetRows(t, f, "Data", [][]interface{}{
+		{"Category", "Amount"},
+		{"A", 10},
+		{"B", 20},
+	})
+
+	limitTwo := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 2")`
+	if err := f.SetCellFormula("Report", "A1", limitTwo); err != nil {
+		t.Fatalf("SetCellFormula limitTwo: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitTwo: %v", err)
+	}
+
+	if err := f.SetCellValue("Report", "A6", "stale-A6"); err != nil {
+		t.Fatalf("SetCellValue A6: %v", err)
+	}
+	if err := f.SetCellValue("Report", "Z3", "stale-Z3"); err != nil {
+		t.Fatalf("SetCellValue Z3: %v", err)
+	}
+
+	limitOne := `SQL("select ""Category"", ""Amount"" from ""Data"" order by ""Category"" limit 1")`
+	if err := f.SetCellFormulaWithValue("Report", "A1", limitOne, "Category"); err != nil {
+		t.Fatalf("SetCellFormulaWithValue limitOne: %v", err)
+	}
+	if err := f.RecalculateAllWithDependency(); err != nil {
+		t.Fatalf("RecalculateAllWithDependency limitOne: %v", err)
+	}
+
+	if got, err := f.GetCellValue("Report", "A6"); err != nil || got != "" {
+		t.Fatalf("expected stale A6 cleared, got %q err=%v", got, err)
+	}
+	if got, err := f.GetCellValue("Report", "Z3"); err != nil || got != "" {
+		t.Fatalf("expected stale Z3 cleared, got %q err=%v", got, err)
+	}
+	if got, err := f.GetSheetDimension("Report"); err != nil || got != "A1:B2" {
+		t.Fatalf("expected shrunk dimension A1:B2, got %q err=%v", got, err)
+	}
+}
+
 func writeSQLSheetRows(t *testing.T, f *File, sheet string, rows [][]interface{}) {
 	t.Helper()
 	for rowIdx, row := range rows {
